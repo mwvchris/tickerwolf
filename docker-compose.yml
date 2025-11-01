@@ -1,0 +1,108 @@
+version: "3.8"
+
+services:
+
+  php:
+    build:
+      context: ./
+      dockerfile: docker/php/Dockerfile-8.4
+    container_name: tickerwolf-php
+    restart: unless-stopped
+    tty: true
+    working_dir: /www/websites/tickerwolf.ai
+    environment:
+      - COMPOSER_MEMORY_LIMIT=-1
+      - PHP_MEMORY_LIMIT=2G
+    volumes:
+      - ./:/www/websites/tickerwolf.ai
+      - ./storage:/www/websites/tickerwolf.ai/storage:rw
+      - ./bootstrap/cache:/www/websites/tickerwolf.ai/bootstrap/cache:rw
+      - ./docker/php/php-ini-overrides.ini:/usr/local/etc/php/conf.d/99-overrides.ini
+      - ./docker/php/xdebug.ini:/usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
+    depends_on:
+      - mariadb
+      - redis
+
+  scheduler:
+    build:
+      context: ./
+      dockerfile: docker/php/Dockerfile-8.4
+    container_name: tickerwolf-scheduler
+    restart: unless-stopped
+    tty: true
+    working_dir: /www/websites/tickerwolf.ai
+    environment:
+      - COMPOSER_MEMORY_LIMIT=-1
+      - PHP_MEMORY_LIMIT=2G
+    volumes:
+      - ./:/www/websites/tickerwolf.ai
+      - ./storage:/www/websites/tickerwolf.ai/storage:rw
+      - ./bootstrap/cache:/www/websites/tickerwolf.ai/bootstrap/cache:rw
+    depends_on:
+      - php
+      - mariadb
+      - redis
+    command: sh -c "while true; do php artisan schedule:run --verbose --no-interaction; sleep 60; done"
+
+  redis:
+    image: redis:alpine
+    container_name: tickerwolf-redis
+    restart: unless-stopped
+    tty: true
+    volumes:
+      - redis-data:/data:delegated
+    ports:
+      - "6379:6379"
+
+  mariadb:
+    image: mariadb:10.11
+    container_name: tickerwolf-mariadb
+    restart: unless-stopped
+    tty: true
+    mem_limit: 8g
+    shm_size: 2g
+    volumes:
+      - mariadb-data:/var/lib/mysql
+      - ./docker/mariadb/conf.d:/etc/mysql/conf.d
+    environment:
+      - MARIADB_ROOT_PASSWORD=!tickerwolf91923!
+      - MARIADB_DATABASE=tickerwolf
+      - MARIADB_USER=tickerwolf
+      - MARIADB_PASSWORD=!tickerwolf91923!
+      - MARIADB_AUTO_UPGRADE=true
+    ports:
+      - "3306:3306"
+
+  nginx:
+    image: nginx:alpine
+    container_name: tickerwolf-nginx
+    restart: unless-stopped
+    tty: true
+    working_dir: /www/websites/tickerwolf.ai
+    volumes:
+      - .:/www/websites/tickerwolf.ai:delegated
+      - ./docker/nginx/nginx.conf:/etc/nginx/conf.d/default.conf
+    depends_on:
+      - mariadb
+      - redis
+      - php
+    ports:
+      - "80:80"
+
+  vite:
+    image: node:20-alpine
+    container_name: tickerwolf-vite
+    working_dir: /www/websites/tickerwolf.ai
+    volumes:
+      - ./:/www/websites/tickerwolf.ai
+    ports:
+      - "5173:5173"
+    command: sh -c "npm install && npm run dev"
+    depends_on:
+      - php
+
+volumes:
+  mariadb-data:
+    driver: local
+  redis-data:
+    driver: local

@@ -1,0 +1,507 @@
+===== GPT DUMP GENERATED: 2025-10-30T00:32:43Z =====
+===== DATABASE MIGRATIONS (Part 1 - First 10 Files) =====
+
+
+
+===== FILE: database/migrations/0001_01_01_000000_create_users_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('users', function (Blueprint $table) {
+            $table->id();
+            $table->string('name');
+            $table->string('email')->unique();
+            $table->timestamp('email_verified_at')->nullable();
+            $table->string('password');
+            $table->rememberToken();
+            $table->timestamps();
+        });
+
+        Schema::create('password_reset_tokens', function (Blueprint $table) {
+            $table->string('email')->primary();
+            $table->string('token');
+            $table->timestamp('created_at')->nullable();
+        });
+
+        Schema::create('sessions', function (Blueprint $table) {
+            $table->string('id')->primary();
+            $table->foreignId('user_id')->nullable()->index();
+            $table->string('ip_address', 45)->nullable();
+            $table->text('user_agent')->nullable();
+            $table->longText('payload');
+            $table->integer('last_activity')->index();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('users');
+        Schema::dropIfExists('password_reset_tokens');
+        Schema::dropIfExists('sessions');
+    }
+};
+
+
+===== FILE: database/migrations/0001_01_01_000001_create_cache_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('cache', function (Blueprint $table) {
+            $table->string('key')->primary();
+            $table->mediumText('value');
+            $table->integer('expiration');
+        });
+
+        Schema::create('cache_locks', function (Blueprint $table) {
+            $table->string('key')->primary();
+            $table->string('owner');
+            $table->integer('expiration');
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('cache');
+        Schema::dropIfExists('cache_locks');
+    }
+};
+
+
+===== FILE: database/migrations/0001_01_01_000002_create_jobs_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('jobs', function (Blueprint $table) {
+            $table->id();
+            $table->string('queue')->index();
+            $table->longText('payload');
+            $table->unsignedTinyInteger('attempts');
+            $table->unsignedInteger('reserved_at')->nullable();
+            $table->unsignedInteger('available_at');
+            $table->unsignedInteger('created_at');
+        });
+
+        Schema::create('job_batches', function (Blueprint $table) {
+            $table->string('id')->primary();
+            $table->string('name');
+            $table->integer('total_jobs');
+            $table->integer('pending_jobs');
+            $table->integer('failed_jobs');
+            $table->longText('failed_job_ids');
+            $table->mediumText('options')->nullable();
+            $table->integer('cancelled_at')->nullable();
+            $table->integer('created_at');
+            $table->integer('finished_at')->nullable();
+        });
+
+        Schema::create('failed_jobs', function (Blueprint $table) {
+            $table->id();
+            $table->string('uuid')->unique();
+            $table->text('connection');
+            $table->text('queue');
+            $table->longText('payload');
+            $table->longText('exception');
+            $table->timestamp('failed_at')->useCurrent();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('jobs');
+        Schema::dropIfExists('job_batches');
+        Schema::dropIfExists('failed_jobs');
+    }
+};
+
+
+===== FILE: database/migrations/2025_08_14_170933_add_two_factor_columns_to_users_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('users', function (Blueprint $table) {
+            $table->text('two_factor_secret')->after('password')->nullable();
+            $table->text('two_factor_recovery_codes')->after('two_factor_secret')->nullable();
+            $table->timestamp('two_factor_confirmed_at')->after('two_factor_recovery_codes')->nullable();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('users', function (Blueprint $table) {
+            $table->dropColumn([
+                'two_factor_secret',
+                'two_factor_recovery_codes',
+                'two_factor_confirmed_at',
+            ]);
+        });
+    }
+};
+
+
+===== FILE: database/migrations/2025_10_22_052228_create_tickers_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('tickers', function (Blueprint $table) {
+            $table->id();
+
+            // Primary / searchable fields
+            $table->string('ticker')->unique();                   // ticker symbol e.g., AAPL
+            $table->string('name')->nullable();                   // company name
+            $table->string('market')->nullable();                 // 'stocks', 'crypto', ...
+            $table->string('locale')->nullable();                 // 'us' / 'global'
+            $table->string('primary_exchange')->nullable();
+            $table->string('type')->nullable();                   // human readable type
+            $table->string('status')->nullable();                 // e.g., 'active'
+            $table->boolean('active')->nullable()->index();
+            $table->string('currency_symbol')->nullable();
+            $table->string('currency_name')->nullable();
+            $table->string('base_currency_symbol')->nullable();
+            $table->string('base_currency_name')->nullable();
+            $table->string('cik')->nullable()->index();
+            $table->string('composite_figi')->nullable();
+            $table->string('share_class_figi')->nullable();
+            $table->timestamp('last_updated_utc')->nullable()->index();
+            $table->timestamp('delisted_utc')->nullable()->index();
+
+            // Store raw payload for future fields, faster schema changes
+            $table->json('raw')->nullable();
+
+            $table->timestamps();
+
+            // Useful compound query
+            $table->index(['market', 'primary_exchange']);
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('tickers');
+    }
+};
+
+
+===== FILE: database/migrations/2025_10_22_220423_add_slug_to_tickers_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('tickers', function (Blueprint $table) {
+            $table->string('slug')->nullable()->after('name')->index();
+            $table->unique(['ticker', 'slug']);
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('tickers', function (Blueprint $table) {
+            $table->dropUnique(['tickers_ticker_slug_unique']);
+            $table->dropColumn('slug');
+        });
+    }
+};
+
+===== FILE: database/migrations/2025_10_23_171640_create_ticker_analyses_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+public function up(): void {
+        Schema::create('ticker_analyses', function (Blueprint $table) {
+            $table->id();
+            $table->string('ticker')->index();
+            $table->unsignedBigInteger('user_id')->nullable()->index();
+            $table->string('provider')->index(); // openai, gemini, grok, etc.
+            $table->string('model')->nullable();
+            $table->json('request_payload')->nullable();
+            $table->json('response_raw')->nullable();
+            $table->text('summary')->nullable();
+            $table->json('structured')->nullable();
+            $table->string('status')->default('pending')->index();
+            $table->timestamp('requested_at')->nullable();
+            $table->timestamp('completed_at')->nullable();
+            $table->timestamps();
+
+            $table->foreign('user_id')->references('id')->on('users')->nullOnDelete();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void {
+        Schema::dropIfExists('ticker_analyses');
+    }
+};
+
+
+===== FILE: database/migrations/2025_10_25_161321_add_overview_fields_to_tickers_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     *
+     * Adds frequently-used ticker overview fields directly on the `tickers`
+     * table to keep ticker profile page queries fast (avoid joins on each load).
+     *
+     * These fields are denormalized from Polygon's /v3/reference/tickers/{ticker}
+     * endpoint. Less-frequently used or arbitrary fields will still be stored
+     * in the `ticker_overviews` table (raw JSON).
+     */
+    public function up(): void
+    {
+        Schema::table('tickers', function (Blueprint $table) {
+            // Overview / company info
+            $table->text('description')->nullable()->after('name'); // company description
+            $table->string('homepage_url')->nullable()->after('description');
+            $table->date('list_date')->nullable()->after('homepage_url'); // YYYY-MM-DD
+            $table->unsignedBigInteger('market_cap')->nullable()->after('list_date')->index();
+
+            // Contact / size
+            $table->string('phone_number')->nullable()->after('market_cap');
+            $table->integer('total_employees')->nullable()->after('phone_number')->index();
+
+            // Industry / classification
+            $table->string('sic_code')->nullable()->after('total_employees')->index();
+            $table->string('sic_description')->nullable()->after('sic_code');
+
+            // Share class / shares outstanding
+            $table->unsignedBigInteger('share_class_shares_outstanding')->nullable()->after('sic_description');
+            $table->unsignedBigInteger('weighted_shares_outstanding')->nullable()->after('share_class_shares_outstanding');
+
+            // Ticker components
+            $table->string('ticker_root')->nullable()->after('weighted_shares_outstanding')->index();
+            $table->string('ticker_suffix')->nullable()->after('ticker_root');
+
+            // Round lot and other numeric small fields
+            $table->integer('round_lot')->nullable()->after('ticker_suffix');
+
+            // Small branding fields to display quickly without parsing JSON
+            $table->string('branding_logo_url')->nullable()->after('round_lot');
+            $table->string('branding_icon_url')->nullable()->after('branding_logo_url');
+
+            // keep the raw overview on the tickers table for quick access if needed,
+            // but we'll also store full historical snapshots in ticker_overviews.
+            // If your existing 'raw' column is used for other payloads, leave as-is.
+            // $table->json('overview_raw')->nullable()->after('raw'); // optional
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('tickers', function (Blueprint $table) {
+            $table->dropColumn([
+                'description',
+                'homepage_url',
+                'list_date',
+                'market_cap',
+                'phone_number',
+                'total_employees',
+                'sic_code',
+                'sic_description',
+                'share_class_shares_outstanding',
+                'weighted_shares_outstanding',
+                'ticker_root',
+                'ticker_suffix',
+                'round_lot',
+                'branding_logo_url',
+                'branding_icon_url',
+            ]);
+        });
+    }
+};
+
+===== FILE: database/migrations/2025_10_25_161418_create_ticker_overviews_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     *
+     * This table stores the full Polygon ticker overview payload (raw JSON)
+     * and a few parsed/indexed fields for quick searches. It also supports
+     * snapshots over time using the `overview_date` column (the date= query param).
+     *
+     * Use-case: keep full data for auditing, re-parsing, or supporting new UI features
+     * without changing schema. Denormalized fields on `tickers` will be the
+     * current/latest values used for profile pages.
+     */
+    public function up(): void
+    {
+        Schema::create('ticker_overviews', function (Blueprint $table) {
+            $table->id();
+
+            // Link back to tickers table
+            $table->foreignId('ticker_id')->constrained('tickers')->cascadeOnDelete();
+
+            // The `date` query param on Polygon endpoint — if null, this is "latest".
+            $table->date('overview_date')->nullable()->index();
+
+            // Frequently useful parsed fields indexed for queries
+            $table->boolean('active')->nullable()->index();
+            $table->unsignedBigInteger('market_cap')->nullable()->index();
+            $table->string('primary_exchange')->nullable()->index();
+            $table->string('locale')->nullable()->index();
+            $table->string('status')->nullable();
+
+            // Raw entire response stored for future-proofing.
+            $table->json('results_raw')->nullable();
+
+            $table->timestamp('fetched_at')->useCurrent(); // when we pulled the overview
+            $table->timestamps();
+
+            // Avoid duplicate snapshots for the same ticker + date.
+            $table->unique(['ticker_id', 'overview_date']);
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('ticker_overviews');
+    }
+};
+
+===== FILE: database/migrations/2025_10_25_171607_create_failed_ticker_overviews_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('failed_ticker_overviews', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('ticker_id')->constrained()->cascadeOnDelete();
+            $table->string('ticker')->index();
+            $table->string('reason')->nullable();
+            $table->json('context')->nullable();
+            $table->timestamp('failed_at')->useCurrent();
+        });
+    }
+
+    /**
+    * Reverse the migrations.
+    */
+    public function down(): void
+    {
+        Schema::dropIfExists('failed_ticker_overviews');
+    }
+};
+[EOF: database/migrations (Part 1)]

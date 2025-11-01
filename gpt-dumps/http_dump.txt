@@ -1,0 +1,780 @@
+===== GPT DUMP GENERATED: 2025-10-30T00:32:43Z =====
+===== DIRECTORY: app/Http =====
+
+app/Http/Middleware/RedirectIfAuthenticated.php
+
+
+===== FILE: app/Http/Middleware/RedirectIfAuthenticated.php =====
+
+<?php
+
+namespace App\Http\Middleware;
+
+use Closure;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+
+class RedirectIfAuthenticated
+{
+    /**
+     * Handle an incoming request.
+     *
+     * If the user is authenticated, redirect them to the dashboard.
+     */
+    public function handle(Request $request, Closure $next, ...$guards)
+    {
+        $guards = empty($guards) ? [null] : $guards;
+
+        foreach ($guards as $guard) {
+            if (Auth::guard($guard)->check()) {
+                // 🚀 Redirect authenticated users away from login/register/forgot-password pages
+                return redirect()->intended('/dashboard');
+            }
+        }
+
+        return $next($request);
+    }
+}app/Http/Middleware/HandleInertiaRequests.php
+
+
+===== FILE: app/Http/Middleware/HandleInertiaRequests.php =====
+
+<?php
+
+namespace App\Http\Middleware;
+
+use Illuminate\Foundation\Inspiring;
+use Illuminate\Http\Request;
+use Inertia\Middleware;
+
+class HandleInertiaRequests extends Middleware
+{
+    /**
+     * The root template that's loaded on the first page visit.
+     *
+     * @see https://inertiajs.com/server-side-setup#root-template
+     *
+     * @var string
+     */
+    protected $rootView = 'app';
+
+    /**
+     * Determines the current asset version.
+     *
+     * @see https://inertiajs.com/asset-versioning
+     */
+    public function version(Request $request): ?string
+    {
+        return parent::version($request);
+    }
+
+    /**
+     * Define the props that are shared by default.
+     *
+     * @see https://inertiajs.com/shared-data
+     *
+     * @return array<string, mixed>
+     */
+    public function share(Request $request): array
+    {
+        [$message, $author] = str(Inspiring::quotes()->random())->explode('-');
+
+        return [
+            ...parent::share($request),
+            'name' => config('app.name'),
+            'quote' => ['message' => trim($message), 'author' => trim($author)],
+            'auth' => [
+                'user' => $request->user(),
+            ],
+            'sidebarOpen' => ! $request->hasCookie('sidebar_state') || $request->cookie('sidebar_state') === 'true',
+        ];
+    }
+}
+app/Http/Middleware/HandleAppearance.php
+
+
+===== FILE: app/Http/Middleware/HandleAppearance.php =====
+
+<?php
+
+namespace App\Http\Middleware;
+
+use Closure;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\View;
+use Symfony\Component\HttpFoundation\Response;
+
+class HandleAppearance
+{
+    /**
+     * Handle an incoming request.
+     *
+     * @param  \Closure(\Illuminate\Http\Request): (\Symfony\Component\HttpFoundation\Response)  $next
+     */
+    public function handle(Request $request, Closure $next): Response
+    {
+        View::share('appearance', $request->cookie('appearance') ?? 'system');
+
+        return $next($request);
+    }
+}
+app/Http/Requests/Settings/ProfileUpdateRequest.php
+
+
+===== FILE: app/Http/Requests/Settings/ProfileUpdateRequest.php =====
+
+<?php
+
+namespace App\Http\Requests\Settings;
+
+use App\Models\User;
+use Illuminate\Foundation\Http\FormRequest;
+use Illuminate\Validation\Rule;
+
+class ProfileUpdateRequest extends FormRequest
+{
+    /**
+     * Get the validation rules that apply to the request.
+     *
+     * @return array<string, \Illuminate\Contracts\Validation\ValidationRule|array<mixed>|string>
+     */
+    public function rules(): array
+    {
+        return [
+            'name' => ['required', 'string', 'max:255'],
+            'email' => [
+                'required',
+                'string',
+                'lowercase',
+                'email',
+                'max:255',
+                Rule::unique(User::class)->ignore($this->user()->id),
+            ],
+        ];
+    }
+}
+app/Http/Requests/Settings/TwoFactorAuthenticationRequest.php
+
+
+===== FILE: app/Http/Requests/Settings/TwoFactorAuthenticationRequest.php =====
+
+<?php
+
+namespace App\Http\Requests\Settings;
+
+use Illuminate\Foundation\Http\FormRequest;
+use Laravel\Fortify\Features;
+use Laravel\Fortify\InteractsWithTwoFactorState;
+
+class TwoFactorAuthenticationRequest extends FormRequest
+{
+    use InteractsWithTwoFactorState;
+
+    /**
+     * Determine if the user is authorized to make this request.
+     */
+    public function authorize(): bool
+    {
+        return Features::enabled(Features::twoFactorAuthentication());
+    }
+
+    /**
+     * Get the validation rules that apply to the request.
+     *
+     * @return array<string, \Illuminate\Contracts\Validation\ValidationRule|array<mixed>|string>
+     */
+    public function rules(): array
+    {
+        return [];
+    }
+}
+app/Http/Controllers/Settings/ProfileController.php
+
+
+===== FILE: app/Http/Controllers/Settings/ProfileController.php =====
+
+<?php
+
+namespace App\Http\Controllers\Settings;
+
+use App\Http\Controllers\Controller;
+use App\Http\Requests\Settings\ProfileUpdateRequest;
+use Illuminate\Contracts\Auth\MustVerifyEmail;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Inertia\Inertia;
+use Inertia\Response;
+
+class ProfileController extends Controller
+{
+    /**
+     * Show the user's profile settings page.
+     */
+    public function edit(Request $request): Response
+    {
+        return Inertia::render('settings/Profile', [
+            'mustVerifyEmail' => $request->user() instanceof MustVerifyEmail,
+            'status' => $request->session()->get('status'),
+        ]);
+    }
+
+    /**
+     * Update the user's profile information.
+     */
+    public function update(ProfileUpdateRequest $request): RedirectResponse
+    {
+        $request->user()->fill($request->validated());
+
+        if ($request->user()->isDirty('email')) {
+            $request->user()->email_verified_at = null;
+        }
+
+        $request->user()->save();
+
+        return to_route('profile.edit');
+    }
+
+    /**
+     * Delete the user's profile.
+     */
+    public function destroy(Request $request): RedirectResponse
+    {
+        $request->validate([
+            'password' => ['required', 'current_password'],
+        ]);
+
+        $user = $request->user();
+
+        Auth::logout();
+
+        $user->delete();
+
+        $request->session()->invalidate();
+        $request->session()->regenerateToken();
+
+        return redirect('/');
+    }
+}
+app/Http/Controllers/Settings/PasswordController.php
+
+
+===== FILE: app/Http/Controllers/Settings/PasswordController.php =====
+
+<?php
+
+namespace App\Http\Controllers\Settings;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Validation\Rules\Password;
+use Inertia\Inertia;
+use Inertia\Response;
+
+class PasswordController extends Controller
+{
+    /**
+     * Show the user's password settings page.
+     */
+    public function edit(): Response
+    {
+        return Inertia::render('settings/Password');
+    }
+
+    /**
+     * Update the user's password.
+     */
+    public function update(Request $request): RedirectResponse
+    {
+        $validated = $request->validate([
+            'current_password' => ['required', 'current_password'],
+            'password' => ['required', Password::defaults(), 'confirmed'],
+        ]);
+
+        $request->user()->update([
+            'password' => $validated['password'],
+        ]);
+
+        return back();
+    }
+}
+app/Http/Controllers/Settings/TwoFactorAuthenticationController.php
+
+
+===== FILE: app/Http/Controllers/Settings/TwoFactorAuthenticationController.php =====
+
+<?php
+
+namespace App\Http\Controllers\Settings;
+
+use App\Http\Controllers\Controller;
+use App\Http\Requests\Settings\TwoFactorAuthenticationRequest;
+use Illuminate\Routing\Controllers\HasMiddleware;
+use Illuminate\Routing\Controllers\Middleware;
+use Inertia\Inertia;
+use Inertia\Response;
+use Laravel\Fortify\Features;
+
+class TwoFactorAuthenticationController extends Controller implements HasMiddleware
+{
+    /**
+     * Get the middleware that should be assigned to the controller.
+     */
+    public static function middleware(): array
+    {
+        return Features::optionEnabled(Features::twoFactorAuthentication(), 'confirmPassword')
+            ? [new Middleware('password.confirm', only: ['show'])]
+            : [];
+    }
+
+    /**
+     * Show the user's two-factor authentication settings page.
+     */
+    public function show(TwoFactorAuthenticationRequest $request): Response
+    {
+        $request->ensureStateIsValid();
+
+        return Inertia::render('settings/TwoFactor', [
+            'twoFactorEnabled' => $request->user()->hasEnabledTwoFactorAuthentication(),
+            'requiresConfirmation' => Features::optionEnabled(Features::twoFactorAuthentication(), 'confirm'),
+        ]);
+    }
+}
+app/Http/Controllers/HomeController.php
+
+
+===== FILE: app/Http/Controllers/HomeController.php =====
+
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+
+class HomeController extends Controller
+{
+    public function index()
+    {
+        return view('home');
+    }
+}
+app/Http/Controllers/Controller.php
+
+
+===== FILE: app/Http/Controllers/Controller.php =====
+
+<?php
+
+namespace App\Http\Controllers;
+
+abstract class Controller
+{
+    //
+}
+app/Http/Controllers/SearchController.php
+
+
+===== FILE: app/Http/Controllers/SearchController.php =====
+
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use App\Models\Ticker;
+use Illuminate\Support\Str;
+
+class SearchController extends Controller
+{
+    /**
+     * Optionally show a search page (if you want a GET search page)
+     */
+    public function searchForm(Request $request)
+    {
+        return view('search');
+    }
+
+    /**
+     * Perform search: simple lookup by exact ticker symbol, otherwise try name fuzzy match.
+     * Then redirect to canonical ticker page.
+     */
+    public function performSearch(Request $request)
+    {
+        $q = trim($request->input('q', ''));
+
+        if (empty($q)) {
+            return redirect()->route('home')->with('error', 'Please enter a ticker or name.');
+        }
+
+        // If the user input looks like a ticker (all alpha-numeric, <=6 chars), try exact match first
+        $maybeTicker = preg_match('/^[A-Za-z0-9\.\-]{1,7}$/', $q);
+
+        if ($maybeTicker) {
+            $ticker = Ticker::whereRaw('upper(ticker) = ?', [strtoupper($q)])->first();
+            if ($ticker) {
+                return redirect()->route('tickers.show', ['symbol' => $ticker->ticker, 'slug' => $ticker->slug]);
+            }
+        }
+
+        // Fallback: try name search (simple LIKE, you can use full-text or Elastic later)
+        $ticker = Ticker::where('name', 'like', '%' . $q . '%')->first();
+
+        if ($ticker) {
+            return redirect()->route('tickers.show', ['symbol' => $ticker->ticker, 'slug' => $ticker->slug]);
+        }
+
+        // No exact matches; redirect back with message
+        return redirect()->back()->with('error', 'Ticker not found. Try the exact symbol, e.g., "AAPL" or a company name.');
+    }
+}app/Http/Controllers/Auth/NewPasswordController.php
+
+
+===== FILE: app/Http/Controllers/Auth/NewPasswordController.php =====
+
+<?php
+
+namespace App\Http\Controllers\Auth;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use Inertia\Inertia;
+use Inertia\Response;
+
+class NewPasswordController extends Controller
+{
+    /**
+     * Show the password reset page.
+     */
+    public function create(Request $request): Response
+    {
+        return Inertia::render('auth/ResetPassword', [
+            'token' => $request->route('token'),
+            'email' => $request->query('email'),
+        ]);
+    }
+
+    /**
+     * Handle the actual password reset submission.
+     */
+    public function store(Request $request)
+    {
+        $request->validate([
+            'token' => 'required',
+            'email' => 'required|email',
+            'password' => 'required|confirmed|min:8',
+        ]);
+
+        $status = \Password::reset(
+            $request->only('email', 'password', 'password_confirmation', 'token'),
+            function ($user, $password) {
+                $user->forceFill([
+                    'password' => bcrypt($password),
+                ])->save();
+
+                $user->setRememberToken(\Str::random(60));
+
+                event(new \Illuminate\Auth\Events\PasswordReset($user));
+            }
+        );
+
+        return $status === \Password::PASSWORD_RESET
+            ? redirect()->route('login')->with('status', __($status))
+            : back()->withErrors(['email' => __($status)]);
+    }
+}app/Http/Controllers/TickerAnalysisController.php
+
+
+===== FILE: app/Http/Controllers/TickerAnalysisController.php =====
+
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Cache;
+use App\Models\TickerAnalysis;
+use App\Jobs\RunTickerAnalysis;
+
+class TickerAnalysisController extends Controller
+{
+    /**
+     * Handle an AI analysis request for a given ticker.
+     */
+    public function requestAnalysis(Request $request)
+    {
+        $validated = $request->validate([
+            'ticker'   => 'required|string|max:10',
+            'provider' => 'required|string|in:openai,gemini,grok',
+        ]);
+
+        $user = Auth::user();
+        if (! $user) {
+            return response()->json(['message' => 'Unauthorized'], 401);
+        }
+
+        $ticker   = strtoupper($validated['ticker']);
+        $provider = strtolower($validated['provider']);
+
+        /**
+         * 1️⃣  Rate limiting per user
+         * -----------------------------------------
+         * Uses atomic increments to avoid race conditions.
+         * Defaults to 500 requests per hour per user, configurable via .env.
+         */
+        $limit   = config('app.ticker_analysis_rate_limit', 500);
+        $window  = config('app.ticker_analysis_rate_window', 60); // minutes
+        $rateKey = "ticker_analysis_rate:{$user->id}";
+
+        $count = Cache::add($rateKey, 1, now()->addMinutes($window)) 
+            ? 1 
+            : Cache::increment($rateKey);
+
+        if ($count > $limit) {
+            $ttl = Cache::getExpiration($rateKey) 
+                ? now()->addMinutes($window)->toDateTimeString() 
+                : now()->addMinutes($window)->toDateTimeString();
+
+            return response()->json([
+                'message'   => 'Rate limit exceeded',
+                'limit'     => $limit,
+                'used'      => $count,
+                'remaining' => max(0, $limit - $count),
+                'resets_at' => $ttl,
+            ], 429);
+        }
+
+        /**
+         * 2️⃣  Check for cached analysis
+         * -----------------------------------------
+         * Return most recent cached response if found.
+         */
+        $cacheKey = "ticker_analysis:{$ticker}:{$provider}";
+        if ($cached = Cache::get($cacheKey)) {
+            return response()->json([
+                'cached'     => true,
+                'structured' => $cached,
+                'analysis'   => $cached['analysis'] ?? ($cached['summary'] ?? ''),
+                'message'    => 'Returning cached analysis.',
+            ]);
+        }
+
+        /**
+         * 3️⃣  Queue a new analysis job
+         * -----------------------------------------
+         * Creates a database record and dispatches async job.
+         */
+        $analysis = TickerAnalysis::create([
+            'ticker'       => $ticker,
+            'provider'     => $provider,
+            'user_id'      => $user->id,
+            'model'        => config("services.$provider.model"),
+            'status'       => 'pending',
+            'requested_at' => now(),
+        ]);
+
+        RunTickerAnalysis::dispatch($analysis)->onQueue('ticker_analysis');
+
+        return response()->json([
+            'analysis_id' => $analysis->id,
+            'status'      => 'queued',
+            'message'     => 'Analysis request queued successfully.',
+        ]);
+    }
+
+    /**
+     * Return details for a specific analysis request.
+     */
+    public function show($id)
+    {
+        $analysis = TickerAnalysis::findOrFail($id);
+        $this->authorize('view', $analysis);
+
+        return response()->json([
+            'id'           => $analysis->id,
+            'ticker'       => $analysis->ticker,
+            'provider'     => $analysis->provider,
+            'status'       => $analysis->status,
+            'summary'      => $analysis->summary,
+            'structured'   => $analysis->structured,
+            'model'        => $analysis->model,
+            'created_at'   => $analysis->created_at,
+            'completed_at' => $analysis->completed_at,
+        ]);
+    }
+}app/Http/Controllers/Api/TickerApiController.php
+
+
+===== FILE: app/Http/Controllers/Api/TickerApiController.php =====
+
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use App\Models\Ticker;
+
+class TickerApiController extends Controller
+{
+    public function search(Request $request)
+    {
+        $q = $request->query('q', '');
+        if (empty($q)) {
+            return response()->json([]);
+        }
+
+        $results = Ticker::where('ticker', 'like', $q . '%')
+            ->orWhere('name', 'like', '%' . $q . '%')
+            ->limit(10)
+            ->get(['ticker', 'name', 'slug']);
+
+        return response()->json($results);
+    }
+}app/Http/Controllers/TickerController.php
+
+
+===== FILE: app/Http/Controllers/TickerController.php =====
+
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use App\Models\Ticker;
+use App\Models\TickerAnalysis;
+use Inertia\Inertia;
+use Inertia\Response;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Support\Str;
+use Illuminate\Support\Facades\Auth;
+
+class TickerController extends Controller
+{
+    /**
+     * Show the ticker profile page via Inertia.
+     */
+    public function show(Request $request, string $symbol, ?string $slug = null): Response|RedirectResponse
+    {
+        $ticker = Ticker::whereRaw('upper(ticker) = ?', [strtoupper($symbol)])
+            ->with(['overviews' => function ($q) {
+                // eager-load the latest overview first (we'll pick the latest)
+                $q->orderByDesc('fetched_at')->limit(1);
+            }])
+            ->firstOrFail();
+
+        $canonicalSlug = $ticker->slug ?? Str::slug($ticker->name ?? '');
+
+        if (empty($slug) || $slug !== $canonicalSlug) {
+            return redirect()->route('tickers.show', [
+                'symbol' => $ticker->ticker,
+                'slug'   => $canonicalSlug,
+            ], 301);
+        }
+
+        // ==========================================
+        // Fetch most recent completed + valid AI analysis (<= 24h old)
+        // ==========================================
+        $latestAnalysis = TickerAnalysis::where('ticker', strtoupper($ticker->ticker))
+            ->where('status', 'completed')
+            ->whereNotNull('response_raw')
+            ->whereRaw("(response_raw != '' AND response_raw != '[]')")
+            ->where('requested_at', '>=', now()->subDay())
+            ->orderByDesc('completed_at')
+            ->first();
+
+        $analysisContent = null;
+
+        if ($latestAnalysis) {
+            $raw = $latestAnalysis->response_raw;
+
+            if (is_string($raw)) {
+                $decoded = json_decode($raw, true);
+                $response = is_array($decoded) ? $decoded : [];
+            } elseif (is_array($raw)) {
+                $response = $raw;
+            } else {
+                $response = [];
+            }
+
+            $analysisContent = $response['content']
+                ?? $response['summary']
+                ?? ($latestAnalysis->summary ?? $latestAnalysis->output ?? null);
+        }
+
+        // ==========================================
+        // Latest overview snapshot
+        // ==========================================
+        $latestOverview = $ticker->overviews->first() ?? null;
+
+        // Determine logo (prefer ticker.branding_logo_url then overview payload)
+        $logoUrl = $ticker->branding_logo_url
+            ?? optional($latestOverview)->results_raw['branding']['logo_url'] ?? null
+            ?? null;
+
+        // Friendly values
+        $formattedMarketCap = $ticker->formatted_market_cap ?? ($latestOverview?->formatted_market_cap ?? null);
+        $listDate = $ticker->list_date ? $ticker->list_date->toDateString() : ($latestOverview?->overview_date?->toDateString() ?? null);
+        $employees = $ticker->total_employees ?? ($latestOverview->results_raw['total_employees'] ?? null);
+        $phone = $ticker->phone_number ?? ($latestOverview->results_raw['phone_number'] ?? null);
+        $sic = $ticker->sic_description ?? ($latestOverview->results_raw['sic_description'] ?? null);
+
+        // Prepare quick stats (server-side) — you can add/remove entries here
+        $quickStats = [
+            [
+                'label' => 'Market Cap',
+                'value' => $formattedMarketCap ?? '—',
+            ],
+            [
+                'label' => 'Employees',
+                'value' => $employees ? number_format($employees) : '—',
+            ],
+            [
+                'label' => 'List Date',
+                'value' => $listDate ?? '—',
+            ],
+            [
+                'label' => 'SIC',
+                'value' => $sic ?? '—',
+            ],
+        ];
+
+        // Send the enriched payload to the Vue page
+        return Inertia::render('tickers/Show', [
+            'ticker' => [
+                'id'               => $ticker->id,
+                'ticker'           => $ticker->ticker,
+                'name'             => $ticker->name,
+                'slug'             => $canonicalSlug,
+                'market'           => $ticker->market ?? null,
+                'locale'           => $ticker->locale ?? null,
+                'primary_exchange' => $ticker->primary_exchange ?? null,
+                'currency_name'    => $ticker->currency_name ?? null,
+                'type'             => $ticker->type ?? null,
+                'active'           => (bool) $ticker->active,
+                // overview fields
+                'description'      => $ticker->description ?? ($latestOverview->results_raw['description'] ?? null),
+                'homepage_url'     => $ticker->homepage_url ?? ($latestOverview->results_raw['homepage_url'] ?? null),
+                'market_cap'       => $ticker->market_cap ?? ($latestOverview->market_cap ?? null),
+                'formatted_market_cap' => $formattedMarketCap ?? null,
+                'total_employees'  => $employees,
+                'phone_number'     => $phone,
+                'list_date'        => $listDate,
+                'sic_description'  => $sic,
+                'branding_logo_url'=> $logoUrl,
+            ],
+            'quickStats' => $quickStats,
+            'user' => [
+                'authenticated' => Auth::check(),
+                'loginUrl'      => route('login', [], false),
+            ],
+            'latestAnalysis' => $latestAnalysis ? [
+                'provider'  => $latestAnalysis->provider,
+                'content'   => $analysisContent,
+                'completed' => optional($latestAnalysis->completed_at)->toIso8601String(),
+            ] : null,
+        ]);
+    }
+}
+[EOF: app/Http]

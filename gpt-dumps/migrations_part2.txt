@@ -1,0 +1,1251 @@
+===== GPT DUMP GENERATED: 2025-10-30T00:32:43Z =====
+===== DATABASE MIGRATIONS (Part 2 - Remaining Files) =====
+
+
+
+===== FILE: database/migrations/2025_10_25_193123_add_timestamps_to_failed_ticker_overviews_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('failed_ticker_overviews', function (Blueprint $table) {
+            $table->timestamps();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('failed_ticker_overviews', function (Blueprint $table) {
+            $table->dropTimestamps();
+        });
+    }
+};
+
+
+===== FILE: database/migrations/2025_10_25_231557_create_ticker_price_histories_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('ticker_price_histories', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('ticker_id')->constrained('tickers')->cascadeOnDelete();
+            $table->string('ticker', 16)->index();
+            $table->string('resolution', 8)->default('1d')->index(); // 1m, 5m, 15m, 1d, etc.
+            $table->timestamp('t')->index(); // timestamp of bar (UTC)
+            $table->decimal('o', 16, 6)->nullable();
+            $table->decimal('h', 16, 6)->nullable();
+            $table->decimal('l', 16, 6)->nullable();
+            $table->decimal('c', 16, 6)->nullable();
+            $table->bigInteger('v')->nullable();
+            $table->json('raw')->nullable();
+            $table->unique(['ticker_id', 'resolution', 't']);
+            $table->timestamps();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('ticker_price_histories');
+    }
+};
+
+===== FILE: database/migrations/2025_10_25_231714_create_ticker_indicators_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('ticker_indicators', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('ticker_id')->constrained('tickers')->cascadeOnDelete();
+            $table->string('resolution', 8)->default('1d')->index();
+            $table->timestamp('t')->index();
+            $table->string('indicator')->index(); // e.g. sma_20, ema_50, rsi_14
+            $table->decimal('value', 24, 8)->nullable();
+            $table->json('meta')->nullable(); // For complex indicators (MACD, Bollinger)
+            $table->unique(['ticker_id', 'resolution', 't', 'indicator']);
+            $table->timestamps();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('ticker_indicators');
+    }
+};
+
+===== FILE: database/migrations/2025_10_25_231845_create_ticker_news_items_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('ticker_news_items', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('ticker_id')->nullable()->constrained('tickers')->nullOnDelete()->index();
+            $table->string('ticker', 16)->nullable()->index();
+            $table->string('source')->nullable();
+            $table->string('url')->nullable();
+            $table->string('title')->nullable();
+            $table->text('summary')->nullable();
+            $table->timestamp('published_at')->nullable()->index();
+            $table->json('raw')->nullable();
+            $table->timestamps();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('ticker_news_items');
+    }
+};
+
+===== FILE: database/migrations/2025_10_26_011635_optimize_ticker_price_histories_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\DB;
+
+return new class extends Migration
+{
+    /**
+     * NOTE:
+     * - This migration is intentionally defensive. It will:
+     *   1) Add a generated column `t_year` storing YEAR(t)
+     *   2) Create helpful indexes for common queries
+     *   3) Attempt to partition the table by YEAR using RANGE on t_year
+     *
+     * WARNING:
+     * - Partitioning an existing large table may take a long time and lock the table.
+     * - Test in staging and/or run during a maintenance window.
+     */
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        $table = 'ticker_price_histories';
+
+        // 1) Add generated column t_year if it doesn't exist
+        $hasColumn = DB::selectOne("SELECT COUNT(*) AS cnt FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 't_year'", [$table])->cnt ?? 0;
+        if (! $hasColumn) {
+            // Use STORED generated column so it can be indexed and used for partitioning
+            DB::statement("ALTER TABLE `{$table}` ADD COLUMN `t_year` INT GENERATED ALWAYS AS (YEAR(`t`)) STORED");
+        }
+
+        // 2) Add / ensure indexes
+        // Composite index for (ticker_id, resolution, t) - useful for time-range queries per ticker
+        $indexExists = DB::selectOne("SELECT COUNT(*) AS cnt FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = 'idx_ticker_resolution_t'", [$table])->cnt ?? 0;
+        if (! $indexExists) {
+            DB::statement("CREATE INDEX idx_ticker_resolution_t ON `{$table}` (`ticker_id`, `resolution`, `t`)");
+        }
+
+        // Index by date (t) for range queries across tickers
+        $idxT = DB::selectOne("SELECT COUNT(*) AS cnt FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = 'idx_t'", [$table])->cnt ?? 0;
+        if (! $idxT) {
+            DB::statement("CREATE INDEX idx_t ON `{$table}` (`t`)");
+        }
+
+        // Index on t_year to help partition pruning / queries
+        $idxYear = DB::selectOne("SELECT COUNT(*) AS cnt FROM INFORMATION_SCHEMA.STATISTICS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND INDEX_NAME = 'idx_t_year'", [$table])->cnt ?? 0;
+        if (! $idxYear) {
+            DB::statement("CREATE INDEX idx_t_year ON `{$table}` (`t_year`)");
+        }
+
+        // 3) Attempt to partition the table by RANGE on t_year
+        // Build partitions from 2015 through next year, plus MAXVALUE
+        $currentYear = (int) date('Y');
+        $startYear = 2015;
+        $endYear = $currentYear + 1;
+
+        // Check if the table is already partitioned
+        $isPartitioned = DB::selectOne("SELECT COUNT(*) AS cnt FROM INFORMATION_SCHEMA.PARTITIONS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", [$table])->cnt ?? 0;
+
+        if (! $isPartitioned) {
+            $parts = [];
+            for ($y = $startYear; $y <= $endYear; $y++) {
+                $label = "p{$y}";
+                $lessThan = $y + 1; // partition holds years < (y+1) => year == y
+                $parts[] = "PARTITION `{$label}` VALUES LESS THAN ({$lessThan})";
+            }
+            $parts[] = "PARTITION `pmax` VALUES LESS THAN (MAXVALUE)";
+            $partSql = implode(",\n    ", $parts);
+
+            $partitionStmt = "ALTER TABLE `{$table}` PARTITION BY RANGE (`t_year`) (\n    {$partSql}\n)";
+
+            // Try to run partitioning; wrap in try/catch because this may fail on some engines or existing data.
+            try {
+                DB::statement($partitionStmt);
+            } catch (\Throwable $e) {
+                // Partitioning can fail on large tables or specific server configs.
+                // Log the error to the Laravel log and continue; an operator can run partitioning manually.
+                \Illuminate\Support\Facades\Log::warning("Partitioning attempt failed for {$table}: " . $e->getMessage());
+            }
+        }
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        $table = 'ticker_price_histories';
+
+        // Remove partitioning if present - this operation can be heavy.
+        try {
+            // Only try if partitions exist
+            $isPartitioned = DB::selectOne("SELECT COUNT(*) AS cnt FROM INFORMATION_SCHEMA.PARTITIONS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?", [$table])->cnt ?? 0;
+            if ($isPartitioned) {
+                DB::statement("ALTER TABLE `{$table}` REMOVE PARTITIONING");
+            }
+        } catch (\Throwable $e) {
+            \Illuminate\Support\Facades\Log::warning("Failed to remove partitioning for {$table}: " . $e->getMessage());
+        }
+
+        // Drop the generated column if it exists
+        $hasColumn = DB::selectOne("SELECT COUNT(*) AS cnt FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = 't_year'", [$table])->cnt ?? 0;
+        if ($hasColumn) {
+            DB::statement("ALTER TABLE `{$table}` DROP COLUMN `t_year`");
+        }
+
+        // Drop indexes we created (ignore errors)
+        try {
+            DB::statement("DROP INDEX idx_ticker_resolution_t ON `{$table}`");
+        } catch (\Throwable $e) {
+            // ignore
+        }
+        try {
+            DB::statement("DROP INDEX idx_t ON `{$table}`");
+        } catch (\Throwable $e) {
+            // ignore
+        }
+        try {
+            DB::statement("DROP INDEX idx_t_year ON `{$table}`");
+        } catch (\Throwable $e) {
+            // ignore
+        }
+    }
+};
+
+===== FILE: database/migrations/2025_10_26_012358_add_performance_indexes_to_ticker_price_histories_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\DB;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        if (!Schema::hasTable('ticker_price_histories')) {
+            return;
+        }
+
+        Schema::table('ticker_price_histories', function (Blueprint $table) {
+            // Add performance indexes (if not already present)
+            $table->index(['ticker', 't'], 'ticker_t_index');
+            $table->index(['ticker', 'resolution'], 'ticker_resolution_index');
+            $table->index('t', 't_index');
+            $table->unique(['ticker', 't', 'resolution'], 'unique_ticker_t_resolution');
+        });
+
+        // Optional but highly useful: create a materialized-style view for the latest price per ticker
+        DB::statement("
+            CREATE OR REPLACE VIEW latest_ticker_prices AS
+            SELECT tph.*
+            FROM ticker_price_histories tph
+            INNER JOIN (
+                SELECT ticker, MAX(t) AS latest_t
+                FROM ticker_price_histories
+                GROUP BY ticker
+            ) latest
+            ON tph.ticker = latest.ticker AND tph.t = latest.latest_t
+        ");
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        if (!Schema::hasTable('ticker_price_histories')) {
+            return;
+        }
+
+        Schema::table('ticker_price_histories', function (Blueprint $table) {
+            $table->dropIndex('ticker_t_index');
+            $table->dropIndex('ticker_resolution_index');
+            $table->dropIndex('t_index');
+            $table->dropUnique('unique_ticker_t_resolution');
+        });
+
+        DB::statement('DROP VIEW IF EXISTS latest_ticker_prices');
+    }
+};
+
+===== FILE: database/migrations/2025_10_26_025540_add_latest_price_index_to_ticker_price_histories_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\DB;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        // We’ll use a raw query to safely check existing indexes in MariaDB.
+        $table = 'ticker_price_histories';
+        $indexName = 'idx_ticker_latest';
+
+        // Check if index already exists
+        $indexExists = DB::select("
+            SHOW INDEX FROM {$table} WHERE Key_name = ?
+        ", [$indexName]);
+
+        if (empty($indexExists)) {
+            Schema::table($table, function (Blueprint $table) use ($indexName) {
+                // Add compound index for latest prices per ticker
+                // `t` is the date column
+                $table->index(['ticker', 't'], $indexName);
+            });
+        }
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('ticker_price_histories', function (Blueprint $table) {
+            $table->dropIndex('idx_ticker_latest');
+        });
+    }
+};
+
+===== FILE: database/migrations/2025_10_26_032603_partition_ticker_price_histories_final_fix.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        // Step 1: Ensure 'year' column exists
+        if (!Schema::hasColumn('ticker_price_histories', 'year')) {
+            Schema::table('ticker_price_histories', function ($table) {
+                $table->unsignedSmallInteger('year')->nullable()->after('t');
+            });
+
+            DB::statement("UPDATE ticker_price_histories SET year = YEAR(t)");
+            Schema::table('ticker_price_histories', function ($table) {
+                $table->unsignedSmallInteger('year')->nullable(false)->change();
+            });
+        }
+
+        // Step 2: Rebuild primary key safely
+        // First check if 'year' is already part of the primary key
+        $indexes = DB::select("SHOW INDEX FROM ticker_price_histories WHERE Key_name = 'PRIMARY'");
+        $hasYear = collect($indexes)->contains(fn($i) => $i->Column_name === 'year');
+
+        if (!$hasYear) {
+            // Use MODIFY instead of DROP+ADD to preserve AUTO_INCREMENT
+            DB::statement('ALTER TABLE ticker_price_histories MODIFY id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY');
+            DB::statement('ALTER TABLE ticker_price_histories DROP PRIMARY KEY, ADD PRIMARY KEY (id, year)');
+        }
+
+        // Step 3: Drop and recreate any unique indexes that exclude 'year'
+        $uniqueKeys = DB::select("
+            SELECT DISTINCT INDEX_NAME
+            FROM information_schema.STATISTICS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = 'ticker_price_histories'
+              AND NON_UNIQUE = 0
+              AND INDEX_NAME != 'PRIMARY'
+        ");
+
+        foreach ($uniqueKeys as $key) {
+            $cols = DB::select("
+                SELECT COLUMN_NAME
+                FROM information_schema.STATISTICS
+                WHERE TABLE_SCHEMA = DATABASE()
+                  AND TABLE_NAME = 'ticker_price_histories'
+                  AND INDEX_NAME = ?
+                ORDER BY SEQ_IN_INDEX
+            ", [$key->INDEX_NAME]);
+
+            $colNames = collect($cols)->pluck('COLUMN_NAME')->toArray();
+            if (!in_array('year', $colNames)) {
+                DB::statement("ALTER TABLE ticker_price_histories DROP INDEX `{$key->INDEX_NAME}`");
+                DB::statement("ALTER TABLE ticker_price_histories ADD UNIQUE KEY `{$key->INDEX_NAME}_year` (" . implode(',', $colNames) . ", year)");
+            }
+        }
+
+        // Step 4: Apply partitioning
+        try {
+            DB::statement("
+                ALTER TABLE ticker_price_histories
+                PARTITION BY RANGE (year) (
+                    PARTITION p2020 VALUES LESS THAN (2021),
+                    PARTITION p2021 VALUES LESS THAN (2022),
+                    PARTITION p2022 VALUES LESS THAN (2023),
+                    PARTITION p2023 VALUES LESS THAN (2024),
+                    PARTITION p2024 VALUES LESS THAN (2025),
+                    PARTITION p2025 VALUES LESS THAN (2026),
+                    PARTITION pmax  VALUES LESS THAN MAXVALUE
+                );
+            ");
+        } catch (\Throwable $e) {
+            throw new \RuntimeException('Failed to apply partitioning: ' . $e->getMessage());
+        }
+    }
+
+    
+    public function down(): void
+    {
+        // rollback only drops partitioning and 'year'
+        try {
+            DB::statement("ALTER TABLE ticker_price_histories REMOVE PARTITIONING");
+        } catch (\Throwable $e) {
+            // ignore if already removed
+        }
+
+        if (Schema::hasColumn('ticker_price_histories', 'year')) {
+            Schema::table('ticker_price_histories', function ($table) {
+                $table->dropColumn('year');
+            });
+        }
+    }
+};
+
+===== FILE: database/migrations/2025_10_26_054457_add_vw_to_ticker_price_histories_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('ticker_price_histories', function (Blueprint $table) {
+            $table->decimal('vw', 12, 6)->nullable()->after('v');
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('ticker_price_histories', function (Blueprint $table) {
+            $table->dropColumn('vw');
+        });
+    }
+};
+
+
+===== FILE: database/migrations/2025_10_26_055453_safely_remove_ticker_column_from_ticker_price_histories_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\DB;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        // First, drop all indexes that reference the `ticker` column
+        $indexes = [
+            'unique_ticker_t_resolution_year',
+            'ticker_t_index',
+            'ticker_resolution_index',
+            'ticker_price_histories_ticker_index',
+            'idx_ticker_latest',
+        ];
+
+        foreach ($indexes as $index) {
+            try {
+                DB::statement("ALTER TABLE ticker_price_histories DROP INDEX `$index`");
+            } catch (\Throwable $e) {
+                // Ignore if index doesn't exist
+            }
+        }
+
+        // Finally, drop the ticker column if it exists
+        Schema::table('ticker_price_histories', function (Blueprint $table) {
+            if (Schema::hasColumn('ticker_price_histories', 'ticker')) {
+                $table->dropColumn('ticker');
+            }
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('ticker_price_histories', function (Blueprint $table) {
+            if (!Schema::hasColumn('ticker_price_histories', 'ticker')) {
+                $table->string('ticker', 16)->nullable()->after('ticker_id');
+            }
+
+            // Optionally restore one index if needed
+            $table->index('ticker');
+        });
+    }
+};
+
+===== FILE: database/migrations/2025_10_26_180113_add_timestamps_to_job_batches_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('job_batches', function (Blueprint $table) {
+            if (!Schema::hasColumn('job_batches', 'created_at')) {
+                $table->timestamp('created_at')->nullable();
+            }
+            if (!Schema::hasColumn('job_batches', 'updated_at')) {
+                $table->timestamp('updated_at')->nullable();
+            }
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('job_batches', function (Blueprint $table) {
+            $table->dropColumn(['created_at', 'updated_at']);
+        });
+    }
+};
+
+===== FILE: database/migrations/2025_10_26_180545_fix_timestamps_in_job_batches_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('job_batches', function (Blueprint $table) {
+            $table->datetime('created_at')->nullable()->change();
+            $table->datetime('updated_at')->nullable()->change();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('job_batches', function (Blueprint $table) {
+            $table->timestamp('created_at')->nullable()->change();
+            $table->timestamp('updated_at')->nullable()->change();
+        });
+    }
+};
+
+===== FILE: database/migrations/2025_10_26_181650_fix_job_batches_datetime_columns.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('job_batches', function (Blueprint $table) {
+            // Convert integer timestamp columns to proper datetime
+            $table->dateTime('created_at')->nullable()->change();
+            $table->dateTime('finished_at')->nullable()->change();
+            $table->dateTime('cancelled_at')->nullable()->change();
+        });
+    }
+
+    
+    public function down(): void
+    {
+        Schema::table('job_batches', function (Blueprint $table) {
+            // Rollback to integer timestamps if needed
+            $table->bigInteger('created_at')->nullable()->change();
+            $table->bigInteger('finished_at')->nullable()->change();
+            $table->bigInteger('cancelled_at')->nullable()->change();
+        });
+    }
+};
+
+===== FILE: database/migrations/2025_10_28_161045_add_author_and_enhanced_fields_to_ticker_news_items_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('ticker_news_items', function (Blueprint $table) {
+            // --- Rename existing column for consistency ---
+            if (Schema::hasColumn('ticker_news_items', 'source')) {
+                $table->renameColumn('source', 'publisher_name');
+            }
+
+            // --- New structured Polygon.io fields ---
+            $table->string('article_id', 128)->nullable()->after('id')->index();
+            $table->string('author', 255)->nullable()->after('publisher_name');
+            $table->string('image_url', 512)->nullable()->after('summary');
+            $table->string('amp_url', 512)->nullable()->after('image_url');
+
+            // Publisher details (beyond name)
+            $table->string('publisher_logo_url', 512)->nullable()->after('author');
+            $table->string('publisher_favicon_url', 512)->nullable()->after('publisher_logo_url');
+            $table->string('publisher_homepage_url', 512)->nullable()->after('publisher_favicon_url');
+
+            // Related tickers, keywords, and insights
+            $table->json('tickers_list')->nullable()->after('publisher_homepage_url');
+            $table->json('keywords')->nullable()->after('tickers_list');
+            $table->json('insights')->nullable()->after('keywords');
+
+            // Flattened insight fields for direct filtering
+            $table->string('insight_sentiment', 32)->nullable()->after('insights');
+            $table->text('insight_reasoning')->nullable()->after('insight_sentiment');
+            $table->string('insight_ticker', 16)->nullable()->after('insight_reasoning');
+
+            // Rename published_at → published_utc for consistency
+            if (Schema::hasColumn('ticker_news_items', 'published_at')) {
+                $table->renameColumn('published_at', 'published_utc');
+            }
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('ticker_news_items', function (Blueprint $table) {
+            // Drop new fields
+            $table->dropColumn([
+                'article_id',
+                'author',
+                'image_url',
+                'amp_url',
+                'publisher_logo_url',
+                'publisher_favicon_url',
+                'publisher_homepage_url',
+                'tickers_list',
+                'keywords',
+                'insights',
+                'insight_sentiment',
+                'insight_reasoning',
+                'insight_ticker',
+            ]);
+
+            // Rename back to original
+            if (Schema::hasColumn('ticker_news_items', 'publisher_name')) {
+                $table->renameColumn('publisher_name', 'source');
+            }
+
+            if (Schema::hasColumn('ticker_news_items', 'published_utc')) {
+                $table->renameColumn('published_utc', 'published_at');
+            }
+        });
+    }
+};
+
+===== FILE: database/migrations/2025_10_28_230455_create_ticker_fundamentals_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('ticker_fundamentals', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('ticker_id')->nullable()->index();
+            $table->foreign('ticker_id', 'fk_tfundamentals_ticker_id')->references('id')->on('tickers')->nullOnDelete();
+            $table->string('ticker', 16)->index();
+            $table->string('cik', 32)->nullable()->index();
+            $table->string('company_name')->nullable();
+
+            $table->string('fiscal_period', 8)->nullable()->index(); // e.g., Q1, Q2, FY
+            $table->string('fiscal_year', 8)->nullable()->index();
+            $table->string('timeframe', 16)->nullable()->index(); // e.g., quarterly, annual
+            $table->string('status', 16)->nullable()->index();
+
+            $table->date('start_date')->nullable()->index();
+            $table->date('end_date')->nullable()->index();
+            $table->date('filing_date')->nullable()->index();
+
+            $table->string('source_filing_url', 512)->nullable();
+            $table->string('source_filing_file_url', 512)->nullable();
+
+            // Core top-level metrics for quick access
+            $table->decimal('total_assets', 24, 2)->nullable();
+            $table->decimal('total_liabilities', 24, 2)->nullable();
+            $table->decimal('equity', 24, 2)->nullable();
+            $table->decimal('net_income', 24, 2)->nullable();
+            $table->decimal('revenue', 24, 2)->nullable();
+            $table->decimal('operating_income', 24, 2)->nullable();
+            $table->decimal('gross_profit', 24, 2)->nullable();
+            $table->decimal('eps_basic', 16, 4)->nullable();
+            $table->decimal('eps_diluted', 16, 4)->nullable();
+
+            // Raw JSON blobs
+            $table->json('balance_sheet')->nullable();
+            $table->json('income_statement')->nullable();
+            $table->json('cash_flow_statement')->nullable();
+            $table->json('comprehensive_income')->nullable();
+            $table->json('raw')->nullable();
+
+            $table->timestamp('fetched_at')->nullable();
+            $table->timestamps();
+
+            $table->unique(['ticker_id', 'fiscal_year', 'fiscal_period'], 'uq_tfundamentals_unique_period');
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('ticker_fundamentals');
+    }
+};
+
+
+===== FILE: database/migrations/2025_10_28_230558_create_ticker_fundamentals_financials_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('ticker_fundamentals_financials', function (Blueprint $table) {
+            $table->id();
+
+            // Foreign key to tickers
+            $table->foreignId('ticker_id')->nullable()->index();
+            $table->foreign('ticker_id', 'fk_tfundamentals_financials_ticker_id')
+                  ->references('id')
+                  ->on('tickers')
+                  ->nullOnDelete();
+
+            // Core identifying fields
+            $table->string('ticker', 16)->index();
+            $table->string('fiscal_period', 8)->nullable()->index(); // Q1, Q2, FY, etc.
+            $table->string('fiscal_year', 8)->nullable()->index();
+            $table->date('start_date')->nullable();
+            $table->date('end_date')->nullable();
+            $table->date('filing_date')->nullable();
+
+            // Financial summary metrics
+            $table->decimal('assets', 24, 2)->nullable();
+            $table->decimal('liabilities', 24, 2)->nullable();
+            $table->decimal('equity', 24, 2)->nullable();
+            $table->decimal('revenues', 24, 2)->nullable();
+            $table->decimal('net_income', 24, 2)->nullable();
+            $table->decimal('gross_profit', 24, 2)->nullable();
+            $table->decimal('operating_income', 24, 2)->nullable();
+            $table->decimal('eps_basic', 16, 4)->nullable();
+            $table->decimal('eps_diluted', 16, 4)->nullable();
+
+            // Full JSON statements for detailed analytics
+            $table->json('balance_sheet')->nullable();
+            $table->json('income_statement')->nullable();
+            $table->json('cash_flow_statement')->nullable();
+            $table->json('comprehensive_income')->nullable();
+
+            // Raw payload for traceability
+            $table->json('raw')->nullable();
+
+            // Timestamp from Polygon response and local ingestion tracking
+            $table->timestamp('fetched_at')->nullable();
+            $table->timestamps();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('ticker_fundamentals_financials');
+    }
+};
+
+===== FILE: database/migrations/2025_10_29_061652_extend_ticker_fundamentals_financials_for_metrics.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('ticker_fundamentals_financials', function (Blueprint $table) {
+            if (!Schema::hasColumn('ticker_fundamentals_financials', 'statement')) {
+                $table->string('statement', 64)->nullable()->after('ticker');
+            }
+            if (!Schema::hasColumn('ticker_fundamentals_financials', 'line_item')) {
+                $table->string('line_item', 128)->nullable()->after('statement');
+            }
+            if (!Schema::hasColumn('ticker_fundamentals_financials', 'label')) {
+                $table->string('label')->nullable()->after('line_item');
+            }
+            if (!Schema::hasColumn('ticker_fundamentals_financials', 'unit')) {
+                $table->string('unit')->nullable()->after('label');
+            }
+            if (!Schema::hasColumn('ticker_fundamentals_financials', 'display_order')) {
+                $table->integer('display_order')->nullable()->after('unit');
+            }
+            if (!Schema::hasColumn('ticker_fundamentals_financials', 'value')) {
+                $table->decimal('value', 24, 4)->nullable()->after('display_order');
+            }
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('ticker_fundamentals_financials', function (Blueprint $table) {
+            foreach (['statement','line_item','label','unit','display_order','value'] as $col) {
+                if (Schema::hasColumn('ticker_fundamentals_financials', $col)) {
+                    $table->dropColumn($col);
+                }
+            }
+        });
+    }
+};
+
+
+===== FILE: database/migrations/2025_10_29_062011_add_fundamental_id_to_ticker_fundamentals_financials.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('ticker_fundamentals_financials', function (Blueprint $table) {
+            if (!Schema::hasColumn('ticker_fundamentals_financials', 'fundamental_id')) {
+                $table->foreignId('fundamental_id')
+                      ->nullable()
+                      ->after('ticker_id')
+                      ->constrained('ticker_fundamentals')
+                      ->onDelete('cascade');
+            }
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('ticker_fundamentals_financials', function (Blueprint $table) {
+            if (Schema::hasColumn('ticker_fundamentals_financials', 'fundamental_id')) {
+                $table->dropForeign(['fundamental_id']);
+                $table->dropColumn('fundamental_id');
+            }
+        });
+    }
+};
+
+===== FILE: database/migrations/2025_10_29_063912_cleanup_ticker_fundamentals_financials_columns.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('ticker_fundamentals_financials', function (Blueprint $table) {
+            // Drop redundant high-level summary and JSON columns
+            $dropColumns = [
+                'assets', 'liabilities', 'equity', 'revenues', 'net_income',
+                'gross_profit', 'operating_income', 'eps_basic', 'eps_diluted',
+                'balance_sheet', 'income_statement', 'cash_flow_statement',
+                'comprehensive_income', 'raw', 'fetched_at', 'filing_date',
+                'start_date'
+            ];
+
+            foreach ($dropColumns as $col) {
+                if (Schema::hasColumn('ticker_fundamentals_financials', $col)) {
+                    $table->dropColumn($col);
+                }
+            }
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('ticker_fundamentals_financials', function (Blueprint $table) {
+            // Recreate dropped columns (basic structure only)
+            $table->decimal('assets', 24, 2)->nullable();
+            $table->decimal('liabilities', 24, 2)->nullable();
+            $table->decimal('equity', 24, 2)->nullable();
+            $table->decimal('revenues', 24, 2)->nullable();
+            $table->decimal('net_income', 24, 2)->nullable();
+            $table->decimal('gross_profit', 24, 2)->nullable();
+            $table->decimal('operating_income', 24, 2)->nullable();
+            $table->decimal('eps_basic', 16, 4)->nullable();
+            $table->decimal('eps_diluted', 16, 4)->nullable();
+            $table->longText('balance_sheet')->nullable();
+            $table->longText('income_statement')->nullable();
+            $table->longText('cash_flow_statement')->nullable();
+            $table->longText('comprehensive_income')->nullable();
+            $table->longText('raw')->nullable();
+            $table->timestamp('fetched_at')->nullable();
+            $table->date('filing_date')->nullable();
+            $table->date('start_date')->nullable();
+        });
+    }
+};
+
+===== FILE: database/migrations/2025_10_29_064334_add_indexes_to_ticker_fundamentals_financials.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    public function up(): void
+    {
+        Schema::table('ticker_fundamentals_financials', function (Blueprint $table) {
+            // Add optimized indexes for high-speed analytics
+            $table->index(['ticker_id', 'end_date'], 'tff_ticker_end_date_index');
+            $table->index(['fiscal_year', 'fiscal_period'], 'tff_fiscal_index');
+            $table->index(['statement', 'line_item'], 'tff_statement_line_item_index');
+            $table->index(['ticker', 'statement'], 'tff_ticker_statement_index');
+        });
+    }
+
+    public function down(): void
+    {
+        Schema::table('ticker_fundamentals_financials', function (Blueprint $table) {
+            $table->dropIndex('tff_ticker_end_date_index');
+            $table->dropIndex('tff_fiscal_index');
+            $table->dropIndex('tff_statement_line_item_index');
+            $table->dropIndex('tff_ticker_statement_index');
+        });
+    }
+};
+
+===== FILE: database/migrations/2025_10_29_064557_add_unique_constraint_to_ticker_fundamentals_financials.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('ticker_fundamentals_financials', function (Blueprint $table) {
+            $table->unique(['fundamental_id', 'line_item'], 'tff_fundamental_line_item_unique');
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('ticker_fundamentals_financials', function (Blueprint $table) {
+            $table->dropUnique('tff_fundamental_line_item_unique');
+        });
+    }
+};
+
+
+===== FILE: database/migrations/2025_10_29_231407_add_display_order_to_ticker_fundamentals_financials_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('ticker_fundamentals_financials', function (Blueprint $table) {
+            if (!Schema::hasColumn('ticker_fundamentals_financials', 'display_order')) {
+                $table->integer('display_order')->nullable()->after('id')->index();
+            }
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('ticker_fundamentals_financials', function (Blueprint $table) {
+            if (Schema::hasColumn('ticker_fundamentals_financials', 'display_order')) {
+                $table->dropColumn('display_order');
+            }
+        });
+    }
+};
+
+
+===== FILE: database/migrations/2025_10_29_231550_add_fundamental_id_to_ticker_fundamentals_financials_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('ticker_fundamentals_financials', function (Blueprint $table) {
+            if (!Schema::hasColumn('ticker_fundamentals_financials', 'fundamental_id')) {
+                $table->unsignedBigInteger('fundamental_id')->nullable()->after('id');
+
+                // Add foreign key if parent table exists
+                if (Schema::hasTable('ticker_fundamentals')) {
+                    $table->foreign('fundamental_id')
+                          ->references('id')
+                          ->on('ticker_fundamentals')
+                          ->onDelete('cascade');
+                }
+            }
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('ticker_fundamentals_financials', function (Blueprint $table) {
+            if (Schema::hasColumn('ticker_fundamentals_financials', 'fundamental_id')) {
+                $table->dropForeign(['fundamental_id']);
+                $table->dropColumn('fundamental_id');
+            }
+        });
+    }
+};
+
+===== FILE: database/migrations/2025_10_29_231655_add_unique_period_index_to_ticker_fundamentals_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\DB;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('ticker_fundamentals', function (Blueprint $table) {
+            $indexName = 'uq_tfundamentals_unique_period';
+            
+            // Check existing indexes safely
+            $existingIndexes = collect(DB::select('SHOW INDEX FROM ticker_fundamentals'))
+                ->pluck('Key_name');
+
+            if (!$existingIndexes->contains($indexName)) {
+                $table->unique(
+                    ['ticker_id', 'fiscal_year', 'fiscal_period'],
+                    $indexName
+                );
+            }
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('ticker_fundamentals', function (Blueprint $table) {
+            if (Schema::hasTable('ticker_fundamentals')) {
+                $table->dropUnique('uq_tfundamentals_unique_period');
+            }
+        });
+    }
+};
+[EOF: database/migrations (Part 2)]

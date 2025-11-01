@@ -1,0 +1,1695 @@
+===== GPT DUMP GENERATED: 2025-10-30T00:32:43Z =====
+===== DIRECTORY: app/Console/Commands =====
+
+app/Console/Commands/PolygonBatchStatus.php
+
+
+===== FILE: app/Console/Commands/PolygonBatchStatus.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use App\Models\JobBatch;
+use Illuminate\Support\Facades\DB;
+
+class PolygonBatchStatus extends Command
+{
+    protected $signature = 'polygon:batches:status
+                            {--recent=5 : Show the most recent N batches}
+                            {--failed : Show only failed batches}
+                            {--active : Show only active (incomplete) batches}';
+
+    protected $description = 'Display recent Polygon batch ingestion statuses and progress.';
+
+    public function handle(): int
+    {
+        $recent = (int) $this->option('recent');
+        $showFailed = $this->option('failed');
+        $showActive = $this->option('active');
+
+        $query = JobBatch::query();
+
+        if ($showFailed) {
+            $query->where('failed_jobs', '>', 0);
+        }
+
+        if ($showActive) {
+            $query->where('pending_jobs', '>', 0);
+        }
+
+        $batches = $query->orderByDesc('created_at')->limit($recent)->get();
+
+        if ($batches->isEmpty()) {
+            $this->warn('No matching batches found.');
+            return Command::SUCCESS;
+        }
+
+        $rows = $batches->map(function ($batch) {
+            $progress = $batch->progress();
+            return [
+                'ID' => $batch->id,
+                'Name' => $batch->name,
+                'Created' => $batch->created_at->format('Y-m-d H:i'),
+                'Progress' => "{$progress}%",
+                'Pending' => $batch->pending_jobs,
+                'Failed' => $batch->failed_jobs,
+                'Total' => $batch->total_jobs,
+            ];
+        });
+
+        $this->table(
+            ['Batch ID', 'Name', 'Created At', 'Progress', 'Pending', 'Failed', 'Total Jobs'],
+            $rows
+        );
+
+        return Command::SUCCESS;
+    }
+}app/Console/Commands/PolygonFundamentalsIngest.php
+
+
+===== FILE: app/Console/Commands/PolygonFundamentalsIngest.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use App\Models\Ticker;
+use App\Jobs\IngestTickerFundamentalsJob;
+use Throwable;
+
+class PolygonFundamentalsIngest extends Command
+{
+    protected $signature = 'polygon:fundamentals:ingest
+                            {ticker? : Optional specific ticker symbol}
+                            {--limit= : Optional page size per API call (omit for provider default)}
+                            {--order=desc : Sort order returned by API: asc|desc}
+                            {--timeframe= : Optional timeframe: annual|quarterly|ttm|all}
+                            {--gte= : filing_date.gte (≥ start date, YYYY-MM-DD)}
+                            {--gt= : filing_date.gt (> start date, YYYY-MM-DD)}
+                            {--lte= : filing_date.lte (≤ end date, YYYY-MM-DD)}
+                            {--lt= : filing_date.lt (< end date, YYYY-MM-DD)}
+                            {--batch=200 : Number of tickers per batch}
+                            {--sleep=5 : Seconds to pause between batch dispatches}
+                            {--sync : Run jobs synchronously for debugging (bypass queue)}';
+
+    protected $description = 'Queue and batch ingest of Polygon Fundamentals (financials) for one or all tickers, across multiple timeframes, with optional filing_date filters.';
+
+    public function handle(): int
+    {
+        $ticker    = $this->argument('ticker');
+        $limit     = $this->option('limit');
+        $order     = $this->option('order') ?: 'desc';
+        $timeframe = $this->option('timeframe');
+        $batchSize = (int) $this->option('batch');
+        $sleep     = (int) $this->option('sleep');
+        $syncMode  = (bool) $this->option('sync');
+
+        // Determine timeframes to process
+        $timeframes = $this->resolveTimeframes($timeframe);
+
+        // Collect all ingestion options, including date filters
+        $options = array_filter([
+            'limit' => $limit !== null ? (int) $limit : null,
+            'order' => $order,
+            'filing_date.gte' => $this->option('gte'),
+            'filing_date.gt'  => $this->option('gt'),
+            'filing_date.lte' => $this->option('lte'),
+            'filing_date.lt'  => $this->option('lt'),
+        ], fn($v) => $v !== null);
+
+        Log::channel('ingest')->info('🚀 Starting fundamentals ingest command', [
+            'ticker' => $ticker,
+            'timeframes' => $timeframes,
+            'options' => $options,
+            'mode' => $syncMode ? 'sync' : 'queued',
+        ]);
+
+        if ($ticker) {
+            return $this->handleSingleTicker($ticker, $options, $timeframes, $syncMode);
+        }
+
+        return $this->handleBatchIngestion($options, $timeframes, $batchSize, $sleep, $syncMode);
+    }
+
+    protected function resolveTimeframes(?string $timeframe): array
+    {
+        if ($timeframe === 'all' || $timeframe === null) {
+            return ['quarterly', 'annual', 'ttm'];
+        }
+
+        $allowed = ['quarterly', 'annual', 'ttm'];
+        if (!in_array($timeframe, $allowed, true)) {
+            $this->error("❌ Invalid timeframe: {$timeframe}. Allowed: " . implode(', ', $allowed) . ", or 'all'");
+            exit(self::FAILURE);
+        }
+
+        return [$timeframe];
+    }
+
+    protected function handleSingleTicker(string $ticker, array $options, array $timeframes, bool $syncMode = false): int
+    {
+        $symbol = strtoupper(trim($ticker));
+        $this->info("📘 Queuing fundamentals ingestion for {$symbol}...");
+        Log::channel('ingest')->info("📘 Queuing single-ticker fundamentals ingestion", [
+            'symbol' => $symbol,
+            'timeframes' => $timeframes,
+            'options' => $options,
+        ]);
+
+        $tickerModel = Ticker::where('ticker', $symbol)->first();
+        if (!$tickerModel) {
+            $this->error("Ticker {$symbol} not found.");
+            Log::channel('ingest')->warning("⚠️ Ticker not found", ['symbol' => $symbol]);
+            return self::FAILURE;
+        }
+
+        try {
+            foreach ($timeframes as $tf) {
+                $opts = array_merge($options, ['timeframe' => $tf]);
+                Log::channel('ingest')->info("⏳ Ingesting {$tf} data for {$symbol}");
+
+                if ($syncMode) {
+                    Log::channel('ingest')->info("⚙️ Running in SYNC mode for {$symbol} [{$tf}]");
+                    (new IngestTickerFundamentalsJob($tickerModel->id, $opts))->handle(
+                        app(\App\Services\PolygonFundamentalsService::class)
+                    );
+                } else {
+                    IngestTickerFundamentalsJob::dispatch($tickerModel->id, $opts)
+                        ->onConnection('database')
+                        ->onQueue('default');
+                }
+
+                $this->info("✅ Fundamentals job dispatched for {$symbol} [{$tf}]");
+                Log::channel('ingest')->info("✅ Job dispatched successfully", [
+                    'symbol' => $symbol,
+                    'timeframe' => $tf,
+                    'mode' => $syncMode ? 'sync' : 'queued',
+                ]);
+            }
+        } catch (Throwable $e) {
+            Log::channel('ingest')->error("❌ Failed dispatching fundamentals job", [
+                'symbol' => $symbol,
+                'error' => $e->getMessage(),
+            ]);
+            $this->error("❌ Dispatch failed: {$e->getMessage()}");
+            return self::FAILURE;
+        }
+
+        return self::SUCCESS;
+    }
+
+    protected function handleBatchIngestion(array $options, array $timeframes, int $batchSize, int $sleep, bool $syncMode = false): int
+    {
+        $this->info("🔎 Selecting active tickers...");
+        Log::channel('ingest')->info("🔎 Selecting active tickers for batch ingestion");
+
+        $tickers = Ticker::select('id', 'ticker')
+            ->where('active', true)
+            ->orderBy('id')
+            ->cursor();
+
+        $count = $tickers->count();
+        if ($count === 0) {
+            $this->warn('No active tickers found.');
+            Log::channel('ingest')->warning("⚠️ No active tickers found");
+            return self::SUCCESS;
+        }
+
+        $this->info("🧱 Dispatching fundamentals ingestion for {$count} tickers ({$batchSize}/batch) across " . implode(', ', $timeframes));
+        Log::channel('ingest')->info("🧱 Beginning batch dispatch", [
+            'total_tickers' => $count,
+            'batch_size' => $batchSize,
+            'timeframes' => $timeframes,
+            'mode' => $syncMode ? 'sync' : 'queued',
+        ]);
+
+        $batchNumber = 0;
+        $dispatched = 0;
+        $chunk = [];
+
+        foreach ($tickers as $t) {
+            foreach ($timeframes as $tf) {
+                $chunk[] = new IngestTickerFundamentalsJob($t->id, array_merge($options, ['timeframe' => $tf]));
+                $dispatched++;
+            }
+
+            if (count($chunk) >= $batchSize) {
+                $batchNumber++;
+                $this->dispatchChunk($chunk, $batchNumber, $sleep, $syncMode);
+                $chunk = [];
+            }
+        }
+
+        if (!empty($chunk)) {
+            $batchNumber++;
+            $this->dispatchChunk($chunk, $batchNumber, $sleep, $syncMode);
+        }
+
+        $this->info("✅ Queued {$dispatched} jobs across {$batchNumber} batches.");
+        Log::channel('ingest')->info("✅ Finished queuing fundamentals batches", [
+            'batches' => $batchNumber,
+            'total_dispatched' => $dispatched,
+        ]);
+
+        return self::SUCCESS;
+    }
+
+    protected function dispatchChunk(array $jobs, int $batchNumber, int $sleep, bool $syncMode = false): void
+    {
+        try {
+            if ($syncMode) {
+                Log::channel('ingest')->info("⚙️ Running batch #{$batchNumber} in SYNC mode", [
+                    'job_count' => count($jobs),
+                ]);
+                foreach ($jobs as $job) {
+                    $job->handle(app(\App\Services\PolygonFundamentalsService::class));
+                }
+                return;
+            }
+
+            Log::channel('ingest')->info("📦 Dispatching batch #{$batchNumber}", [
+                'job_count' => count($jobs),
+            ]);
+
+            DB::connection()->reconnect();
+
+            $batch = Bus::batch($jobs)
+                ->name("PolygonFundamentals Batch #{$batchNumber}")
+                ->onConnection('database')
+                ->onQueue('default')
+                ->then(fn() => Log::channel('ingest')->info("✅ Batch #{$batchNumber} complete"))
+                ->catch(fn(Throwable $e) => Log::channel('ingest')->error("❌ Batch #{$batchNumber} failed", ['error' => $e->getMessage()]))
+                ->dispatch();
+
+            $this->info("✅ Dispatched batch #{$batchNumber} ({$batch->totalJobs} jobs)");
+            Log::channel('ingest')->info("🧩 Batch dispatched successfully", [
+                'batch_number' => $batchNumber,
+                'total_jobs' => $batch->totalJobs,
+            ]);
+
+            if ($sleep > 0) {
+                Log::channel('ingest')->info("😴 Sleeping for {$sleep}s before next batch");
+                sleep($sleep);
+            }
+        } catch (Throwable $e) {
+            Log::channel('ingest')->error("❌ Error dispatching fundamentals batch", [
+                'batch_number' => $batchNumber,
+                'error' => $e->getMessage(),
+            ]);
+            $this->error("❌ Failed to dispatch batch #{$batchNumber}: {$e->getMessage()}");
+        }
+    }
+}app/Console/Commands/PolygonTickersIngest.php
+
+
+===== FILE: app/Console/Commands/PolygonTickersIngest.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Log;
+use App\Services\PolygonTickerService;
+use Throwable;
+
+class PolygonTickersIngest extends Command
+{
+    /**
+     * The name and signature of the console command.
+     *
+     * Supports filtering and optional continuous polling.
+     */
+    protected $signature = 'polygon:tickers:ingest
+                            {--market= : Optionally filter by market (e.g. stocks, crypto)}
+                            {--type= : Optionally filter by ticker type}
+                            {--date= : Point-in-time date (YYYY-MM-DD) to fetch tickers available on that date}
+                            {--poll : Run a single polling cycle (deprecated: now exits after completion)}';
+
+    /**
+     * The console command description.
+     */
+    protected $description = 'Fetch all tickers from Polygon.io and persist them to the database (supports filtering).';
+
+    protected PolygonTickerService $service;
+
+    public function __construct(PolygonTickerService $service)
+    {
+        parent::__construct();
+        $this->service = $service;
+    }
+
+    /**
+     * Execute the console command.
+     */
+    public function handle(): int
+    {
+        $options = [];
+        if ($this->option('market')) {
+            $options['market'] = $this->option('market');
+        }
+        if ($this->option('type')) {
+            $options['type'] = $this->option('type');
+        }
+        if ($this->option('date')) {
+            $options['date'] = $this->option('date');
+        }
+
+        $this->info('Starting Polygon tickers ingestion...');
+        Log::info('Polygon tickers ingestion started', ['options' => $options]);
+
+        try {
+            $result = $this->runIngestionCycle($options);
+
+            $this->info('All tickers successfully ingested.');
+            $this->info('Exiting Polygon tickers ingestion.');
+            Log::info('Polygon tickers ingestion completed successfully', [
+                'pages' => $result['pages'] ?? null,
+                'inserted' => $result['inserted'] ?? null,
+            ]);
+
+            return Command::SUCCESS;
+        } catch (Throwable $e) {
+            Log::error('Polygon tickers ingestion failed', [
+                'message' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+
+            $this->error('Ingestion failed: ' . $e->getMessage());
+            return Command::FAILURE;
+        }
+    }
+
+    /**
+     * Run a single ingestion cycle and log results.
+     */
+    protected function runIngestionCycle(array $options): array
+    {
+        $start = microtime(true);
+        $result = $this->service->ingestAll($options);
+        $duration = round(microtime(true) - $start, 2);
+
+        $this->info("Pages processed: {$result['pages']}");
+        $this->info("Rows inserted: {$result['inserted']}");
+        $this->info("Elapsed time: {$duration} sec");
+        $this->info(str_repeat('-', 50));
+
+        Log::info('Polygon tickers ingestion cycle complete', [
+            'pages' => $result['pages'],
+            'inserted' => $result['inserted'],
+            'duration_sec' => $duration,
+        ]);
+
+        return $result;
+    }
+}app/Console/Commands/PolygonBatchCleanup.php
+
+
+===== FILE: app/Console/Commands/PolygonBatchCleanup.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use App\Models\JobBatch;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Carbon\Carbon;
+
+class PolygonBatchCleanup extends Command
+{
+    /**
+     * The name and signature of the console command.
+     */
+    protected $signature = 'polygon:batches:cleanup
+                            {--days=30 : Delete batches older than this number of days}
+                            {--completed : Delete only completed batches}
+                            {--all : Delete ALL batches regardless of age or status (dangerous)}';
+
+    /**
+     * The console command description.
+     */
+    protected $description = 'Clean up old or completed Polygon job batches to keep the job_batches table lean.';
+
+    /**
+     * Execute the console command.
+     */
+    public function handle(): int
+    {
+        $days = (int) $this->option('days');
+        $onlyCompleted = $this->option('completed');
+        $deleteAll = $this->option('all');
+
+        // Detect if this is being run by the scheduler (non-interactive)
+        $isCron = ! $this->input->isInteractive();
+
+        // Log channel for consistency with other ingestion logs
+        $logger = Log::channel('ingest');
+        $logger->info('Starting Polygon batch cleanup', [
+            'days' => $days,
+            'completed_only' => $onlyCompleted,
+            'all' => $deleteAll,
+            'cron' => $isCron,
+        ]);
+
+        // Full deletion safeguard
+        if ($deleteAll && !$isCron && !$this->confirm('⚠️  Are you sure you want to delete ALL job batches? This cannot be undone.')) {
+            $this->info('Aborted.');
+            $logger->info('Batch cleanup aborted by user.');
+            return Command::SUCCESS;
+        }
+
+        $query = JobBatch::query();
+
+        if ($deleteAll) {
+            $count = $query->count();
+            $deleted = $query->delete();
+            $this->info("Deleted ALL {$deleted} job batches.");
+            $logger->info("Deleted all {$deleted} job batches.");
+            return Command::SUCCESS;
+        }
+
+        // Only completed or aged-out batches
+        $cutoff = Carbon::now()->subDays($days);
+        $query->where('created_at', '<', $cutoff);
+
+        if ($onlyCompleted) {
+            $query->where('pending_jobs', '=', 0);
+        }
+
+        $batches = $query->get();
+        $count = $batches->count();
+
+        if ($count === 0) {
+            $this->info('No matching job batches found for cleanup.');
+            $logger->info('No batches found matching cleanup criteria.');
+            return Command::SUCCESS;
+        }
+
+        $this->warn("Found {$count} job batches older than {$days} days" . ($onlyCompleted ? ' (only completed).' : '.'));
+
+        // Skip confirmation when running from scheduler
+        if (!$isCron && !$this->confirm('Proceed with deletion?')) {
+            $this->info('Cleanup cancelled.');
+            $logger->info('Batch cleanup cancelled by user.');
+            return Command::SUCCESS;
+        }
+
+        // Perform deletion
+        $deleted = JobBatch::whereIn('id', $batches->pluck('id'))->delete();
+        $this->info("Successfully deleted {$deleted} batch records.");
+        $logger->info("Successfully deleted {$deleted} Polygon job batch records.");
+
+        return Command::SUCCESS;
+    }
+}app/Console/Commands/PolygonTickerOverviewsIngest.php
+
+
+===== FILE: app/Console/Commands/PolygonTickerOverviewsIngest.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Bus\Batch;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\DB;
+use App\Models\Ticker;
+use App\Jobs\ProcessTickerOverviewBatch;
+use Throwable;
+
+class PolygonTickerOverviewsIngest extends Command
+{
+    protected $signature = 'polygon:ticker-overviews:ingest
+                            {--batch=500 : Number of tickers per job batch}
+                            {--sleep=5 : Seconds to sleep between batch dispatches}';
+
+    protected $description = 'Ingest Polygon.io ticker overviews in batches using queue jobs';
+
+    public function handle(): int
+    {
+        $batchSize = (int) $this->option('batch');
+        $sleep = (int) $this->option('sleep');
+
+        $this->info("Preparing to dispatch batch jobs...");
+
+        $totalTickers = Ticker::count();
+        if ($totalTickers === 0) {
+            $this->warn("No tickers found in the database.");
+            return Command::SUCCESS;
+        }
+
+        $this->info("Total tickers: {$totalTickers}");
+        $this->info("Processing: {$totalTickers} tickers, batch size {$batchSize}");
+
+        $jobs = [];
+        $tickers = Ticker::select('id', 'ticker')->orderBy('id')->cursor();
+
+        $chunk = [];
+        foreach ($tickers as $ticker) {
+            $chunk[] = $ticker;
+
+            if (count($chunk) >= $batchSize) {
+                $jobs[] = new ProcessTickerOverviewBatch($chunk);
+                $chunk = [];
+            }
+        }
+
+        if (!empty($chunk)) {
+            $jobs[] = new ProcessTickerOverviewBatch($chunk);
+        }
+
+        if (empty($jobs)) {
+            $this->warn("No jobs to dispatch.");
+            return Command::SUCCESS;
+        }
+
+        // 🚀 Create a batch using proper Carbon datetime, not integer timestamp
+        $batch = Bus::batch($jobs)
+            ->name('PolygonTickerOverviews')
+            ->then(function (Batch $batch) {
+                Log::info("Polygon overview ingestion batch complete", [
+                    'batch_id' => $batch->id,
+                    'total_jobs' => $batch->totalJobs,
+                ]);
+            })
+            ->catch(function (Batch $batch, Throwable $e) {
+                Log::error("Polygon overview ingestion batch failed", [
+                    'batch_id' => $batch->id,
+                    'error' => $e->getMessage(),
+                ]);
+            })
+            ->finally(function (Batch $batch) {
+                Log::info("Polygon overview ingestion batch finished", [
+                    'batch_id' => $batch->id,
+                    'finished_jobs' => $batch->processedJobs(),
+                ]);
+            })
+            ->dispatch();
+
+        $this->info("Batch dispatched: {$batch->id}");
+        $this->info("Queued {$batch->totalJobs} jobs.");
+
+        return Command::SUCCESS;
+    }
+}app/Console/Commands/PolygonTickerOverviewsRetry.php
+
+
+===== FILE: app/Console/Commands/PolygonTickerOverviewsRetry.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use App\Services\PolygonTickerOverviewService;
+use App\Models\Ticker;
+
+class PolygonTickerOverviewsRetry extends Command
+{
+    /**
+     * The name and signature of the console command.
+     *
+     * You can run it with:
+     * php artisan polygon:ticker-overviews:retry-failed
+     */
+    protected $signature = 'polygon:ticker-overviews:retry-failed
+                            {--clear : clear the failed_ticker_overviews table after successful retries}
+                            {--limit=0 : maximum number of failed tickers to retry (0 = all)}';
+
+    /**
+     * The console command description.
+     */
+    protected $description = 'Retry failed Polygon ticker overview ingestions from failed_ticker_overviews table.';
+
+    protected PolygonTickerOverviewService $service;
+
+    public function __construct(PolygonTickerOverviewService $service)
+    {
+        parent::__construct();
+        $this->service = $service;
+    }
+
+    /**
+     * Execute the console command.
+     */
+    public function handle(): int
+    {
+        $limit = (int) $this->option('limit');
+        $clearAfter = $this->option('clear');
+
+        $failedTickers = DB::table('failed_ticker_overviews')
+            ->orderBy('id')
+            ->when($limit > 0, fn($q) => $q->limit($limit))
+            ->get();
+
+        if ($failedTickers->isEmpty()) {
+            $this->warn('No failed ticker log found. Exiting.');
+            return Command::SUCCESS;
+        }
+
+        $this->info("Retrying {$failedTickers->count()} failed ticker overviews...");
+
+        $bar = $this->output->createProgressBar($failedTickers->count());
+        $bar->start();
+
+        $retryCount = 0;
+        foreach ($failedTickers as $failed) {
+            $ticker = Ticker::where('ticker', $failed->ticker)->first();
+
+            if (!$ticker) {
+                Log::warning("Retry skipped: ticker not found in DB [{$failed->ticker}]");
+                $bar->advance();
+                continue;
+            }
+
+            try {
+                $this->service->processSingleTicker($ticker);
+                $retryCount++;
+
+                // remove from failed log if successful
+                DB::table('failed_ticker_overviews')->where('id', $failed->id)->delete();
+
+            } catch (\Throwable $e) {
+                Log::error("Retry failed for {$ticker->ticker}: " . $e->getMessage());
+            }
+
+            $bar->advance();
+            usleep(200000); // 0.2s pause between retries to avoid rapid API hits
+        }
+
+        $bar->finish();
+        $this->newLine(2);
+        $this->info("Successfully retried {$retryCount} tickers.");
+
+        if ($clearAfter) {
+            DB::table('failed_ticker_overviews')->truncate();
+            $this->info('Cleared failed_ticker_overviews table after retries.');
+        }
+
+        return Command::SUCCESS;
+    }
+}app/Console/Commands/PolygonTickerPriceHistoriesIngestLegacy.php
+
+
+===== FILE: app/Console/Commands/PolygonTickerPriceHistoriesIngestLegacy.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Log;
+use App\Models\Ticker;
+use App\Services\PolygonTickerPriceHistoryService;
+use Illuminate\Support\Carbon;
+
+class PolygonTickerPriceHistoriesIngestLegacy extends Command
+{
+    /**
+     * The name and signature of the console command.
+     *
+     * Example:
+     * php artisan polygon:ticker-price-histories:ingest-legacy --resolution=1d --from=2019-01-01 --limit=0 --batch=1000 --sleep=15
+     */
+    protected $signature = 'polygon:ticker-price-histories:ingest-legacy
+                            {--resolution=1d : Resolution (1d, 1m, 5m, etc.)}
+                            {--from=2019-01-01 : Start date (YYYY-MM-DD)}
+                            {--to=null : End date (YYYY-MM-DD) or null for today}
+                            {--multiplier=1 : Multiplier for Polygon aggregates endpoint}
+                            {--limit=0 : Limit total tickers processed (0 = all)}
+                            {--batch=1000 : Tickers per chunk}
+                            {--sleep=15 : Seconds to sleep between batches}';
+
+    protected $description = 'LEGACY — Direct (non-queued) ingestion of Polygon ticker price histories.';
+
+    public function handle(): int
+    {
+        $resolution = $this->option('resolution') ?? '1d';
+        $multiplier = (int) $this->option('multiplier');
+        $from = $this->option('from') ?? '2019-01-01';
+        $toOption = $this->option('to');
+        $to = ($toOption === 'null' || $toOption === null)
+            ? now()->toDateString()
+            : $toOption;
+        $limit = (int) $this->option('limit');
+        $batchSize = (int) $this->option('batch');
+        $sleep = (int) $this->option('sleep');
+
+        $logger = Log::channel('ingest');
+        $logger->info("🚀 [LEGACY] Starting Polygon price history ingestion", compact('resolution', 'from', 'to', 'limit', 'batchSize', 'sleep'));
+
+        $this->info("📈 [LEGACY] Starting Polygon ticker price history ingestion...");
+        $tickersQuery = Ticker::orderBy('id')->select('id', 'ticker');
+
+        if ($limit > 0) {
+            $tickersQuery->limit($limit);
+        }
+
+        $totalTickers = $tickersQuery->count();
+        if ($totalTickers === 0) {
+            $this->warn("⚠️ No tickers found.");
+            return 0;
+        }
+
+        $this->info("Processing {$totalTickers} tickers in chunks of {$batchSize}...");
+
+        $bar = $this->output->createProgressBar($totalTickers);
+        $bar->start();
+
+        $service = app(PolygonTickerPriceHistoryService::class);
+        $chunkCount = 0;
+
+        $tickersQuery->chunk($batchSize, function ($tickers) use (
+            $service, $resolution, $multiplier, $from, $to, $sleep, &$chunkCount, $bar, $logger
+        ) {
+            $chunkCount++;
+            $logger->info("Processing chunk #{$chunkCount} (".count($tickers)." tickers)");
+
+            foreach ($tickers as $ticker) {
+                try {
+                    $service->fetchAndStore($ticker, $from, $to, $resolution, $multiplier);
+                    $bar->advance();
+                } catch (\Throwable $e) {
+                    $logger->error("❌ Error ingesting {$ticker->ticker}: ".$e->getMessage(), [
+                        'ticker_id' => $ticker->id,
+                        'trace' => $e->getTraceAsString(),
+                    ]);
+                }
+            }
+
+            if ($sleep > 0) {
+                $this->newLine();
+                $this->info("⏳ Sleeping {$sleep}s before next batch...");
+                sleep($sleep);
+            }
+        });
+
+        $bar->finish();
+        $this->newLine(2);
+        $this->info("🎯 [LEGACY] All batches completed ({$chunkCount} total).");
+        $logger->info("[LEGACY] Polygon ticker price history ingestion completed.", ['total_batches' => $chunkCount]);
+
+        return 0;
+    }
+}app/Console/Commands/TickersGenerateSlugs.php
+
+
+===== FILE: app/Console/Commands/TickersGenerateSlugs.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use App\Models\Ticker;
+use App\Services\TickerSlugService;
+
+class TickersGenerateSlugs extends Command
+{
+    /**
+     * The name and signature of the console command.
+     *
+     * @var string
+     */
+    protected $signature = 'tickers:generate-slugs {--force : overwrite existing slugs}';
+
+    /**
+     * The console command description.
+     *
+     * @var string
+     */
+    protected $description = 'Generate slug field for tickers based on name';
+
+    protected TickerSlugService $slugService;
+
+    public function __construct(TickerSlugService $slugService)
+    {
+        parent::__construct();
+        $this->slugService = $slugService;
+    }
+    
+    /**
+     * Execute the console command.
+     */
+    public function handle()
+    {
+        $this->info('Generating slugs for tickers...');
+
+        $query = Ticker::query();
+
+        if (! $this->option('force')) {
+            $query->whereNull('slug');
+        }
+
+        $total = $query->count();
+        $this->info("Processing {$total} records...");
+
+        $bar = $this->output->createProgressBar($total);
+        $bar->start();
+
+        $query->chunkById(500, function ($rows) use ($bar) {
+            foreach ($rows as $ticker) {
+                $slug = $this->slugService->slugFromName($ticker->name);
+                if ($slug === null) {
+                    // fallback to ticker itself as slug
+                    $slug = strtolower($ticker->ticker);
+                }
+                $ticker->slug = $slug;
+                $ticker->saveQuietly();
+                $bar->advance();
+            }
+        });
+
+        $bar->finish();
+        $this->newLine(2);
+        $this->info('Done. If collisions were possible you may wish to run tickers:resolve-slug-collisions.');
+    }
+    
+}
+app/Console/Commands/PolygonTickerNewsIngest.php
+
+
+===== FILE: app/Console/Commands/PolygonTickerNewsIngest.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Log;
+use App\Models\Ticker;
+use App\Jobs\IngestTickerNewsJob;
+use App\Services\BatchMonitorService;
+use Throwable;
+
+class PolygonTickerNewsIngest extends Command
+{
+    protected $signature = 'polygon:ticker-news:ingest 
+                            {ticker? : Optional specific ticker symbol} 
+                            {--limit=50 : Max news items per ticker} 
+                            {--batch=200 : Number of tickers per batch}
+                            {--sleep=5 : Seconds to pause between batch dispatches}';
+
+    protected $description = 'Queue and batch ingest of latest news items for one or all tickers from Polygon.io';
+
+    public function handle(): int
+    {
+        $ticker = $this->argument('ticker');
+        $limit = (int) $this->option('limit');
+        $batchSize = (int) $this->option('batch');
+        $sleep = (int) $this->option('sleep');
+
+        if ($ticker) {
+            return $this->handleSingleTicker($ticker, $limit);
+        }
+
+        return $this->handleBatchIngestion($limit, $batchSize, $sleep);
+    }
+
+    protected function handleSingleTicker(string $ticker, int $limit): int
+    {
+        $this->info("📰 Queuing news ingestion for {$ticker}...");
+        $tickerModel = Ticker::where('ticker', strtoupper($ticker))->first();
+
+        if (! $tickerModel) {
+            $this->error("Ticker {$ticker} not found.");
+            return self::FAILURE;
+        }
+
+        IngestTickerNewsJob::dispatch($tickerModel->id, $limit)->onQueue('default');
+        $this->info("✅ Dispatched news job for {$ticker}");
+        return self::SUCCESS;
+    }
+
+    protected function handleBatchIngestion(int $limit, int $batchSize, int $sleep): int
+    {
+        $tickers = Ticker::select('id', 'ticker')->where('active', true)->orderBy('id')->cursor();
+
+        if ($tickers->count() === 0) {
+            $this->warn('No active tickers found.');
+            return self::SUCCESS;
+        }
+
+        $this->info("🧱 Dispatching ticker news ingestion batches (batch size: {$batchSize})...");
+        $logger = Log::channel('ingest');
+
+        $chunk = [];
+        $batchNumber = 0;
+        $total = 0;
+
+        foreach ($tickers as $t) {
+            $chunk[] = new IngestTickerNewsJob($t->id, $limit);
+            $total++;
+
+            if (count($chunk) >= $batchSize) {
+                $batchNumber++;
+                $this->dispatchChunk($chunk, $batchNumber, $sleep, $logger);
+                $chunk = [];
+            }
+        }
+
+        if (! empty($chunk)) {
+            $batchNumber++;
+            $this->dispatchChunk($chunk, $batchNumber, $sleep, $logger);
+        }
+
+        $this->info("✅ Queued {$total} tickers across {$batchNumber} batches.");
+        return self::SUCCESS;
+    }
+
+    protected function dispatchChunk(array $jobs, int $batchNumber, int $sleep, $logger): void
+    {
+        try {
+            $batch = Bus::batch($jobs)
+                ->name("PolygonNews Batch #{$batchNumber}")
+                ->onConnection('database')
+                ->onQueue('default')
+                ->then(fn() => Log::info("✅ PolygonNews Batch #{$batchNumber} complete"))
+                ->catch(fn(Throwable $e) => Log::error("❌ PolygonNews Batch #{$batchNumber} failed: {$e->getMessage()}"))
+                ->dispatch();
+
+            BatchMonitorService::createBatch("PolygonNews Batch #{$batchNumber}", count($jobs));
+
+            $this->info("✅ Dispatched batch #{$batchNumber} ({$batch->totalJobs} jobs)");
+            sleep($sleep);
+        } catch (Throwable $e) {
+            $logger->error("Error dispatching batch #{$batchNumber}: {$e->getMessage()}");
+            $this->error("❌ Failed to dispatch batch #{$batchNumber}: {$e->getMessage()}");
+        }
+    }
+}app/Console/Commands/PolygonTickerPriceHistoryIngest.php
+
+
+===== FILE: app/Console/Commands/PolygonTickerPriceHistoryIngest.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Log;
+use App\Models\Ticker;
+use App\Jobs\IngestTickerPriceHistoryJob;
+use App\Services\BatchMonitorService;
+use Throwable;
+
+class PolygonTickerPriceHistoryIngest extends Command
+{
+    protected $signature = 'polygon:ticker-price-histories:ingest
+                            {--resolution=1d : Resolution (1d, 1m, 5m, etc.)}
+                            {--from=2019-01-01 : Start date (YYYY-MM-DD)}
+                            {--to=null : End date (YYYY-MM-DD) or null for today}
+                            {--limit=0 : Limit total tickers processed (0 = all)}
+                            {--batch=500 : Number of tickers per job batch}
+                            {--sleep=5 : Seconds to sleep before dispatch (rate limiting)}';
+
+    protected $description = 'Queue Polygon price history ingestion jobs for all tickers and track via batch monitoring';
+
+    public function handle(): int
+    {
+        $resolution = $this->option('resolution') ?? '1d';
+        $from = $this->option('from') ?? '2019-01-01';
+        $toOption = $this->option('to');
+        $to = ($toOption === 'null' || $toOption === null)
+            ? now()->toDateString()
+            : $toOption;
+
+        $limit = (int) $this->option('limit');
+        $batchSize = (int) $this->option('batch');
+        $sleep = (int) $this->option('sleep');
+
+        $logger = Log::channel('ingest');
+        $this->info("📈 Preparing to dispatch Polygon ticker price history ingestion...");
+        $logger->info('Starting Polygon price histories ingestion', compact('resolution', 'from', 'to', 'limit', 'batchSize', 'sleep'));
+
+        $tickersQuery = Ticker::orderBy('id')->select('id', 'ticker');
+        $totalTickers = $tickersQuery->count();
+
+        if ($limit > 0 && $limit < $totalTickers) {
+            $tickersQuery->limit($limit);
+            $totalTickers = $limit;
+        }
+
+        $this->info("Total tickers to process: {$totalTickers}");
+        $logger->info("Preparing batch for {$totalTickers} tickers");
+
+        if ($totalTickers === 0) {
+            $this->warn("⚠️ No tickers found to ingest.");
+            return 0;
+        }
+
+        $bar = $this->output->createProgressBar($totalTickers);
+        $bar->start();
+
+        // Optional custom batch monitor
+        BatchMonitorService::createBatch('PolygonTickerPriceHistories', $totalTickers);
+
+        $batchCount = 1;
+
+        $tickersQuery->chunk($batchSize, function ($tickers) use (
+            $resolution, $from, $to, $sleep, $bar, $logger, &$batchCount
+        ) {
+            $jobs = [];
+
+            foreach ($tickers as $ticker) {
+                // Pass the full Ticker model to the job
+                $jobs[] = new IngestTickerPriceHistoryJob($ticker, $from, $to);
+                $bar->advance();
+            }
+
+            if (empty($jobs)) {
+                return;
+            }
+
+            try {
+                $batch = Bus::batch($jobs)
+                    ->name("PolygonTickerPriceHistoriesIngest (chunk #{$batchCount})")
+                    ->onConnection('database')
+                    ->onQueue('default')
+                    ->dispatch();
+
+                $jobCount = count($jobs);
+                $this->newLine();
+                $this->info("✅ Dispatched chunk #{$batchCount} ({$jobCount} jobs): {$batch->id}");
+
+                $logger->info('✅ Dispatched chunk batch', [
+                    'batch_number' => $batchCount,
+                    'batch_id' => $batch->id,
+                    'job_count' => $jobCount,
+                ]);
+
+                $batchCount++;
+
+                if ($sleep > 0) {
+                    $this->info("⏳ Sleeping {$sleep}s before next dispatch...");
+                    sleep($sleep);
+                }
+            } catch (Throwable $e) {
+                $this->error("❌ Failed to dispatch chunk batch #{$batchCount}: {$e->getMessage()}");
+                $logger->error('Error dispatching chunk batch', [
+                    'batch_number' => $batchCount,
+                    'error' => $e->getMessage(),
+                    'trace' => $e->getTraceAsString(),
+                ]);
+            }
+        });
+
+        $bar->finish();
+        $this->newLine(2);
+
+        $this->info("🎯 All batches dispatched successfully ({$batchCount} total).");
+        $logger->info("All ticker ingestion batches dispatched successfully", ['total_batches' => $batchCount]);
+
+        return 0;
+    }
+}app/Console/Commands/PolygonDataReset.php
+
+
+===== FILE: app/Console/Commands/PolygonDataReset.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+
+class PolygonDataReset extends Command
+{
+    /**
+     * The name and signature of the console command.
+     *
+     * Usage:
+     * php artisan polygon:data:reset
+     * php artisan polygon:data:reset --force
+     */
+    protected $signature = 'polygon:data:reset
+                            {--force : Run without confirmation prompt (useful for automation)}';
+
+    /**
+     * The console command description.
+     */
+    protected $description = 'Completely reset Polygon-related tables (tickers, overviews, histories, etc.) for a clean re-ingestion.';
+
+    /**
+     * Execute the console command.
+     */
+    public function handle(): int
+    {
+        $force = $this->option('force');
+
+        $this->warn('This will DELETE ALL Polygon-related data:');
+        $this->line('- tickers');
+        $this->line('- ticker_overviews');
+        $this->line('- ticker_price_histories');
+        $this->line('- ticker_news_items (if exists)');
+        $this->line('- failed_ticker_overviews (if exists)');
+        $this->newLine();
+
+        if (!$force && !$this->confirm('Are you sure you want to continue?')) {
+            $this->info('Aborted.');
+            return Command::SUCCESS;
+        }
+
+        try {
+            DB::statement('SET FOREIGN_KEY_CHECKS=0;');
+
+            $tables = [
+                'ticker_price_histories',
+                'ticker_news_items',
+                'ticker_overviews',
+                'failed_ticker_overviews',
+                'tickers',
+            ];
+
+            foreach ($tables as $table) {
+                if (DB::getSchemaBuilder()->hasTable($table)) {
+                    DB::table($table)->truncate();
+                    $this->info("Truncated: {$table}");
+                    Log::channel('polygon')->info("Truncated table: {$table}");
+                } else {
+                    $this->warn("Table not found: {$table}");
+                }
+            }
+
+            DB::statement('SET FOREIGN_KEY_CHECKS=1;');
+
+            $this->newLine();
+            $this->info('Polygon data reset complete.');
+
+        } catch (\Throwable $e) {
+            DB::statement('SET FOREIGN_KEY_CHECKS=1;');
+            $this->error('Error during reset: ' . $e->getMessage());
+            Log::channel('polygon')->error('Polygon data reset failed', [
+                'error' => $e->getMessage(),
+                'trace' => $e->getTraceAsString(),
+            ]);
+            return Command::FAILURE;
+        }
+
+        return Command::SUCCESS;
+    }
+}
+app/Console/Commands/PruneJobBatches.php
+
+
+===== FILE: app/Console/Commands/PruneJobBatches.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Carbon;
+
+class PruneJobBatches extends Command
+{
+    /**
+     * The name and signature of the console command.
+     *
+     * Examples:
+     *   php artisan batches:prune
+     *   php artisan batches:prune --days=1 --include-running
+     */
+    protected $signature = 'batches:prune
+                            {--days=3 : Delete batches older than this number of days}
+                            {--include-running : Also delete batches that are still marked as running}
+                            {--dry-run : Show what would be deleted without actually deleting}';
+
+    /**
+     * The console command description.
+     */
+    protected $description = '🧹 Prune old job batch records to keep the batch monitor clean and performant.';
+
+    /**
+     * Execute the console command.
+     */
+    public function handle(): int
+    {
+        $days = (int) $this->option('days');
+        $includeRunning = $this->option('include-running');
+        $dryRun = $this->option('dry-run');
+        $logger = Log::channel('ingest');
+
+        $cutoff = Carbon::now()->subDays($days);
+
+        $query = DB::table('job_batches')
+            ->where('created_at', '<', $cutoff);
+
+        if (! $includeRunning) {
+            $query->whereNotNull('finished_at');
+        }
+
+        $count = $query->count();
+
+        if ($count === 0) {
+            $this->info("✅ No batches to prune (older than {$days} days).");
+            return Command::SUCCESS;
+        }
+
+        $this->warn("Found {$count} batch records older than {$days} days.");
+        $this->line('Cutoff date: ' . $cutoff->toDateTimeString());
+        $this->line('');
+
+        if ($dryRun) {
+            $this->info('🟡 Dry run mode enabled — no deletions performed.');
+            return Command::SUCCESS;
+        }
+
+        // Confirm deletion if running interactively
+        if ($this->input->isInteractive() && ! $this->confirm("Proceed with deleting {$count} old batch records?")) {
+            $this->info('❎ Operation cancelled.');
+            return Command::SUCCESS;
+        }
+
+        // Progress bar for fun
+        $bar = $this->output->createProgressBar($count);
+        $bar->start();
+
+        $deleted = 0;
+
+        DB::table('job_batches')
+            ->where('created_at', '<', $cutoff)
+            ->when(!$includeRunning, fn($q) => $q->whereNotNull('finished_at'))
+            ->orderBy('created_at')
+            ->chunkById(100, function ($rows) use (&$deleted, $bar) {
+                $ids = collect($rows)->pluck('id');
+                DB::table('job_batches')->whereIn('id', $ids)->delete();
+                $deleted += $ids->count();
+                $bar->advance($ids->count());
+            });
+
+        $bar->finish();
+        $this->newLine(2);
+
+        $msg = "🧹 Pruned {$deleted} batch records older than {$days} days.";
+        $this->info($msg);
+        $logger->info($msg, ['days' => $days, 'include_running' => $includeRunning]);
+
+        return Command::SUCCESS;
+    }
+}app/Console/Commands/PolygonIndicatorsIngest.php
+
+
+===== FILE: app/Console/Commands/PolygonIndicatorsIngest.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Log;
+use App\Models\Ticker;
+use App\Jobs\IngestTickerIndicatorsJob;
+use App\Services\BatchMonitorService;
+use Throwable;
+
+class PolygonIndicatorsIngest extends Command
+{
+    protected $signature = 'polygon:indicators:ingest-batch
+                            {--batch=200 : Number of tickers per batch}
+                            {--indicators=sma_20,ema_50,rsi_14,macd : Comma-separated indicator list}
+                            {--sleep=5 : Seconds to pause between dispatches}';
+
+    protected $description = 'Queue technical indicator ingestion jobs for all tickers in batches.';
+
+    public function handle(): int
+    {
+        $batchSize = (int) $this->option('batch');
+        $sleep = (int) $this->option('sleep');
+        $indicators = explode(',', $this->option('indicators'));
+
+        $tickers = Ticker::select('id', 'ticker')->where('active', true)->orderBy('id')->cursor();
+
+        if ($tickers->count() === 0) {
+            $this->warn('No active tickers found.');
+            return self::SUCCESS;
+        }
+
+        $this->info("Dispatching indicator ingestion batches (batch size: {$batchSize})...");
+        $logger = Log::channel('ingest');
+
+        $jobs = [];
+        $chunk = [];
+        $totalTickers = 0;
+        $batchCount = 0;
+
+        foreach ($tickers as $ticker) {
+            $chunk[] = new IngestTickerIndicatorsJob($ticker->id, $indicators);
+            $totalTickers++;
+
+            if (count($chunk) >= $batchSize) {
+                $batchCount++;
+                $this->dispatchChunk($chunk, $batchCount, $sleep, $logger);
+                $chunk = [];
+            }
+        }
+
+        if (!empty($chunk)) {
+            $batchCount++;
+            $this->dispatchChunk($chunk, $batchCount, $sleep, $logger);
+        }
+
+        $this->newLine(2);
+        $this->info("✅ Dispatched {$totalTickers} tickers across {$batchCount} batches.");
+        $logger->info("Indicator batch ingestion complete.", ['batches' => $batchCount, 'tickers' => $totalTickers]);
+
+        return self::SUCCESS;
+    }
+
+    protected function dispatchChunk(array $jobs, int $batchNumber, int $sleep, $logger): void
+    {
+        try {
+            $batch = Bus::batch($jobs)
+                ->name("PolygonIndicators Batch #{$batchNumber}")
+                ->onConnection('database')
+                ->onQueue('default')
+                ->then(fn() => Log::info("✅ Batch #{$batchNumber} complete"))
+                ->catch(fn(Throwable $e) => Log::error("❌ Batch #{$batchNumber} failed: {$e->getMessage()}"))
+                ->dispatch();
+
+            BatchMonitorService::createBatch("PolygonIndicators Batch #{$batchNumber}", count($jobs));
+
+            $this->info("✅ Dispatched batch #{$batchNumber} ({$batch->totalJobs} jobs)");
+            sleep($sleep);
+        } catch (Throwable $e) {
+            $logger->error("Error dispatching batch #{$batchNumber}: {$e->getMessage()}");
+            $this->error("❌ Failed to dispatch batch #{$batchNumber}: {$e->getMessage()}");
+        }
+    }
+}app/Console/Commands/MonitorBatches.php
+
+
+===== FILE: app/Console/Commands/MonitorBatches.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Carbon;
+use Symfony\Component\Console\Output\OutputInterface;
+
+class MonitorBatches extends Command
+{
+    protected $signature = 'monitor:batches {--refresh=5 : Refresh interval in seconds} {--stale=2 : Days before batch is considered stale}';
+    protected $description = 'Monitor Laravel job batches in real time (with colorized output)';
+
+    public function handle(): int
+    {
+        $refresh = (int) $this->option('refresh');
+        $staleDays = (int) $this->option('stale');
+
+        $this->info("Monitoring batches (refresh: {$refresh}s, stale: {$staleDays} days)");
+        $this->info('Press D = delete stale, A = delete all, Q = quit.');
+        $this->newLine();
+
+        while (true) {
+            $this->displayBatches();
+            $this->listenForKey($staleDays);
+            sleep($refresh);
+        }
+
+        return 0;
+    }
+
+    /**
+     * Display the current batch statuses.
+     */
+    protected function displayBatches(): void
+    {
+        $batches = DB::table('job_batches')
+            ->orderByDesc('created_at')
+            ->limit(6)
+            ->get();
+
+        $this->clearScreen();
+
+        $this->line(now()->format('Y-m-d H:i:s'));
+        $this->info('📊 Monitoring recent job batches (showing ' . $batches->count() . ')');
+        $this->newLine();
+
+        foreach ($batches as $batch) {
+            $pending = max(0, $batch->pending_jobs);
+            $total   = max(0, $batch->total_jobs);
+            $failed  = max(0, $batch->failed_jobs);
+
+            $progress = $total > 0
+                ? round((($total - $pending) / $total) * 100, 1)
+                : 0;
+
+            $barLength = 40;
+            $filled = (int) round(($progress / 100) * $barLength);
+            $bar = str_repeat('█', $filled) . str_repeat('░', max(0, $barLength - $filled));
+
+            $status = match (true) {
+                $batch->cancelled_at !== null => "<fg=yellow>Cancelled</>",
+                $batch->finished_at !== null  => "<fg=green>Finished</>",
+                $failed > 0                   => "<fg=red>Partial Fail</>",
+                default                       => "<fg=cyan>Running</>",
+            };
+
+            $started = Carbon::parse($batch->created_at)->diffForHumans();
+            $finished = $batch->finished_at
+                ? Carbon::parse($batch->finished_at)->diffForHumans()
+                : '—';
+
+            $this->line(" <options=bold>{$batch->name}</>  ID: <fg=gray>{$batch->id}</>");
+            $this->line(" ├─ Total: {$total}   Pending: {$pending}   Failed: {$failed}");
+            $this->line(" ├─ Status: {$status}   Progress: {$progress}%");
+            $this->line(" │  {$bar}");
+            $this->line(" └─ Started: {$started}   Finished: {$finished}");
+            $this->newLine();
+        }
+
+        $this->line('────────────────────────────────────────────────────────────');
+        $this->line('Total batches: ' . $batches->count() . '   |   Last refresh: ' . now()->format('H:i:s'));
+    }
+
+    /**
+     * Detect and handle keypress commands.
+     */
+    protected function listenForKey(int $staleDays): void
+    {
+        // Use non-blocking input with error-safety
+        $read = [STDIN];
+        $write = null;
+        $except = null;
+
+        if (stream_select($read, $write, $except, 0, 200000)) {
+            $key = trim(strtoupper(fgetc(STDIN)));
+
+            match ($key) {
+                'D' => $this->deleteStaleBatches($staleDays),
+                'A' => $this->deleteAllBatches(),
+                'Q' => exit(0),
+                default => null,
+            };
+        }
+    }
+
+    /**
+     * Delete stale batches older than X days.
+     */
+    protected function deleteStaleBatches(int $staleDays): void
+    {
+        $cutoff = now()->subDays($staleDays);
+        $count = DB::table('job_batches')
+            ->whereNotNull('finished_at')
+            ->where('finished_at', '<', $cutoff)
+            ->delete();
+
+        $this->warn("🗑️ Deleted {$count} stale batches older than {$staleDays} days.");
+        sleep(1);
+    }
+
+    /**
+     * Delete all batches.
+     */
+    protected function deleteAllBatches(): void
+    {
+        $count = DB::table('job_batches')->delete();
+        $this->warn("🧹 Deleted all ({$count}) job batches.");
+        sleep(1);
+    }
+
+    /**
+     * Clear terminal screen.
+     */
+    protected function clearScreen(): void
+    {
+        if (strncasecmp(PHP_OS, 'WIN', 3) === 0) {
+            system('cls');
+        } else {
+            echo "\033[2J\033[;H";
+        }
+    }
+}app/Console/Commands/PolygonTickerPricesIngestIncremental.php
+
+
+===== FILE: app/Console/Commands/PolygonTickerPricesIngestIncremental.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\DB;
+use App\Models\Ticker;
+use App\Services\PolygonPriceHistoryService;
+use Carbon\Carbon;
+
+class PolygonTickerPricesIngestIncremental extends Command
+{
+    protected $signature = 'polygon:ingest-ticker-prices
+                            {--ticker= : Specific ticker symbol to ingest}
+                            {--force : Reingest full history (default 5 years)}';
+
+    protected $description = 'Incrementally ingest daily ticker prices from Polygon.io into ticker_price_histories with retry and backoff.';
+
+    protected PolygonPriceHistoryService $priceHistoryService;
+
+    public function __construct(PolygonPriceHistoryService $priceHistoryService)
+    {
+        parent::__construct();
+        $this->priceHistoryService = $priceHistoryService;
+    }
+
+    public function handle(): int
+    {
+        $tickerArg = $this->option('ticker');
+        $force = $this->option('force');
+
+        $query = Ticker::query();
+        if ($tickerArg) {
+            $query->where('ticker', strtoupper($tickerArg));
+        }
+
+        $tickers = $query->get();
+        if ($tickers->isEmpty()) {
+            $this->warn('No tickers found matching criteria.');
+            return Command::SUCCESS;
+        }
+
+        $this->info("Starting incremental ingestion for {$tickers->count()} ticker(s)...");
+
+        foreach ($tickers as $ticker) {
+            try {
+                $this->ingestTicker($ticker, $force);
+            } catch (\Throwable $e) {
+                Log::channel('polygon')->error("Error ingesting {$ticker->ticker}: {$e->getMessage()}", [
+                    'trace' => $e->getTraceAsString(),
+                ]);
+                $this->error("❌ Error ingesting {$ticker->ticker}: {$e->getMessage()}");
+            }
+        }
+
+        $this->info('✅ All done.');
+        return Command::SUCCESS;
+    }
+
+    protected function ingestTicker(Ticker $ticker, bool $force = false): void
+    {
+        $symbol = $ticker->ticker;
+        $this->line("→ Processing {$symbol}...");
+
+        $latest = null;
+        if (! $force) {
+            $latest = DB::table('ticker_price_histories')
+                ->where('ticker_id', $ticker->id)
+                ->where('resolution', '1d')
+                ->max('t');
+        }
+
+        $startDate = $force || !$latest
+            ? Carbon::now()->subYears(5)->format('Y-m-d')
+            : Carbon::parse($latest)->addDay()->format('Y-m-d');
+
+        $endDate = Carbon::now()->format('Y-m-d');
+
+        if (Carbon::parse($startDate)->greaterThan($endDate)) {
+            $this->line("   Already up to date.");
+            return;
+        }
+
+        $this->line("   Fetching bars from {$startDate} → {$endDate} in chunks...");
+
+        $chunkStart = Carbon::parse($startDate);
+        $chunkSize = 365;
+        $totalBars = 0;
+
+        while ($chunkStart->lessThanOrEqualTo(Carbon::parse($endDate))) {
+            $chunkEnd = (clone $chunkStart)->addDays($chunkSize - 1);
+            if ($chunkEnd->greaterThan(Carbon::parse($endDate))) {
+                $chunkEnd = Carbon::parse($endDate);
+            }
+
+            $this->line("     → {$chunkStart->toDateString()} to {$chunkEnd->toDateString()}");
+
+            $attempt = 0;
+            $maxAttempts = 3;
+            $bars = null;
+
+            while ($attempt < $maxAttempts) {
+                try {
+                    $bars = $this->priceHistoryService->fetchAggregates(
+                        $symbol,
+                        1,
+                        'day',
+                        $chunkStart->toDateString(),
+                        $chunkEnd->toDateString()
+                    );
+
+                    // Success: exit retry loop
+                    break;
+                } catch (\Throwable $e) {
+                    $attempt++;
+                    $wait = pow(2, $attempt + 1);
+                    Log::channel('polygon')->warning("Retry {$attempt}/{$maxAttempts} for {$symbol} ({$chunkStart->toDateString()} → {$chunkEnd->toDateString()}): {$e->getMessage()}");
+                    $this->warn("       ⚠️ Attempt {$attempt} failed: {$e->getMessage()} — retrying in {$wait}s...");
+                    sleep($wait);
+                }
+            }
+
+            if (!empty($bars)) {
+                $inserted = $this->priceHistoryService->upsertBars($ticker->id, $symbol, '1d', $bars);
+                $totalBars += $inserted;
+                $this->line("       ✅ Upserted {$inserted} bars.");
+            } else {
+                $this->line("       ❌ Failed all retries or no data returned.");
+            }
+
+            // Normal pacing delay to respect rate limits
+            sleep(2);
+            $chunkStart = $chunkEnd->addDay();
+        }
+
+        $this->info("   ✅ Completed {$symbol}: total {$totalBars} bars inserted/updated.");
+        Log::channel('polygon')->info("Ingested {$totalBars} bars for {$symbol}", [
+            'symbol' => $symbol,
+            'start' => $startDate,
+            'end' => $endDate,
+        ]);
+    }
+}
+[EOF: app/Console/Commands]

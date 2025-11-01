@@ -1,0 +1,39 @@
+mkdir -p gpt-dumps && \
+ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ") && \
+echo "🕒 GPT Dump started at $ts (UTC)" && \
+for dir in app/Bus app/Console/Commands app/Http app/Jobs app/Models app/Providers app/Schedules app/Services config routes; do \
+  name=$(basename "$dir" | tr '[:upper:]' '[:lower:]'); \
+  out="gpt-dumps/${name}_dump.txt"; \
+  echo "📄 Dumping $dir → $out"; \
+  { \
+    echo "===== GPT DUMP GENERATED: $ts ====="; \
+    echo "===== DIRECTORY: $dir ====="; \
+    echo ""; \
+    find "$dir" -type f \( -name "*.php" -o -name "*.sql" \) \
+      -print -exec sh -c 'echo "\n\n===== FILE: {} =====\n"; cat "{}"' \;; \
+    echo ""; \
+    echo "[EOF: $dir]"; \
+  } > "$out"; \
+done && \
+echo "📄 Dumping database/migrations (split into two files)" && \
+first="gpt-dumps/migrations_part1.txt"; \
+second="gpt-dumps/migrations_part2.txt"; \
+{ \
+  echo "===== GPT DUMP GENERATED: $ts ====="; \
+  echo "===== DATABASE MIGRATIONS (Part 1 - First 10 Files) ====="; \
+  echo ""; \
+  ls -1 database/migrations/*.php | head -n 10 | \
+    xargs -I {} sh -c 'echo "\n\n===== FILE: {} =====\n"; cat "{}"'; \
+  echo ""; \
+  echo "[EOF: database/migrations (Part 1)]"; \
+} > "$first"; \
+{ \
+  echo "===== GPT DUMP GENERATED: $ts ====="; \
+  echo "===== DATABASE MIGRATIONS (Part 2 - Remaining Files) ====="; \
+  echo ""; \
+  ls -1 database/migrations/*.php | tail -n +11 | \
+    xargs -I {} sh -c 'echo "\n\n===== FILE: {} =====\n"; cat "{}"'; \
+  echo ""; \
+  echo "[EOF: database/migrations (Part 2)]"; \
+} > "$second"; \
+echo "✅ GPT dump complete! Files written to gpt-dumps/ (timestamp: $ts)"

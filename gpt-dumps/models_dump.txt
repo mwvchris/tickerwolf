@@ -1,0 +1,743 @@
+===== GPT DUMP GENERATED: 2025-10-30T00:32:43Z =====
+===== DIRECTORY: app/Models =====
+
+app/Models/TickerIndicator.php
+
+
+===== FILE: app/Models/TickerIndicator.php =====
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Carbon;
+
+class TickerIndicator extends Model
+{
+    use HasFactory;
+
+    protected $fillable = [
+        'ticker_id',
+        'resolution',
+        't',
+        'indicator',
+        'value',
+        'meta',
+    ];
+
+    protected $casts = [
+        't' => 'datetime',
+        'meta' => 'array',
+        'value' => 'float',
+    ];
+
+    /**
+     * Relationships
+     */
+    public function ticker()
+    {
+        return $this->belongsTo(Ticker::class);
+    }
+
+    /**
+     * Scopes
+     */
+    public function scopeForTicker($query, string $symbol)
+    {
+        return $query->whereHas('ticker', fn($q) => $q->where('ticker', strtoupper($symbol)));
+    }
+
+    public function scopeIndicator($query, string $name)
+    {
+        return $query->where('indicator', $name);
+    }
+
+    public function scopeLatest($query)
+    {
+        return $query->orderByDesc('t');
+    }
+
+    /**
+     * Accessors
+     */
+    public function getDateAttribute(): ?string
+    {
+        return $this->t ? Carbon::parse($this->t)->toDateString() : null;
+    }
+}app/Models/TickerNewsItem.php
+
+
+===== FILE: app/Models/TickerNewsItem.php =====
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Carbon;
+
+class TickerNewsItem extends Model
+{
+    use HasFactory;
+
+    /**
+     * This table is ingestion-only, so we’ll guard nothing to simplify updates.
+     * If you later expose a writable API endpoint, switch to $fillable for safety.
+     */
+    protected $guarded = [];
+
+    /**
+     * Attribute casting.
+     * - Arrays are automatically converted to JSON for storage.
+     * - Dates use Carbon for easy formatting.
+     */
+    protected $casts = [
+        'published_utc' => 'datetime',
+        'tickers_list'  => 'array',
+        'keywords'      => 'array',
+        'insights'      => 'array',
+        'raw'           => 'array',
+    ];
+
+    /**
+     * Relationships
+     */
+    public function ticker()
+    {
+        return $this->belongsTo(Ticker::class);
+    }
+
+    /**
+     * Query Scopes
+     */
+
+    // Limit to recent news items (default: past 7 days)
+    public function scopeRecent($query, int $days = 7)
+    {
+        return $query->where('published_utc', '>=', now()->subDays($days));
+    }
+
+    // Limit to a specific ticker symbol
+    public function scopeForTicker($query, string $symbol)
+    {
+        return $query->where('ticker', strtoupper($symbol));
+    }
+
+    // Filter by sentiment
+    public function scopeWithSentiment($query, ?string $sentiment = null)
+    {
+        if ($sentiment) {
+            return $query->where('insight_sentiment', strtolower($sentiment));
+        }
+        return $query->whereNotNull('insight_sentiment');
+    }
+
+    /**
+     * Accessors
+     */
+
+    // Human-readable date
+    public function getPublishedDateAttribute(): ?string
+    {
+        return $this->published_utc
+            ? Carbon::parse($this->published_utc)->toDateString()
+            : null;
+    }
+
+    // Short summary preview
+    public function getSummaryExcerptAttribute(): ?string
+    {
+        return $this->summary
+            ? mb_strimwidth($this->summary, 0, 140, '…')
+            : null;
+    }
+
+    // Display publisher name fallback
+    public function getPublisherDisplayAttribute(): ?string
+    {
+        return $this->publisher_name ?? 'Unknown Source';
+    }
+}app/Models/TickerPriceHistory.php
+
+
+===== FILE: app/Models/TickerPriceHistory.php =====
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class TickerPriceHistory extends Model
+{
+    use HasFactory;
+
+    protected $table = 'ticker_price_histories';
+
+    protected $fillable = [
+        'ticker_id',
+        'o',
+        'h',
+        'l',
+        'c',
+        'v',
+        'vw',
+        't',
+        'year',
+    ];
+
+    protected $casts = [
+        't' => 'integer',
+        'o' => 'float',
+        'h' => 'float',
+        'l' => 'float',
+        'c' => 'float',
+        'v' => 'float',
+        'vw' => 'float',
+        'year' => 'integer',
+    ];
+
+    public function ticker()
+    {
+        return $this->belongsTo(Ticker::class);
+    }
+
+    /**
+     * Scope for filtering by year.
+     */
+    public function scopeYear($query, int $year)
+    {
+        return $query->where('year', $year);
+    }
+}app/Models/LatestTickerPrice.php
+
+
+===== FILE: app/Models/LatestTickerPrice.php =====
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class LatestTickerPrice extends Model
+{
+    protected $table = 'latest_ticker_prices';
+
+    // This model is read-only (it's a SQL VIEW)
+    public $timestamps = false;
+    protected $guarded = [];
+
+    public static function forTicker(string $ticker)
+    {
+        return static::where('ticker', $ticker)->first();
+    }
+
+    // Optional: make it cast values properly
+    protected $casts = [
+        't' => 'datetime',
+        'o' => 'float', // open
+        'h' => 'float', // high
+        'l' => 'float', // low
+        'c' => 'float', // close
+        'v' => 'float', // volume
+    ];
+}app/Models/TickerAnalysis.php
+
+
+===== FILE: app/Models/TickerAnalysis.php =====
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+class TickerAnalysis extends Model
+{
+    protected $fillable = [
+        'ticker','user_id','provider','model','request_payload','response_raw',
+        'summary','structured','status','requested_at','completed_at',
+    ];
+
+    protected $casts = [
+        'request_payload' => 'array',
+        'response_raw' => 'array',
+        'structured' => 'array',
+        'requested_at' => 'datetime',
+        'completed_at' => 'datetime',
+    ];
+
+    public function user() { return $this->belongsTo(User::class); }
+}app/Models/User.php
+
+
+===== FILE: app/Models/User.php =====
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Contracts\Auth\MustVerifyEmail;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Foundation\Auth\User as Authenticatable;
+use Illuminate\Notifications\Notifiable;
+use Laravel\Fortify\TwoFactorAuthenticatable;
+
+class User extends Authenticatable implements MustVerifyEmail
+{
+    /** @use HasFactory<\Database\Factories\UserFactory> */
+    use HasFactory, Notifiable, TwoFactorAuthenticatable;
+
+    /**
+     * The attributes that are mass assignable.
+     *
+     * @var list<string>
+     */
+    protected $fillable = [
+        'name',
+        'email',
+        'password',
+    ];
+
+    /**
+     * The attributes that should be hidden for serialization.
+     *
+     * @var list<string>
+     */
+    protected $hidden = [
+        'password',
+        'two_factor_secret',
+        'two_factor_recovery_codes',
+        'remember_token',
+    ];
+
+    /**
+     * Get the attributes that should be cast.
+     *
+     * @return array<string, string>
+     */
+    protected function casts(): array
+    {
+        return [
+            'email_verified_at' => 'datetime',
+            'password' => 'hashed',
+            'two_factor_confirmed_at' => 'datetime',
+        ];
+    }
+}app/Models/Ticker.php
+
+
+===== FILE: app/Models/Ticker.php =====
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class Ticker extends Model
+{
+    use HasFactory;
+
+    /**
+     * Mass-assignable fields.
+     * Includes core Polygon fields + newly added overview fields.
+     */
+    protected $fillable = [
+        // --- Core fields from Polygon /v3/reference/tickers ---
+        'ticker',
+        'name',
+        'market',
+        'locale',
+        'primary_exchange',
+        'type',
+        'status',
+        'active',
+        'currency_symbol',
+        'currency_name',
+        'base_currency_symbol',
+        'base_currency_name',
+        'cik',
+        'composite_figi',
+        'share_class_figi',
+        'last_updated_utc',
+        'delisted_utc',
+        'raw',
+
+        // --- Overview fields from Polygon /v3/reference/tickers/{ticker} ---
+        'description',
+        'homepage_url',
+        'list_date',
+        'market_cap',
+        'phone_number',
+        'total_employees',
+        'sic_code',
+        'sic_description',
+        'share_class_shares_outstanding',
+        'weighted_shares_outstanding',
+        'ticker_root',
+        'ticker_suffix',
+        'round_lot',
+        'branding_logo_url',
+        'branding_icon_url',
+    ];
+
+    /**
+     * Attribute casting.
+     */
+    protected $casts = [
+        'active' => 'boolean',
+        'raw' => 'array',
+        'last_updated_utc' => 'datetime',
+        'delisted_utc' => 'datetime',
+        'list_date' => 'date',
+        'market_cap' => 'integer',
+        'total_employees' => 'integer',
+        'share_class_shares_outstanding' => 'integer',
+        'weighted_shares_outstanding' => 'integer',
+        'round_lot' => 'integer',
+    ];
+
+    /**
+     * Timestamps enabled.
+     */
+    public $timestamps = true;
+
+    /**
+     * Relationships
+     */
+
+    // Each ticker can have multiple Polygon overview snapshots
+    public function overviews()
+    {
+        return $this->hasMany(TickerOverview::class);
+    }
+
+    // Each ticker can have multiple AI/analysis records (future-proofing)
+    public function analyses()
+    {
+        return $this->hasMany(TickerAnalysis::class);
+    }
+
+    /**
+     * Accessors
+     */
+
+    // Generate a lowercase slug for routing (e.g. /ticker/aapl)
+    public function getSlugAttribute(): string
+    {
+        return strtolower($this->ticker);
+    }
+
+    // Return a formatted market cap (e.g. $1.23B)
+    public function getFormattedMarketCapAttribute(): ?string
+    {
+        if (! $this->market_cap) {
+            return null;
+        }
+
+        $value = $this->market_cap;
+        if ($value >= 1_000_000_000) {
+            return '$' . number_format($value / 1_000_000_000, 2) . 'B';
+        } elseif ($value >= 1_000_000) {
+            return '$' . number_format($value / 1_000_000, 2) . 'M';
+        }
+
+        return '$' . number_format($value);
+    }
+
+    /**
+     * Scopes
+     */
+
+    // Scope: only active tickers
+    public function scopeActive($query)
+    {
+        return $query->where('active', true);
+    }
+
+    // Scope: find ticker by symbol (case-insensitive)
+    public function scopeBySymbol($query, string $symbol)
+    {
+        return $query->whereRaw('LOWER(ticker) = ?', [strtolower($symbol)]);
+    }
+}app/Models/JobBatch.php
+
+
+===== FILE: app/Models/JobBatch.php =====
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class JobBatch extends Model
+{
+    use HasFactory;
+
+    protected $table = 'job_batches';
+
+    protected $fillable = [
+        'name',
+        'total_jobs',
+        'pending_jobs',
+        'processed_jobs',
+        'failed_jobs',
+        'status',
+        'created_at',
+        'updated_at',
+    ];
+
+    protected $casts = [
+        'total_jobs'    => 'integer',
+        'pending_jobs'  => 'integer',
+        'processed_jobs'=> 'integer',
+        'failed_jobs'   => 'integer',
+    ];
+
+    /**
+     * Determine if the batch is complete.
+     */
+    public function isComplete(): bool
+    {
+        return $this->pending_jobs <= 0 && $this->failed_jobs === 0;
+    }
+
+    /**
+     * Determine if the batch has failures.
+     */
+    public function hasFailures(): bool
+    {
+        return $this->failed_jobs > 0;
+    }
+
+    /**
+     * Mark the batch as complete.
+     */
+    public function markComplete(): void
+    {
+        $this->update(['status' => 'complete']);
+    }
+
+    /**
+     * Mark the batch as failed.
+     */
+    public function markFailed(): void
+    {
+        $this->update(['status' => 'failed']);
+    }
+}app/Models/TickerOverview.php
+
+
+===== FILE: app/Models/TickerOverview.php =====
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class TickerOverview extends Model
+{
+    use HasFactory;
+
+    /**
+     * Table name (explicit for clarity).
+     */
+    protected $table = 'ticker_overviews';
+
+    /**
+     * Mass assignable attributes.
+     */
+    protected $fillable = [
+        'ticker_id',
+        'overview_date',
+        'active',
+        'market_cap',
+        'primary_exchange',
+        'locale',
+        'status',
+        'results_raw',
+        'fetched_at',
+    ];
+
+    /**
+     * Attribute casting.
+     */
+    protected $casts = [
+        'active' => 'boolean',
+        'market_cap' => 'integer',
+        'results_raw' => 'array',
+        'overview_date' => 'date',
+        'fetched_at' => 'datetime',
+    ];
+
+    /**
+     * Relationship: belongs to a ticker.
+     */
+    public function ticker()
+    {
+        return $this->belongsTo(Ticker::class);
+    }
+
+    /**
+     * Scope: fetch only the latest overview for each ticker.
+     */
+    public function scopeLatestForEachTicker($query)
+    {
+        // Note: This is DB-driver specific; for MySQL, we can use a subquery
+        return $query->whereIn('id', function ($sub) {
+            $sub->selectRaw('MAX(id)')
+                ->from('ticker_overviews')
+                ->groupBy('ticker_id');
+        });
+    }
+
+    /**
+     * Accessors
+     */
+
+    // Nicely formatted market cap for display
+    public function getFormattedMarketCapAttribute(): ?string
+    {
+        if (! $this->market_cap) {
+            return null;
+        }
+
+        $value = $this->market_cap;
+        if ($value >= 1_000_000_000) {
+            return '$' . number_format($value / 1_000_000_000, 2) . 'B';
+        } elseif ($value >= 1_000_000) {
+            return '$' . number_format($value / 1_000_000, 2) . 'M';
+        }
+
+        return '$' . number_format($value);
+    }
+
+    // Derived ticker symbol for convenience
+    public function getSymbolAttribute(): ?string
+    {
+        return optional($this->ticker)->ticker;
+    }
+
+    /**
+     * Utility: Create or update overview record from a Polygon API response.
+     * 
+     * @param  \App\Models\Ticker  $ticker
+     * @param  array  $polygonData  Raw JSON data from Polygon API
+     * @return static
+     */
+    public static function fromPolygonResponse(Ticker $ticker, array $polygonData): self
+    {
+        $parsed = [
+            'ticker_id'        => $ticker->id,
+            'overview_date'    => now()->toDateString(),
+            'active'           => $polygonData['active'] ?? null,
+            'market_cap'       => $polygonData['market_cap'] ?? null,
+            'primary_exchange' => $polygonData['primary_exchange'] ?? null,
+            'locale'           => $polygonData['locale'] ?? null,
+            'status'           => $polygonData['status'] ?? null,
+            'results_raw'      => $polygonData,
+            'fetched_at'       => now(),
+        ];
+
+        // Upsert for ticker + overview_date uniqueness
+        return static::updateOrCreate(
+            ['ticker_id' => $ticker->id, 'overview_date' => $parsed['overview_date']],
+            $parsed
+        );
+    }
+}app/Models/TickerFundamental.php
+
+
+===== FILE: app/Models/TickerFundamental.php =====
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+
+class TickerFundamental extends Model
+{
+    use HasFactory;
+
+    protected $table = 'ticker_fundamentals';
+
+    // This table is ingestion-only; easiest is to allow all mass assignment:
+    protected $guarded = [];
+
+    protected $casts = [
+        'start_date'            => 'date',
+        'end_date'              => 'date',
+        'filing_date'           => 'date',
+        'balance_sheet'         => 'array',
+        'income_statement'      => 'array',
+        'cash_flow_statement'   => 'array',
+        'comprehensive_income'  => 'array',
+        'raw'                   => 'array',
+        'fetched_at'            => 'datetime',
+    ];
+
+    public function ticker()
+    {
+        return $this->belongsTo(Ticker::class);
+    }
+
+    public function metrics()
+    {
+        return $this->hasMany(TickerFundamentalMetric::class, 'fundamental_id');
+    }
+}app/Models/TickerFundamentalMetric.php
+
+
+===== FILE: app/Models/TickerFundamentalMetric.php =====
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Factories\HasFactory;
+use Illuminate\Database\Eloquent\Model;
+
+class TickerFundamentalMetric extends Model
+{
+    use HasFactory;
+
+    protected $table = 'ticker_fundamentals_financials';
+
+    protected $fillable = [
+        'ticker_id', 'fundamental_id', 'ticker', 'statement', 'line_item',
+        'label', 'unit', 'display_order', 'value',
+        'end_date', 'fiscal_period', 'fiscal_year',
+    ];
+
+    protected $casts = [
+        'value' => 'float',
+        'display_order' => 'integer',
+        'end_date' => 'date',
+        'created_at' => 'datetime',
+        'updated_at' => 'datetime',
+    ];
+
+    public function ticker()
+    {
+        return $this->belongsTo(Ticker::class);
+    }
+
+    public function fundamental()
+    {
+        return $this->belongsTo(TickerFundamental::class, 'fundamental_id');
+    }
+}
+[EOF: app/Models]

@@ -1,0 +1,4 @@
+[2025-10-25 21:24:00] local.INFO: Starting Polygon ticker overview ingestion {"started_at":"2025-10-25 21:24:00","total_in_db":11851,"to_process":100,"batch_size":1000,"sleep_between_batches":15} 
+[2025-10-25 21:24:29] local.INFO: Polygon ticker overview ingestion finished {"started_at":"2025-10-25 21:24:00","finished_at":"2025-10-25 21:24:29","processed":100,"succeeded":100,"failed":0} 
+[2025-10-25 21:28:26] local.INFO: Starting Polygon ticker overview ingestion {"started_at":"2025-10-25 21:28:26","total_in_db":11851,"to_process":100,"batch_size":1000,"sleep_between_batches":15} 
+[2025-10-25 21:28:56] local.INFO: Polygon ticker overview ingestion finished {"started_at":"2025-10-25 21:28:26","finished_at":"2025-10-25 21:28:56","processed":100,"succeeded":100,"failed":0} 

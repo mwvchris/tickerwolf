@@ -1,0 +1,1604 @@
+===== GPT DUMP GENERATED: 2025-10-30T00:32:43Z =====
+===== DIRECTORY: app/Services =====
+
+app/Services/TickerSlugService.php
+
+
+===== FILE: app/Services/TickerSlugService.php =====
+
+<?php
+
+namespace App\Services;
+
+use Illuminate\Support\Str;
+
+class TickerSlugService
+{
+    /**
+     * Generate a URL-safe slug from ticker + name.
+     * Example: ticker=AAPL, name="Apple Inc." => "apple-inc"
+     * We intentionally *do not* include ticker in the slug itself because the URL will include ticker before the slug.
+     *
+     * @param string|null $name
+     * @return string|null
+     */
+    public function slugFromName(?string $name): ?string
+    {
+        if (empty($name)) {
+            return null;
+        }
+
+        // Generate a slug from the company name, limit length to 80 chars
+        $slug = Str::slug($name);
+        return Str::limit($slug, 80, '');
+    }
+}
+app/Services/LLMContracts/LLMProviderInterface.php
+
+
+===== FILE: app/Services/LLMContracts/LLMProviderInterface.php =====
+
+<?php
+
+namespace App\Services\LLMContracts;
+
+interface LLMProviderInterface
+{
+    public function analyze(string $ticker, string $promptTemplate, array $context = []): array;
+
+    public function extractStructuredFromText(string $text): ?array;
+}
+app/Services/PolygonApiClient.php
+
+
+===== FILE: app/Services/PolygonApiClient.php =====
+
+<?php
+
+namespace App\Services;
+
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+
+class PolygonApiClient
+{
+    protected string $baseUrl;
+    protected string $apiKey;
+    protected int $timeout;
+    protected int $maxRetries;
+
+    public function __construct()
+    {
+        $this->baseUrl = rtrim(config('services.polygon.base') ?? env('POLYGON_API_BASE', 'https://api.polygon.io'), '/');
+        $this->apiKey = config('services.polygon.key') ?? env('POLYGON_API_KEY');
+        $this->timeout = (int) (env('POLYGON_API_TIMEOUT', 30));
+        $this->maxRetries = (int) (env('POLYGON_API_RETRIES', 3));
+    }
+
+    /**
+     * Perform a GET request with built-in retries, rate-limit handling, and backoff.
+     */
+    public function get(string $endpointOrUrl, array $params = [])
+    {
+        $url = str_starts_with($endpointOrUrl, 'http')
+            ? $endpointOrUrl
+            : "{$this->baseUrl}/" . ltrim($endpointOrUrl, '/');
+
+        // Ensure API key is always attached
+        $params['apiKey'] = $params['apiKey'] ?? $this->apiKey;
+        $url .= (str_contains($url, '?') ? '&' : '?') . http_build_query($params);
+
+        $attempt = 0;
+        $waitSeconds = 2;
+
+        while (true) {
+            $attempt++;
+            try {
+                $response = Http::timeout($this->timeout)->get($url);
+            } catch (\Throwable $e) {
+                Log::error("Polygon HTTP exception: {$e->getMessage()}", ['url' => $url]);
+                if ($attempt >= $this->maxRetries) {
+                    return response()->json(['error' => $e->getMessage()], 500);
+                }
+                sleep($waitSeconds);
+                $waitSeconds *= 2;
+                continue;
+            }
+
+            // Handle rate limit
+            if ($response->status() === 429) {
+                $retryAfter = (int) ($response->header('Retry-After') ?? $waitSeconds);
+                Log::warning("Polygon API 429 - sleeping {$retryAfter}s");
+                sleep($retryAfter);
+                continue;
+            }
+
+            // Retry on 5xx
+            if ($response->serverError() && $attempt < $this->maxRetries) {
+                Log::warning("Polygon server error {$response->status()} — retrying in {$waitSeconds}s");
+                sleep($waitSeconds);
+                $waitSeconds *= 2;
+                continue;
+            }
+
+            return $response;
+        }
+    }
+}app/Services/LLMProviders/GeminiProvider.php
+
+
+===== FILE: app/Services/LLMProviders/GeminiProvider.php =====
+
+<?php
+
+namespace App\Services\LLMProviders;
+
+use Illuminate\Support\Facades\Http;
+use App\Services\LLMContracts\LLMProviderInterface;
+
+class GeminiProvider implements LLMProviderInterface
+{
+    public function analyze(string $ticker, string $promptTemplate, array $context = []): array
+    {
+        $prompt = $this->renderPrompt($promptTemplate, ['ticker'=>strtoupper($ticker)] + $context);
+
+        $response = Http::withToken(config('services.gemini.key'))
+            ->post('https://generativelanguage.googleapis.com/v1beta/models/gemini-pro:generateContent', [
+                'contents' => [['parts' => [['text' => $prompt]]]],
+            ]);
+
+        return $response->json();
+    }
+
+    protected function renderPrompt(string $template, array $data): string {
+        foreach ($data as $k=>$v) $template = str_replace('{{'.$k.'}}',$v,$template);
+        return $template;
+    }
+
+    public function extractStructuredFromText(string $text): ?array {
+        $json = $this->findJson($text);
+        return $json ? json_decode($json,true) : null;
+    }
+
+    protected function findJson(string $text): ?string {
+        $start=strrpos($text,'{'); $end=strrpos($text,'}');
+        return ($start!==false && $end!==false) ? substr($text,$start,$end-$start+1) : null;
+    }
+}app/Services/LLMProviders/GrokProvider.php
+
+
+===== FILE: app/Services/LLMProviders/GrokProvider.php =====
+
+<?php
+
+namespace App\Services\LLMProviders;
+
+use Illuminate\Support\Facades\Http;
+use App\Services\LLMContracts\LLMProviderInterface;
+
+class GrokProvider implements LLMProviderInterface
+{
+    public function analyze(string $ticker, string $promptTemplate, array $context = []): array
+    {
+        $prompt = $this->renderPrompt($promptTemplate, ['ticker'=>strtoupper($ticker)] + $context);
+
+        $response = Http::withToken(config('services.grok.key'))
+            ->post(config('services.grok.endpoint', 'https://api.x.ai/v1/chat/completions'), [
+                'model' => config('services.grok.model', 'grok-beta'),
+                'messages' => [
+                    ['role'=>'system','content'=>'You are a helpful financial analyst.'],
+                    ['role'=>'user','content'=>$prompt],
+                ],
+            ]);
+
+        return $response->json();
+    }
+
+    protected function renderPrompt(string $template, array $data): string {
+        foreach ($data as $k=>$v) $template = str_replace('{{'.$k.'}}',$v,$template);
+        return $template;
+    }
+
+    public function extractStructuredFromText(string $text): ?array {
+        $json = $this->findJson($text);
+        return $json ? json_decode($json,true) : null;
+    }
+
+    protected function findJson(string $text): ?string {
+        $start=strrpos($text,'{'); $end=strrpos($text,'}');
+        return ($start!==false && $end!==false) ? substr($text,$start,$end-$start+1) : null;
+    }
+}app/Services/LLMProviders/OpenAiProvider.php
+
+
+===== FILE: app/Services/LLMProviders/OpenAiProvider.php =====
+
+<?php
+
+namespace App\Services\LLMProviders;
+
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use App\Services\LLMContracts\LLMProviderInterface;
+use RuntimeException;
+use Throwable;
+
+class OpenAiProvider implements LLMProviderInterface
+{
+    /**
+     * Perform analysis using the OpenAI Responses API (v1/responses)
+     * with provider-level hardening (retries, backoff, validation).
+     */
+    public function analyze(string $ticker, string $promptTemplate, array $context = []): array
+    {
+        $prompt = $this->renderPrompt(
+            $promptTemplate,
+            array_merge($context, ['ticker' => strtoupper($ticker)])
+        );
+
+        $apiKey   = config('services.openai.key');
+        $endpoint = config('services.openai.endpoint', 'https://api.openai.com/v1/responses');
+        $model    = config('services.openai.model', 'gpt-4.1-mini');
+
+        if (empty($apiKey)) {
+            throw new RuntimeException('Missing OpenAI API key.');
+        }
+
+        $payload = [
+            'model' => $model,
+            'input' => [
+                [
+                    'role' => 'system',
+                    'content' => 'You are a helpful financial analyst that provides concise, structured insights.'
+                ],
+                [
+                    'role' => 'user',
+                    'content' => $prompt
+                ]
+            ],
+            'temperature' => 0.2,
+            'max_output_tokens' => 1200,
+        ];
+
+        $maxAttempts = 3;
+        $delaySeconds = 5;
+
+        for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
+            try {
+                $response = Http::withToken($apiKey)
+                    ->timeout(60)
+                    ->acceptJson()
+                    ->post($endpoint, $payload);
+
+                $json = $response->json();
+
+                Log::debug('OpenAI raw response', [
+                    'provider' => 'openai',
+                    'ticker'   => $ticker,
+                    'attempt'  => $attempt,
+                    'raw'      => $json,
+                ]);
+
+                // Handle non-2xx responses
+                if ($response->failed()) {
+                    $status = $response->status();
+                    $message = $json['error']['message'] ?? 'Unknown API error';
+
+                    // Retry automatically on transient or rate-limit errors
+                    if (in_array($status, [408, 429, 500, 502, 503, 504], true)) {
+                        Log::warning("Transient OpenAI error [{$status}]: {$message}. Retrying in {$delaySeconds}s…");
+                        sleep($delaySeconds);
+                        $delaySeconds *= 2; // Exponential backoff
+                        continue;
+                    }
+
+                    throw new RuntimeException("OpenAI API error [{$status}]: {$message}");
+                }
+
+                // Validate structure before parsing
+                if (!isset($json['output'][0]['content'][0]['text'])) {
+                    throw new RuntimeException('Malformed API response: missing content.');
+                }
+
+                $content = trim($json['output'][0]['content'][0]['text'] ?? '');
+
+                if ($content === '') {
+                    throw new RuntimeException('Provider returned empty content.');
+                }
+
+                return [
+                    'content' => $content,
+                    'raw'     => $json,
+                ];
+            } catch (Throwable $e) {
+                Log::error("OpenAI attempt {$attempt} failed: {$e->getMessage()}");
+
+                if ($attempt < $maxAttempts) {
+                    sleep($delaySeconds);
+                    $delaySeconds *= 2;
+                    continue;
+                }
+
+                throw new RuntimeException("OpenAI analysis failed after {$attempt} attempts: " . $e->getMessage(), 0, $e);
+            }
+        }
+
+        // Should not reach here
+        throw new RuntimeException('OpenAI analysis aborted after maximum retries.');
+    }
+
+    /**
+     * Simple template interpolation.
+     */
+    protected function renderPrompt(string $template, array $data): string
+    {
+        foreach ($data as $k => $v) {
+            $template = str_replace('{{' . $k . '}}', $v, $template);
+        }
+        return $template;
+    }
+
+    /**
+     * Extracts structured JSON from a text blob.
+     */
+    public function extractStructuredFromText(string $text): ?array
+    {
+        $json = $this->findJson($text);
+        return $json ? json_decode($json, true) : null;
+    }
+
+    /**
+     * Finds JSON within a text body.
+     */
+    protected function findJson(string $text): ?string
+    {
+        $start = strpos($text, '{');
+        $end = strrpos($text, '}');
+
+        if ($start === false || $end === false || $end <= $start) {
+            return null;
+        }
+
+        $possibleJson = substr($text, $start, $end - $start + 1);
+
+        // Basic sanity check before decoding
+        return str_contains($possibleJson, ':') ? $possibleJson : null;
+    }
+}app/Services/PolygonPriceHistoryService.php
+
+
+===== FILE: app/Services/PolygonPriceHistoryService.php =====
+
+<?php
+
+namespace App\Services;
+
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Carbon;
+use Throwable;
+
+class PolygonPriceHistoryService
+{
+    protected string $baseUrl;
+    protected string $apiKey;
+    protected int $timeout;
+    protected int $maxRetries;
+    protected string $logChannel;
+
+    public function __construct()
+    {
+        $this->baseUrl = rtrim(config('services.polygon.base') ?? env('POLYGON_API_BASE', 'https://api.polygon.io'), '/');
+        $this->apiKey = config('services.polygon.key') ?? env('POLYGON_API_KEY');
+        $this->timeout = (int)(env('POLYGON_API_TIMEOUT', 30));
+        $this->maxRetries = (int)(env('POLYGON_API_RETRIES', 3));
+        $this->logChannel = 'polygon';
+    }
+
+    public function fetchAggregates(string $symbol, int $multiplier, string $timespan, string $from, string $to, array $extraParams = []): array
+    {
+        $endpoint = "/v2/aggs/ticker/{$symbol}/range/{$multiplier}/{$timespan}/{$from}/{$to}";
+        $params = array_merge(['apiKey' => $this->apiKey, 'limit' => 50000], $extraParams);
+        $url = $this->baseUrl . $endpoint . '?' . http_build_query($params);
+
+        $attempt = 0;
+        $wait = 1;
+
+        while (true) {
+            $attempt++;
+            try {
+                $resp = Http::timeout($this->timeout)->get($url);
+
+                if ($resp->successful()) {
+                    $json = $resp->json();
+                    Log::channel($this->logChannel)->debug("Polygon raw response for {$symbol} ({$from}→{$to}): " . json_encode($json));
+                    return $json['results'] ?? [];
+                }
+
+                if ($resp->status() == 429) {
+                    $retryAfter = $resp->header('Retry-After') ?? $wait;
+                    Log::channel($this->logChannel)->warning("Polygon 429 for {$symbol}. Retry after {$retryAfter}s (attempt {$attempt})");
+                    sleep((int)$retryAfter);
+                } elseif ($resp->serverError()) {
+                    if ($attempt >= $this->maxRetries) {
+                        Log::channel($this->logChannel)->error("Polygon server error for {$symbol} after {$attempt} attempts. Status: {$resp->status()}");
+                        break;
+                    }
+                    sleep($wait);
+                    $wait *= 2;
+                } else {
+                    Log::channel($this->logChannel)->warning("Polygon client error for {$symbol}: status {$resp->status()} body: {$resp->body()}");
+                    return [];
+                }
+            } catch (Throwable $e) {
+                Log::channel($this->logChannel)->error("HTTP error fetching aggregates for {$symbol}: {$e->getMessage()}");
+                if ($attempt >= $this->maxRetries) break;
+                sleep($wait);
+                $wait *= 2;
+            }
+
+            if ($attempt >= ($this->maxRetries + 3)) break;
+        }
+
+        return [];
+    }
+
+    public function upsertBars(int $tickerId, string $symbol, string $resolution, array $bars): int
+    {
+        if (empty($bars)) return 0;
+
+        $now = Carbon::now()->toDateTimeString();
+        $rows = [];
+
+        foreach ($bars as $b) {
+            $ts = isset($b['t']) ? Carbon::createFromTimestampMs((int)$b['t']) : null;
+            if (!$ts) continue;
+
+            $rows[] = [
+                'ticker_id' => $tickerId,
+                'resolution' => $resolution,
+                't' => $ts->toDateTimeString(),
+                'year' => (int)$ts->year,
+                'o' => $b['o'] ?? null,
+                'h' => $b['h'] ?? null,
+                'l' => $b['l'] ?? null,
+                'c' => $b['c'] ?? null,
+                'v' => isset($b['v']) ? (int)$b['v'] : null,
+                'vw' => $b['vw'] ?? null,
+                'raw' => json_encode($b),
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
+        }
+
+        if (empty($rows)) return 0;
+
+        DB::table('ticker_price_histories')->upsert(
+            $rows,
+            ['ticker_id', 'resolution', 't'],
+            ['o', 'h', 'l', 'c', 'v', 'vw', 'raw', 'updated_at']
+        );
+
+        return count($rows);
+    }
+}app/Services/LLMProviderFactory.php
+
+
+===== FILE: app/Services/LLMProviderFactory.php =====
+
+<?php
+
+namespace App\Services;
+
+use App\Services\LLMProviders\{OpenAiProvider, GeminiProvider, GrokProvider};
+use App\Services\LLMContracts\LLMProviderInterface;
+use InvalidArgumentException;
+
+class LLMProviderFactory
+{
+    public static function make(string $provider): LLMProviderInterface
+    {
+        return match(strtolower($provider)) {
+            'openai' => new OpenAiProvider(),
+            'gemini' => new GeminiProvider(),
+            'grok'   => new GrokProvider(),
+            default  => throw new InvalidArgumentException("Unsupported provider [$provider]"),
+        };
+    }
+}app/Services/PolygonTickerPriceHistoryService.php
+
+
+===== FILE: app/Services/PolygonTickerPriceHistoryService.php =====
+
+<?php
+
+namespace App\Services;
+
+use Illuminate\Support\Facades\Log;
+use Throwable;
+
+class PolygonTickerPriceHistoryService
+{
+    protected PolygonPriceHistoryService $polygon;
+    protected string $logChannel;
+
+    public function __construct(PolygonPriceHistoryService $polygon)
+    {
+        $this->polygon = $polygon;
+        $this->logChannel = 'polygon';
+    }
+
+    /**
+     * Fetch and store historical price bars for a given ticker.
+     */
+    public function fetchAndStore(object $ticker, string $rangeFrom, string $rangeTo): void
+    {
+        $logger = Log::channel($this->logChannel);
+
+        // ✅ Use correct column from your model
+        $symbol = $ticker->ticker ?? null;
+
+        if (empty($symbol) || empty($ticker->id)) {
+            $logger->error('Ticker object missing symbol or id', ['ticker' => $ticker]);
+            return;
+        }
+
+        $symbol = strtoupper(trim($symbol));
+        $tickerId = (int)$ticker->id;
+        $resolution = '1d';
+        $multiplier = 1;
+        $timespan = 'day';
+
+        $logger->info("📈 Fetching Polygon data for {$symbol} ({$rangeFrom} → {$rangeTo})");
+
+        try {
+            $bars = $this->polygon->fetchAggregates($symbol, $multiplier, $timespan, $rangeFrom, $rangeTo);
+
+            if (empty($bars)) {
+                $logger->warning("⚠️ No data returned for {$symbol} ({$rangeFrom} → {$rangeTo}).");
+                return;
+            }
+
+            $count = $this->polygon->upsertBars($tickerId, $symbol, $resolution, $bars);
+            $logger->info("✅ Stored {$count} bars for {$symbol} ({$rangeFrom} → {$rangeTo})");
+        } catch (Throwable $e) {
+            $logger->error("❌ Exception fetching/storing data for {$symbol}: {$e->getMessage()}");
+        }
+    }
+}app/Services/BatchMonitorService.php
+
+
+===== FILE: app/Services/BatchMonitorService.php =====
+
+<?php
+
+namespace App\Services;
+
+use App\Models\JobBatch;
+use Illuminate\Support\Facades\Log;
+use Throwable;
+
+class BatchMonitorService
+{
+    /**
+     * Create a new batch record.
+     */
+    public static function createBatch(string $name, int $totalJobs): ?JobBatch
+    {
+        try {
+            return JobBatch::create([
+                'name'          => $name,
+                'total_jobs'    => $totalJobs,
+                'pending_jobs'  => $totalJobs,
+                'failed_jobs'   => 0,
+                'processed_jobs'=> 0,
+                'status'        => 'running',
+                'created_at'    => now(),
+                'updated_at'    => now(),
+            ]);
+        } catch (Throwable $e) {
+            Log::channel('ingest')->error("❌ Failed to create batch record: {$e->getMessage()}");
+            return null;
+        }
+    }
+
+    /**
+     * Increment progress for a batch as jobs complete successfully.
+     */
+    public static function incrementProgress(string $batchName, ?string $ticker = null): void
+    {
+        try {
+            $batch = JobBatch::where('name', $batchName)->latest('id')->first();
+            if ($batch) {
+                $batch->increment('processed_jobs');
+                $batch->decrement('pending_jobs', min(1, $batch->pending_jobs));
+                $batch->touch();
+
+                Log::channel('ingest')->info("📈 Batch progress incremented for {$batchName}", [
+                    'ticker' => $ticker,
+                    'processed_jobs' => $batch->processed_jobs,
+                    'pending_jobs'   => $batch->pending_jobs,
+                ]);
+
+                // Optionally auto-complete batch if all jobs are done
+                if ($batch->pending_jobs <= 0) {
+                    $batch->update(['status' => 'complete']);
+                }
+            } else {
+                Log::channel('ingest')->warning("⚠️ incrementProgress: No batch found for {$batchName}");
+            }
+        } catch (Throwable $e) {
+            Log::channel('ingest')->error("❌ incrementProgress failed for {$batchName}: {$e->getMessage()}");
+        }
+    }
+
+    /**
+     * Decrement pending count (e.g., when a job finishes).
+     */
+    public static function decrementPending(JobBatch $jobBatch): void
+    {
+        try {
+            $jobBatch->decrement('pending_jobs');
+            $jobBatch->increment('processed_jobs');
+            $jobBatch->touch();
+        } catch (Throwable $e) {
+            Log::channel('ingest')->warning("⚠️ decrementPending failed: {$e->getMessage()}");
+        }
+    }
+
+    /**
+     * Mark a batch job as failed.
+     */
+    public static function markFailed(JobBatch $jobBatch, string $jobId): void
+    {
+        try {
+            $jobBatch->increment('failed_jobs');
+            $jobBatch->decrement('pending_jobs');
+            $jobBatch->touch();
+
+            Log::channel('ingest')->error("❌ Job failed in batch [{$jobBatch->name}] - Job ID: {$jobId}");
+        } catch (Throwable $e) {
+            Log::channel('ingest')->warning("⚠️ markFailed failed: {$e->getMessage()}");
+        }
+    }
+}app/Services/PolygonIndicatorsService.php
+
+
+===== FILE: app/Services/PolygonIndicatorsService.php =====
+
+<?php
+
+namespace App\Services;
+
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use App\Models\Ticker;
+use Throwable;
+
+class PolygonIndicatorsService
+{
+    protected string $baseUrl;
+    protected string $apiKey;
+    protected int $timeout;
+    protected int $maxRetries;
+    protected string $logChannel;
+
+    public function __construct()
+    {
+        $this->baseUrl = rtrim(config('services.polygon.base') ?? env('POLYGON_API_BASE', 'https://api.polygon.io'), '/');
+        $this->apiKey = config('services.polygon.key') ?? env('POLYGON_API_KEY');
+        $this->timeout = (int)(env('POLYGON_API_TIMEOUT', 30));
+        $this->maxRetries = (int)(env('POLYGON_API_RETRIES', 3));
+        $this->logChannel = 'polygon';
+    }
+
+    /**
+     * Fetch and store multiple indicators for a single ticker.
+     *
+     * @param string $symbol
+     * @param array $indicators  e.g. ['sma_20', 'ema_50', 'rsi_14', 'macd']
+     */
+    public function fetchIndicators(string $symbol, array $indicators = ['sma_20', 'ema_50', 'rsi_14', 'macd']): void
+    {
+        $symbol = strtoupper(trim($symbol));
+        $ticker = Ticker::where('ticker', $symbol)->first();
+
+        if (! $ticker) {
+            Log::warning("Skipping unknown ticker: {$symbol}");
+            return;
+        }
+
+        foreach ($indicators as $ind) {
+            try {
+                [$type, $period] = $this->parseIndicator($ind);
+                $results = $this->fetchIndicatorData($symbol, $type, $period);
+
+                if (! empty($results)) {
+                    $count = $this->storeIndicators($ticker->id, $symbol, $ind, $results);
+                    Log::channel($this->logChannel)->info("Stored {$count} {$ind} records for {$symbol}");
+                } else {
+                    Log::channel($this->logChannel)->warning("No data returned for {$symbol} {$ind}");
+                }
+            } catch (Throwable $e) {
+                Log::channel($this->logChannel)->error("Error fetching indicator {$ind} for {$symbol}: {$e->getMessage()}");
+            }
+            sleep(1); // gentle API pacing
+        }
+    }
+
+    protected function parseIndicator(string $name): array
+    {
+        if (preg_match('/^(sma|ema|rsi)_(\d+)$/i', $name, $m)) {
+            return [strtolower($m[1]), (int)$m[2]];
+        }
+        return [$name, null];
+    }
+
+    protected function fetchIndicatorData(string $symbol, string $type, ?int $window): array
+    {
+        $endpoint = "/v1/indicators/{$type}/{$symbol}";
+        $params = [
+            'timespan' => 'day',
+            'window' => $window ?? 14,
+            'limit' => 120,
+            'apiKey' => $this->apiKey,
+        ];
+
+        $attempt = 0;
+        $wait = 2;
+
+        while ($attempt < $this->maxRetries) {
+            $attempt++;
+            try {
+                $response = Http::timeout($this->timeout)->get($this->baseUrl . $endpoint, $params);
+
+                if ($response->successful()) {
+                    $data = $response->json();
+                    return $data['results']['values'] ?? [];
+                }
+
+                if ($response->status() === 429) {
+                    $retryAfter = (int)($response->header('Retry-After') ?? $wait);
+                    Log::warning("Rate limited on {$type} for {$symbol}, retrying in {$retryAfter}s...");
+                    sleep($retryAfter);
+                    continue;
+                }
+
+                Log::error("Indicator fetch failed [{$response->status()}] for {$symbol} {$type}");
+                break;
+            } catch (Throwable $e) {
+                Log::error("Exception fetching {$type} for {$symbol}: {$e->getMessage()}");
+                sleep($wait);
+                $wait *= 2;
+            }
+        }
+
+        return [];
+    }
+
+    protected function storeIndicators(int $tickerId, string $symbol, string $indicator, array $values): int
+    {
+        $now = now()->toDateTimeString();
+        $rows = [];
+
+        foreach ($values as $v) {
+            $ts = isset($v['timestamp']) ? now()->createFromTimestampMs((int)$v['timestamp'])->toDateTimeString() : null;
+            if (! $ts) continue;
+
+            $rows[] = [
+                'ticker_id' => $tickerId,
+                'resolution' => '1d',
+                't' => $ts,
+                'indicator' => $indicator,
+                'value' => $v['value'] ?? null,
+                'meta' => isset($v['meta']) ? json_encode($v['meta']) : null,
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
+        }
+
+        if (empty($rows)) return 0;
+
+        DB::table('ticker_indicators')->upsert(
+            $rows,
+            ['ticker_id', 'indicator', 't'],
+            ['value', 'meta', 'updated_at']
+        );
+
+        return count($rows);
+    }
+
+    /**
+     * Bulk-ingest indicators for all active tickers.
+     */
+    public function ingestAllTickers(array $indicators = ['sma_20', 'ema_50', 'rsi_14', 'macd']): void
+    {
+        $tickers = Ticker::where('active', true)->limit(50)->get();
+
+        foreach ($tickers as $ticker) {
+            $this->fetchIndicators($ticker->ticker, $indicators);
+        }
+    }
+}app/Services/PolygonTickerOverviewService.php
+
+
+===== FILE: app/Services/PolygonTickerOverviewService.php =====
+
+<?php
+
+namespace App\Services;
+
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Carbon;
+use App\Models\Ticker;
+
+class PolygonTickerOverviewService
+{
+    protected PolygonApiClient $client;
+    protected array $tickerColumns;
+
+    public function __construct(PolygonApiClient $client)
+    {
+        $this->client = $client;
+        $this->tickerColumns = DB::getSchemaBuilder()->getColumnListing('tickers');
+    }
+
+    public function fetchAndUpsertOverview(Ticker $ticker): void
+    {
+        $endpoint = "/v3/reference/tickers/{$ticker->ticker}";
+        $response = $this->client->get($endpoint);
+
+        if (! $response->ok()) {
+            $this->logFailure($ticker, "HTTP {$response->status()}");
+            return;
+        }
+
+        $data = $response->json('results') ?? null;
+
+        if (!$data) {
+            $this->logFailure($ticker, 'No results returned');
+            return;
+        }
+
+        $marketCap = is_numeric($data['market_cap'] ?? null) ? (int)$data['market_cap'] : null;
+
+        DB::table('ticker_overviews')->upsert([[
+            'ticker_id' => $ticker->id,
+            'overview_date' => Carbon::now()->toDateString(),
+            'active' => $data['active'] ?? null,
+            'market_cap' => $marketCap,
+            'primary_exchange' => $data['primary_exchange'] ?? null,
+            'locale' => $data['locale'] ?? null,
+            'status' => $data['status'] ?? 'unknown',
+            'results_raw' => json_encode($data),
+            'fetched_at' => now(),
+            'updated_at' => now(),
+        ]], ['ticker_id', 'overview_date'], [
+            'active', 'market_cap', 'primary_exchange', 'locale',
+            'status', 'results_raw', 'fetched_at', 'updated_at'
+        ]);
+
+        $updateData = array_intersect_key([
+            'description' => $data['description'] ?? null,
+            'homepage_url' => $data['homepage_url'] ?? null,
+            'market_cap' => $marketCap,
+            'total_employees' => $data['total_employees'] ?? null,
+            'sic_code' => $data['sic_code'] ?? null,
+            'branding_logo_url' => $data['branding']['logo_url'] ?? null,
+            'branding_icon_url' => $data['branding']['icon_url'] ?? null,
+        ], array_flip($this->tickerColumns));
+
+        $ticker->fill($updateData);
+        $ticker->save();
+    }
+
+    public function processBatch($tickers): void
+    {
+        foreach ($tickers as $ticker) {
+            try {
+                $this->fetchAndUpsertOverview($ticker);
+            } catch (\Throwable $e) {
+                $this->logFailure($ticker, $e->getMessage());
+            }
+        }
+    }
+
+    protected function logFailure(Ticker $ticker, string $reason): void
+    {
+        DB::table('failed_ticker_overviews')->insert([
+            'ticker_id' => $ticker->id,
+            'ticker' => $ticker->ticker,
+            'reason' => $reason,
+            'failed_at' => now(),
+        ]);
+
+        Log::warning("Failed overview for {$ticker->ticker}: {$reason}");
+    }
+}app/Services/PolygonFundamentalsService.php
+
+
+===== FILE: app/Services/PolygonFundamentalsService.php =====
+
+<?php
+
+namespace App\Services;
+
+use App\Models\Ticker;
+use App\Models\TickerFundamental;
+use App\Models\TickerFundamentalMetric;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Arr;
+use Throwable;
+
+class PolygonFundamentalsService
+{
+    protected string $baseUrl;
+    protected string $apiKey;
+    protected int $timeout;
+    protected int $maxRetries;
+    protected string $logChannel;
+
+    public function __construct()
+    {
+        $this->baseUrl    = rtrim(config('services.polygon.base') ?? env('POLYGON_API_BASE', 'https://api.polygon.io'), '/');
+        $this->apiKey     = (string) (config('services.polygon.key') ?? env('POLYGON_API_KEY'));
+        $this->timeout    = (int) (env('POLYGON_API_TIMEOUT', 30));
+        $this->maxRetries = (int) (env('POLYGON_API_RETRIES', 3));
+        $this->logChannel = 'ingest'; // unified channel for all debug info
+    }
+
+    public function fetchAndStoreFundamentals(string $ticker, array $options = []): int
+    {
+        $symbol = strtoupper(trim($ticker));
+        $tickerModel = Ticker::where('ticker', $symbol)->first();
+
+        if (! $tickerModel) {
+            Log::channel($this->logChannel)->warning("⚠️ Unknown ticker, skipping fundamentals ingestion", ['symbol' => $symbol]);
+            return 0;
+        }
+
+        // 🔧 Respect Polygon's hard limit (max 100 per page)
+        $limit = isset($options['limit']) && (int)$options['limit'] > 0 ? (int)$options['limit'] : 100;
+        if ($limit > 100) $limit = 100;
+
+        $params = [
+            'ticker'    => $symbol,
+            'limit'     => $limit,
+            'order'     => in_array(strtolower($options['order'] ?? 'desc'), ['asc', 'desc'], true)
+                ? strtolower($options['order'])
+                : 'desc',
+            'timeframe' => $options['timeframe'] ?? 'quarterly',
+            'sort'      => $options['sort'] ?? 'filing_date',
+        ];
+
+        // ✅ Add Polygon filing_date filters if provided via command options
+        foreach (['filing_date.gte', 'filing_date.gt', 'filing_date.lte', 'filing_date.lt'] as $key) {
+            if (!empty($options[$key])) {
+                $params[$key] = $options[$key];
+            }
+        }
+
+        $endpoint = '/vX/reference/financials';
+        $nextUrl  = $this->buildUrl("{$this->baseUrl}{$endpoint}", $params);
+
+        Log::channel($this->logChannel)->info("🌍 Fetching fundamentals from Polygon", [
+            'symbol' => $symbol,
+            'url' => $nextUrl,
+            'params' => $params,
+        ]);
+
+        $totalInserted = 0;
+        $page = 0;
+
+        while ($nextUrl) {
+            $page++;
+            $json = $this->safeGetJson($nextUrl);
+
+            if (! $json) {
+                Log::channel($this->logChannel)->warning("⚠️ Null or invalid JSON response", ['symbol' => $symbol, 'page' => $page]);
+                break;
+            }
+
+            // Log snippet of the raw JSON for inspection
+            Log::channel($this->logChannel)->debug("🧾 Raw JSON snippet", [
+                'symbol' => $symbol,
+                'page' => $page,
+                'sample' => substr(json_encode(array_slice($json, 0, 5)), 0, 800),
+            ]);
+
+            $status  = $json['status'] ?? 'unknown';
+            $results = $json['results'] ?? [];
+
+            Log::channel($this->logChannel)->info("📄 Page summary", [
+                'symbol' => $symbol,
+                'page' => $page,
+                'status' => $status,
+                'results_count' => is_countable($results) ? count($results) : 0,
+                'has_next_url' => isset($json['next_url']),
+            ]);
+
+            if (!is_array($results) || count($results) === 0) {
+                Log::channel($this->logChannel)->warning("⚠️ No results returned for fundamentals", [
+                    'symbol' => $symbol,
+                    'status' => $status,
+                    'json_keys' => array_keys($json ?? []),
+                ]);
+                break;
+            }
+
+            DB::beginTransaction();
+            try {
+                foreach ($results as $item) {
+                    $topId = $this->upsertTopline($tickerModel, $symbol, $item);
+                    if ($topId) {
+                        $this->upsertMetrics($tickerModel, $symbol, $item, $topId);
+                    }
+                }
+                DB::commit();
+                $totalInserted += count($results);
+
+                Log::channel($this->logChannel)->info("💾 DB commit successful", [
+                    'symbol' => $symbol,
+                    'page' => $page,
+                    'inserted_count' => count($results),
+                ]);
+
+            } catch (Throwable $e) {
+                DB::rollBack();
+                Log::channel($this->logChannel)->error("❌ DB transaction failed", [
+                    'symbol' => $symbol,
+                    'page' => $page,
+                    'error' => $e->getMessage(),
+                    'trace' => substr($e->getTraceAsString(), 0, 500),
+                ]);
+                break;
+            }
+
+            $nextUrl = $json['next_url'] ?? null;
+            if ($nextUrl) {
+                $nextUrl = $this->appendApiKey($nextUrl);
+                usleep(250_000);
+            }
+        }
+
+        Log::channel($this->logChannel)->info("✅ Fundamentals ingestion complete", [
+            'symbol' => $symbol,
+            'total_inserted' => $totalInserted,
+        ]);
+
+        return $totalInserted;
+    }
+
+    protected function upsertTopline(Ticker $tickerModel, string $symbol, array $item): ?int
+    {
+        $unique = [
+            'ticker_id'     => $tickerModel->id,
+            'ticker'        => $symbol,
+            'end_date'      => Arr::get($item, 'end_date'),
+            'fiscal_period' => Arr::get($item, 'fiscal_period'),
+            'fiscal_year'   => Arr::get($item, 'fiscal_year'),
+        ];
+
+        $balance  = Arr::get($item, 'financials.balance_sheet', []);
+        $income   = Arr::get($item, 'financials.income_statement', []);
+        $cashflow = Arr::get($item, 'financials.cash_flow_statement', []);
+
+        $values = [
+            'cik'                    => Arr::get($item, 'cik'),
+            'company_name'           => Arr::get($item, 'company_name'),
+            'timeframe'              => Arr::get($item, 'timeframe'),
+            'status'                 => Arr::get($item, 'status'),
+            'start_date'             => Arr::get($item, 'start_date'),
+            'filing_date'            => Arr::get($item, 'filing_date'),
+            'source_filing_url'      => Arr::get($item, 'source_filing_url'),
+            'source_filing_file_url' => Arr::get($item, 'source_filing_file_url'),
+
+            'total_assets'      => $this->num(Arr::get($balance, 'assets.value')),
+            'total_liabilities' => $this->num(Arr::get($balance, 'liabilities.value')),
+            'equity'            => $this->num(Arr::get($balance, 'equity.value')),
+            'net_income'        => $this->num(Arr::get($income, 'net_income_loss.value')),
+            'revenue'           => $this->num(Arr::get($income, 'revenues.value')),
+            'operating_income'  => $this->num(Arr::get($income, 'operating_income_loss.value')),
+            'gross_profit'      => $this->num(Arr::get($income, 'gross_profit.value')),
+            'eps_basic'         => $this->num(Arr::get($income, 'basic_earnings_per_share.value'), 4),
+            'eps_diluted'       => $this->num(Arr::get($income, 'diluted_earnings_per_share.value'), 4),
+
+            'balance_sheet'        => $balance,
+            'income_statement'     => $income,
+            'cash_flow_statement'  => $cashflow,
+            'comprehensive_income' => Arr::get($item, 'financials.comprehensive_income'),
+
+            'raw'         => $item,
+            'fetched_at'  => now(),
+            'updated_at'  => now(),
+            'created_at'  => now(),
+        ];
+
+        try {
+            $existingId = TickerFundamental::query()->where($unique)->value('id');
+            if ($existingId) {
+                TickerFundamental::where('id', $existingId)->update($values);
+                return (int)$existingId;
+            }
+
+            $record = TickerFundamental::create(array_merge($unique, $values));
+            return $record->id ?? null;
+        } catch (Throwable $e) {
+            Log::channel($this->logChannel)->error("❌ Failed to upsert topline", [
+                'symbol' => $symbol,
+                'error' => $e->getMessage(),
+                'trace' => substr($e->getTraceAsString(), 0, 500),
+            ]);
+            return null;
+        }
+    }
+
+    protected function upsertMetrics(Ticker $tickerModel, string $symbol, array $item, ?int $topId): int
+    {
+        $financials = Arr::get($item, 'financials', []);
+        if (empty($financials)) return 0;
+
+        $endDate = Arr::get($item, 'end_date');
+        $period  = Arr::get($item, 'fiscal_period');
+        $year    = Arr::get($item, 'fiscal_year');
+        $rows = [];
+        $now = now()->toDateTimeString();
+
+        foreach (['balance_sheet','income_statement','cash_flow_statement','comprehensive_income'] as $statement) {
+            $section = Arr::get($financials, $statement, []);
+            foreach ($section as $key => $node) {
+                if (!is_array($node)) continue;
+                $value = Arr::get($node, 'value');
+                if (!is_numeric($value) && $value !== 0) continue;
+
+                $rows[] = [
+                    'ticker_id'      => $tickerModel->id,
+                    'ticker'         => $symbol,
+                    'fundamental_id' => $topId,
+                    'statement'      => $statement,
+                    'line_item'      => $key,
+                    'label'          => Arr::get($node, 'label'),
+                    'unit'           => Arr::get($node, 'unit'),
+                    'display_order'  => Arr::get($node, 'order'),
+                    'value'          => $this->num($value),
+                    'end_date'       => $endDate,
+                    'fiscal_period'  => $period,
+                    'fiscal_year'    => $year,
+                    'created_at'     => $now,
+                    'updated_at'     => $now,
+                ];
+            }
+        }
+
+        if (empty($rows)) return 0;
+
+        try {
+            TickerFundamentalMetric::upsert(
+                $rows,
+                ['ticker_id', 'end_date', 'statement', 'line_item'],
+                ['label','unit','display_order','value','fiscal_period','fiscal_year','updated_at']
+            );
+
+            Log::channel($this->logChannel)->debug("📈 Inserted fundamental metrics", [
+                'symbol' => $symbol,
+                'count' => count($rows),
+            ]);
+
+            return count($rows);
+        } catch (Throwable $e) {
+            Log::channel($this->logChannel)->error("❌ Failed to upsert metrics", [
+                'symbol' => $symbol,
+                'error' => $e->getMessage(),
+                'trace' => substr($e->getTraceAsString(), 0, 500),
+            ]);
+            return 0;
+        }
+    }
+
+    protected function safeGetJson(string $url): ?array
+    {
+        $attempt = 0;
+        $wait = 2;
+
+        while ($attempt < $this->maxRetries) {
+            $attempt++;
+            try {
+                $resp = Http::timeout($this->timeout)->get($url);
+
+                if ($resp->successful()) {
+                    $data = $resp->json();
+                    Log::channel($this->logChannel)->debug("✅ HTTP success", [
+                        'url' => $url,
+                        'attempt' => $attempt,
+                        'status' => $resp->status(),
+                    ]);
+                    return (array) $data;
+                }
+
+                Log::channel($this->logChannel)->error("❌ Polygon HTTP error", [
+                    'url' => $url,
+                    'status' => $resp->status(),
+                    'body_snippet' => substr($resp->body(), 0, 500),
+                ]);
+
+                if ($resp->status() === 429) {
+                    $retryAfter = (int)($resp->header('Retry-After') ?? $wait);
+                    Log::channel($this->logChannel)->warning("Rate limited, retrying...", [
+                        'retry_after' => $retryAfter,
+                    ]);
+                    sleep($retryAfter);
+                    continue;
+                }
+
+                return null;
+            } catch (Throwable $e) {
+                Log::channel($this->logChannel)->error("HTTP exception", [
+                    'url' => $url,
+                    'error' => $e->getMessage(),
+                ]);
+                sleep($wait);
+                $wait *= 2;
+            }
+        }
+
+        return null;
+    }
+
+    // ✅ FIXED: Prevent encoding dots in query keys like "filing_date.gte"
+    protected function buildUrl(string $base, array $params): string
+    {
+        $params['apiKey'] = $this->apiKey;
+
+        // Build the query string manually to avoid encoding dots in keys
+        $query = collect($params)->map(function ($v, $k) {
+            return $k . '=' . urlencode((string) $v);
+        })->implode('&');
+
+        return $base . (str_contains($base, '?') ? '&' : '?') . $query;
+    }
+
+    protected function appendApiKey(string $url): string
+    {
+        return str_contains($url, 'apiKey=') ? $url : $url . (str_contains($url, '?') ? '&' : '?') . 'apiKey=' . urlencode($this->apiKey);
+    }
+
+    protected function num($v, int $scale = 2): ?float
+    {
+        if ($v === null || $v === '' || (!is_numeric($v) && $v !== 0 && $v !== '0')) {
+            return null;
+        }
+        return round((float)$v, $scale);
+    }
+}app/Services/PolygonTickerNewsService.php
+
+
+===== FILE: app/Services/PolygonTickerNewsService.php =====
+
+<?php
+
+namespace App\Services;
+
+use App\Models\Ticker;
+use App\Models\TickerNewsItem;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Arr;
+
+class PolygonTickerNewsService
+{
+    protected string $apiKey;
+    protected string $baseUrl;
+
+    public function __construct()
+    {
+        $this->apiKey  = (string) config('services.polygon.key');
+        $this->baseUrl = 'https://api.polygon.io/v2/reference/news';
+    }
+
+    /**
+     * Fetch and store news for a single ticker.
+     */
+    public function fetchNewsForTicker(string $ticker, int $limit = 50): int
+    {
+        $symbol = strtoupper(trim($ticker));
+        $url    = "{$this->baseUrl}?ticker={$symbol}&limit={$limit}&apiKey={$this->apiKey}";
+        $resp   = Http::timeout(30)->get($url);
+
+        if (! $resp->ok()) {
+            Log::channel('ingest')->error("Polygon News API failed for {$symbol}", [
+                'status' => $resp->status(),
+                'body'   => $resp->body(),
+            ]);
+            return 0;
+        }
+
+        $json    = $resp->json() ?? [];
+        $results = $json['results'] ?? [];
+
+        if (!is_array($results) || empty($results)) {
+            return 0;
+        }
+
+        $count = 0;
+        foreach ($results as $item) {
+            $count += $this->storeNewsItem($symbol, (array) $item);
+        }
+
+        Log::channel('ingest')->info("📰 Ingested {$count} news items for {$symbol}");
+        return $count;
+    }
+
+    /**
+     * Store a single Polygon.io news item.
+     */
+    protected function storeNewsItem(string $symbol, array $item): int
+    {
+        try {
+            $tickerModel = Ticker::where('ticker', $symbol)->first();
+
+            // Flatten one insight if present
+            $insight = is_array($item['insights'] ?? null) && count($item['insights']) > 0
+                ? (array) $item['insights'][0]
+                : null;
+
+            // Build a deterministic unique article_id per ticker
+            $articleId = $item['id'] ?? null;
+            $hashSource = ($symbol ?? '') . '|' .
+                          ($item['article_url'] ?? '') . '|' .
+                          ($item['published_utc'] ?? '') . '|' .
+                          ($item['title'] ?? '') . '|' .
+                          ($item['author'] ?? '');
+            $articleId = $articleId ? "{$symbol}_{$articleId}" : md5($hashSource);
+
+            $attributes = [
+                'article_id' => $articleId,
+            ];
+
+            $values = [
+                'ticker_id'              => $tickerModel?->id,
+                'ticker'                 => $symbol,
+
+                // Author / Publisher
+                'author'                 => $item['author'] ?? null,
+                'publisher_name'         => Arr::get($item, 'publisher.name'),
+                'publisher_logo_url'     => Arr::get($item, 'publisher.logo_url'),
+                'publisher_favicon_url'  => Arr::get($item, 'publisher.favicon_url'),
+                'publisher_homepage_url' => Arr::get($item, 'publisher.homepage_url'),
+
+                // Core content
+                'title'                  => $item['title'] ?? null,
+                'summary'                => $item['description'] ?? null,
+                'url'                    => $item['article_url'] ?? null,
+                'amp_url'                => $item['amp_url'] ?? null,
+                'image_url'              => $item['image_url'] ?? null,
+
+                // Arrays (cast to array in model)
+                'tickers_list'           => isset($item['tickers'])  ? array_values((array) $item['tickers'])  : null,
+                'keywords'               => isset($item['keywords']) ? array_values((array) $item['keywords']) : null,
+                'insights'               => isset($item['insights']) ? (array) $item['insights']               : null,
+
+                // Flattened insight fields
+                'insight_sentiment'      => $insight['sentiment'] ?? null,
+                'insight_reasoning'      => $insight['sentiment_reasoning'] ?? null,
+                'insight_ticker'         => $insight['ticker'] ?? null,
+
+                // Publish time
+                'published_utc'          => isset($item['published_utc'])
+                    ? date('Y-m-d H:i:s', strtotime($item['published_utc']))
+                    : null,
+
+                // Store raw payload
+                'raw'                    => $item,
+                'updated_at'             => now(),
+                'created_at'             => now(),
+            ];
+
+            TickerNewsItem::updateOrCreate($attributes, $values);
+
+            return 1;
+        } catch (\Throwable $e) {
+            Log::channel('ingest')->error("❌ Failed to store news for {$symbol}: {$e->getMessage()}", [
+                'item' => $item,
+            ]);
+            return 0;
+        }
+    }
+
+    /**
+     * Ingest for all active tickers (simple sequential mode).
+     */
+    public function ingestAllTickers(int $limit = 50): void
+    {
+        Ticker::where('active', true)
+            ->orderBy('id')
+            ->pluck('ticker')
+            ->each(function ($sym) use ($limit) {
+                $this->fetchNewsForTicker($sym, $limit);
+                usleep(400_000); // 0.4s pacing
+            });
+    }
+}app/Services/PolygonTickerService.php
+
+
+===== FILE: app/Services/PolygonTickerService.php =====
+
+<?php
+
+namespace App\Services;
+
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Carbon;
+use Throwable;
+
+/**
+ * Handles ingestion of all tickers from the Polygon.io API.
+ * Supports automatic pagination, rate limit backoff, and resumable polling.
+ */
+class PolygonTickerService
+{
+    protected PolygonApiClient $client;
+
+    // Default polling interval (seconds)
+    protected int $pollInterval = 10;
+
+    public function __construct(PolygonApiClient $client)
+    {
+        $this->client = $client;
+    }
+
+    /**
+     * Ingest all tickers via Polygon reference endpoint.
+     *
+     * @param  array  $options  Additional query params (e.g. ['market' => 'stocks'])
+     * @param  bool   $poll     Whether to continuously poll for updates
+     */
+    public function ingestAll(array $options = [], bool $poll = false): array
+    {
+        do {
+            $stats = $this->runIngestionPass($options);
+
+            Log::info('Polygon ticker ingestion completed', [
+                'pages' => $stats['pages'],
+                'inserted' => $stats['inserted'],
+                'timestamp' => now()->toDateTimeString(),
+            ]);
+
+            if ($poll) {
+                Log::info("Sleeping {$this->pollInterval}s before next polling pass...");
+                sleep($this->pollInterval);
+            }
+
+        } while ($poll);
+
+        return $stats;
+    }
+
+    /**
+     * Executes a single ingestion run (all pages).
+     */
+    protected function runIngestionPass(array $options = []): array
+    {
+        $endpoint = '/v3/reference/tickers';
+        $params = array_merge(['limit' => 1000], $options);
+
+        $nextUrl = $endpoint . '?' . http_build_query($params);
+        $pages = 0;
+        $totalInserted = 0;
+
+        while ($nextUrl) {
+            $pages++;
+            try {
+                $response = $this->client->get($nextUrl);
+
+                if (! $response->ok()) {
+                    Log::error('Polygon ticker ingestion failed', [
+                        'url' => $nextUrl,
+                        'status' => $response->status(),
+                        'body' => $response->body(),
+                    ]);
+                    break;
+                }
+
+                $json = $response->json();
+                $results = $json['results'] ?? [];
+
+                if (!empty($results)) {
+                    [$inserted] = $this->persistTickerResults($results);
+                    $totalInserted += $inserted;
+                }
+
+                // Determine next page
+                $nextUrl = $json['next_url'] ?? null;
+                if ($nextUrl) {
+                    $nextUrl = $this->appendApiKey($nextUrl);
+                    sleep(1); // gentle pause between pages
+                }
+
+            } catch (Throwable $e) {
+                Log::error('Polygon ticker ingestion exception', [
+                    'url' => $nextUrl,
+                    'message' => $e->getMessage(),
+                ]);
+
+                // Retry logic for transient issues (MySQL disconnects, network hiccups, etc.)
+                sleep(5);
+                continue;
+            }
+
+            // Basic rate limit pacing (Polygon's free tier = ~5 req/s)
+            sleep(2);
+        }
+
+        return [
+            'inserted' => $totalInserted,
+            'pages' => $pages,
+        ];
+    }
+
+    /**
+     * Append the Polygon API key to a URL if missing.
+     */
+    protected function appendApiKey(string $url): string
+    {
+        return str_contains($url, 'apiKey=')
+            ? $url
+            : $url . (str_contains($url, '?') ? '&' : '?') . 'apiKey=' . urlencode(env('POLYGON_API_KEY'));
+    }
+
+    /**
+     * Upsert ticker rows into the database.
+     */
+    protected function persistTickerResults(array $results): array
+    {
+        $now = now()->toDateTimeString();
+        $rows = [];
+
+        foreach ($results as $item) {
+            $rows[] = [
+                'ticker' => $item['ticker'] ?? null,
+                'name' => $item['name'] ?? null,
+                'market' => $item['market'] ?? null,
+                'locale' => $item['locale'] ?? null,
+                'primary_exchange' => $item['primary_exchange'] ?? null,
+                'type' => $item['type'] ?? null,
+                'status' => $item['status'] ?? null,
+                'active' => $item['active'] ?? null,
+                'currency_symbol' => $item['currency_symbol'] ?? null,
+                'currency_name' => $item['currency_name'] ?? null,
+                'composite_figi' => $item['composite_figi'] ?? null,
+                'share_class_figi' => $item['share_class_figi'] ?? null,
+                'last_updated_utc' => isset($item['last_updated_utc'])
+                    ? Carbon::parse($item['last_updated_utc'])->toDateTimeString()
+                    : null,
+                'delisted_utc' => isset($item['delisted_utc'])
+                    ? Carbon::parse($item['delisted_utc'])->toDateTimeString()
+                    : null,
+                'raw' => json_encode($item),
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
+        }
+
+        if (!empty($rows)) {
+            DB::table('tickers')->upsert(
+                $rows,
+                ['ticker'],
+                [
+                    'name', 'market', 'locale', 'primary_exchange',
+                    'type', 'status', 'active', 'currency_symbol',
+                    'currency_name', 'composite_figi', 'share_class_figi',
+                    'last_updated_utc', 'delisted_utc', 'raw', 'updated_at',
+                ]
+            );
+        }
+
+        return [count($rows)];
+    }
+}
+[EOF: app/Services]
