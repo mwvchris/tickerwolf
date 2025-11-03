@@ -163,9 +163,15 @@ class PolygonPriceHistoryService
     /**
      * Upsert Polygon bar data into ticker_price_histories.
      *
-     * Adds pre-upsert sanity checks for numeric overflow values to avoid
-     * SQLSTATE[22003] "Numeric value out of range" errors caused by rare
-     * Polygon anomalies (e.g., 39000000 instead of 39.00).
+     * v2.7.0 — Hardened Sanitization Layer
+     * ------------------------------------
+     * This version adds stronger guards against malformed or extreme values
+     * that could trigger SQLSTATE[22003] or silently corrupt analytics data.
+     *
+     * Key protections:
+     *  • Skips bars with any NaN, INF, negative, or absurdly large values.
+     *  • Ensures all numeric fields are finite, positive, and within sane bounds.
+     *  • Logs granular warnings per skipped bar.
      *
      * @param  int    $tickerId
      * @param  string $symbol
@@ -193,17 +199,32 @@ class PolygonPriceHistoryService
                     continue;
                 }
 
-                // 🧩 Sanitize abnormal numeric values before mapping
-                // --------------------------------------------------
-                // Polygon occasionally returns absurdly large magnitudes
-                // (e.g., 39 000 000 instead of 39.00) for reverse-split or
-                // delisted tickers.  This block skips those bars entirely.
+                // 🧩 SANITIZATION: Hardened numeric checks
+                // ------------------------------------------------------
                 $fields = ['o', 'h', 'l', 'c', 'vw'];
+                $valid = true;
                 foreach ($fields as $field) {
-                    if (isset($b[$field]) && abs((float)$b[$field]) > 1_000_000) {
-                        $logger->warning("⚠️ Skipping abnormal {$field}={$b[$field]} for {$symbol} at {$b['t']}");
-                        continue 2; // skip entire bar
+                    if (!array_key_exists($field, $b)) {
+                        continue;
                     }
+
+                    $val = (float)$b[$field];
+
+                    // Reject NaN, INF, absurdly large, or non-sensical values
+                    if (
+                        !is_finite($val) ||
+                        $val <= 0 ||                        // zero or negative price
+                        $val > 10_000_000 ||                // 10 million upper limit
+                        $val < 0.0001                       // lower bound sanity floor
+                    ) {
+                        $logger->warning("⚠️ Skipping abnormal {$field}={$b[$field]} for {$symbol} at {$b['t']}");
+                        $valid = false;
+                        break;
+                    }
+                }
+
+                if (!$valid) {
+                    continue; // Skip entire bar
                 }
 
                 // Convert Polygon’s millisecond timestamp (UTC) → MySQL datetime
