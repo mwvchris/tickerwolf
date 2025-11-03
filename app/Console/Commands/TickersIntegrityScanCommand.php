@@ -9,23 +9,26 @@ use Illuminate\Support\Facades\Schema;
 use App\Services\Validation\DataIntegrityService;
 use App\Services\Validation\Validators\PolygonDataValidator;
 use App\Models\DataValidationLog;
+use Carbon\Carbon;
 
 /**
  * ============================================================================
- *  tickers:integrity-scan  (v2.6.4 — Bulk Polygon Re-Ingest Support)
+ *  tickers:integrity-scan  (v3.0.0 — Diagnostic Expansion + Deep Health Metrics)
  * ============================================================================
  *
  * 🔧 Purpose:
  *   Performs configurable, severity-weighted integrity scans across ticker data,
  *   combining local anomaly scoring with optional live Polygon.io verification.
- *   Now supports one-click “Yes to All” re-ingestion for verified (200) tickers.
+ *   Now includes detailed per-ticker diagnostics (bar count, coverage ratio,
+ *   flatness, average volume, first/last bar dates) and aggregate issue summaries.
  *
- * 🚀 New in v2.6.4:
+ * 🚀 New in v3.0.0:
  * ----------------------------------------------------------------------------
- *   • Added "bulk yes-to-all" prompt after live verification.
- *   • Automatically queues re-ingestion for all verified tickers if confirmed.
- *   • Preserves individual deactivation confirmations for not-found tickers.
- *   • Enhanced structured logging of bulk actions.
+ *   • Extended diagnostic table (Bars, Expected, Coverage%, AvgVol, Issues)
+ *   • Inline classification of "empty", "sparse", "flat", "partial", "illiquid"
+ *   • Aggregate diagnostic summary (counts by issue type)
+ *   • Retains bulk re-ingestion and live verification (v2.6.4 feature set)
+ *   • Structured logging of all scan + verification actions
  *
  * ============================================================================
  */
@@ -80,23 +83,73 @@ class TickersIntegrityScanCommand extends Command
             ->where('id', '>=', $fromId)
             ->orderBy('id')
             ->limit($limit)
-            ->pluck('id')
-            ->toArray();
+            ->get(['id', 'ticker', 'type']);
 
-        $results      = [];
+        $results = [];
+        $healths = [];
         $sourceHealth = [];
-        $healths      = [];
 
         /*
         |--------------------------------------------------------------------------
-        | 3️⃣ Per-ticker scans (local + upstream)
+        | 3️⃣ Per-ticker scans (local + upstream) + diagnostics
         |--------------------------------------------------------------------------
         */
-        foreach ($tickers as $id) {
+        foreach ($tickers as $ticker) {
+            $id     = $ticker->id;
+            $symbol = $ticker->ticker;
+            $type   = $ticker->type ?? 'CS';
+
             try {
                 $r = $service->scanTicker($id);
+                $health = $r['health'] ?? 0;
                 $results[$id] = $r;
-                $healths[]    = $r['health'] ?? 0;
+                $healths[] = $health;
+
+                // Diagnostics
+                $bars = DB::table('ticker_price_histories')
+                    ->where('ticker_id', $id)
+                    ->count();
+
+                $minDate = DB::table('ticker_price_histories')
+                    ->where('ticker_id', $id)
+                    ->min('t');
+
+                $maxDate = DB::table('ticker_price_histories')
+                    ->where('ticker_id', $id)
+                    ->max('t');
+
+                $expected = 0;
+                if ($minDate && $maxDate) {
+                    $expected = Carbon::parse($minDate)->diffInDays(Carbon::parse($maxDate));
+                }
+
+                $coverage = $expected > 0 ? round(($bars / $expected) * 100, 2) : 0;
+                $avgVol = DB::table('ticker_price_histories')
+                    ->where('ticker_id', $id)
+                    ->avg('v');
+
+                $flatBars = DB::table('ticker_price_histories')
+                    ->where('ticker_id', $id)
+                    ->whereColumn('o', '=', 'c')
+                    ->whereColumn('h', '=', 'l')
+                    ->count();
+
+                $flags = [];
+                if ($bars == 0) $flags[] = 'empty';
+                elseif ($bars < 10) $flags[] = 'sparse';
+                elseif ($coverage < 25) $flags[] = 'partial';
+                if ($avgVol !== null && $avgVol < 100) $flags[] = 'illiquid';
+                if ($flatBars > 0 && $bars > 0 && ($flatBars / $bars) > 0.5) $flags[] = 'flat';
+
+                $results[$id]['diagnostics'] = [
+                    'bars'      => $bars,
+                    'expected'  => $expected,
+                    'coverage'  => $coverage,
+                    'avg_vol'   => $avgVol,
+                    'first'     => $minDate ? Carbon::parse($minDate)->format('Y-m-d') : '—',
+                    'last'      => $maxDate ? Carbon::parse($maxDate)->format('Y-m-d') : '—',
+                    'issues'    => implode(', ', $flags) ?: 'none',
+                ];
 
                 if (!empty($r['upstream'])) {
                     $sourceHealth[$id] = $r['upstream'];
@@ -154,7 +207,7 @@ class TickersIntegrityScanCommand extends Command
 
         /*
         |--------------------------------------------------------------------------
-        | 5️⃣ Summary display
+        | 5️⃣ Summary display (high-level bands)
         |--------------------------------------------------------------------------
         */
         $this->line('');
@@ -169,26 +222,28 @@ class TickersIntegrityScanCommand extends Command
 
         /*
         |--------------------------------------------------------------------------
-        | 6️⃣ Flagged tickers
+        | 6️⃣ Detailed diagnostics table (Moderate + Critical)
         |--------------------------------------------------------------------------
         */
         $flagged = [];
         foreach ($results as $id => $r) {
             $h = $r['health'] ?? 1;
             if ($h >= 0.9) continue;
-            $symbol = DB::table('tickers')->where('id', $id)->value('ticker');
-            $type   = DB::table('tickers')->where('id', $id)->value('type');
-            $issues = $r['issues'] ?? [];
-            $summary = is_array($issues)
-                ? implode(', ', array_keys($issues) ?: ['none'])
-                : (string) ($issues ?: 'none');
+
+            $d = $r['diagnostics'] ?? [];
             $flagged[] = [
-                'id'       => $id,
-                'symbol'   => $symbol,
-                'type'     => $type,
-                'health'   => $h,
-                'severity' => $h < 0.6 ? 'Critical' : 'Moderate',
-                'issues'   => $summary,
+                'id'        => $id,
+                'symbol'    => DB::table('tickers')->where('id', $id)->value('ticker'),
+                'type'      => DB::table('tickers')->where('id', $id)->value('type'),
+                'health'    => $h,
+                'severity'  => $h < 0.6 ? 'Critical' : 'Moderate',
+                'bars'      => $d['bars'] ?? 0,
+                'expected'  => $d['expected'] ?? 0,
+                'coverage'  => $d['coverage'] ?? 0,
+                'first'     => $d['first'] ?? '—',
+                'last'      => $d['last'] ?? '—',
+                'avg_vol'   => $d['avg_vol'] ?? 0,
+                'issues'    => $d['issues'] ?? 'none',
             ];
         }
 
@@ -201,32 +256,54 @@ class TickersIntegrityScanCommand extends Command
 
             $this->warn("⚠️ Detailed Report (Moderate & Critical):");
             $this->line(str_pad('ID', 8)
-                . str_pad('Symbol', 12)
-                . str_pad('Type', 12)
+                . str_pad('Symbol', 10)
+                . str_pad('Type', 10)
                 . str_pad('Health', 10)
                 . str_pad('Severity', 12)
-                . "\tIssues");
-            $this->line(str_repeat('-', 90));
+                . str_pad('Bars', 8)
+                . str_pad('Expect', 10)
+                . str_pad('Cover%', 10)
+                . str_pad('First', 12)
+                . str_pad('Last', 12)
+                . str_pad('AvgVol', 10)
+                . "Issues");
+            $this->line(str_repeat('-', 128));
 
             foreach ($flagged as $f) {
                 $sevLabel = $f['severity'] === 'Critical'
                     ? $this->formatRed('Critical')
                     : $this->formatYellow('Moderate');
+
                 $this->line(
                     str_pad($f['id'], 8)
-                    . str_pad($f['symbol'], 12)
-                    . str_pad($f['type'], 12)
+                    . str_pad($f['symbol'], 10)
+                    . str_pad($f['type'], 10)
                     . str_pad(number_format($f['health'], 3), 10)
                     . str_pad($sevLabel, 14)
-                    . "\t" . $f['issues']
+                    . str_pad($f['bars'], 8)
+                    . str_pad($f['expected'], 10)
+                    . str_pad($f['coverage'] . '%', 10)
+                    . str_pad($f['first'], 12)
+                    . str_pad($f['last'], 12)
+                    . str_pad(number_format((float)$f['avg_vol'], 0), 10)
+                    . $f['issues']
                 );
             }
+
+            $this->newLine();
+            // Aggregate issue summary
+            $this->info('📈 Diagnostic Summary:');
+            $this->line('   - Empty tickers     : ' . collect($flagged)->filter(fn($x) => str_contains($x['issues'], 'empty'))->count());
+            $this->line('   - Sparse tickers    : ' . collect($flagged)->filter(fn($x) => str_contains($x['issues'], 'sparse'))->count());
+            $this->line('   - Partial coverage  : ' . collect($flagged)->filter(fn($x) => str_contains($x['issues'], 'partial'))->count());
+            $this->line('   - Flat tickers      : ' . collect($flagged)->filter(fn($x) => str_contains($x['issues'], 'flat'))->count());
+            $this->line('   - Illiquid tickers  : ' . collect($flagged)->filter(fn($x) => str_contains($x['issues'], 'illiquid'))->count());
             $this->newLine();
         }
 
         /*
         |--------------------------------------------------------------------------
-        | 7️⃣ Live verification and bulk re-ingest support
+        | 7️⃣ Live verification + bulk re-ingest (unchanged core logic)
         |--------------------------------------------------------------------------
         */
         $actions = [];
