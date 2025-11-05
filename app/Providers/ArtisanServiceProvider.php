@@ -41,6 +41,9 @@ class ArtisanServiceProvider extends ServiceProvider
             \App\Console\Commands\TickersValidateDataCommand::class,
             \App\Console\Commands\TickersBackfillIndicatorsCommand::class,
             \App\Console\Commands\TickersIntegrityScanCommand::class,
+            \App\Console\Commands\ComputeCorrelationMatrix::class,
+            \App\Console\Commands\TickersReviewMissingDataCommand::class,
+            \App\Console\Commands\Diagnostics\TickersDataAuditCommand::class,
         ]);
     }
 }

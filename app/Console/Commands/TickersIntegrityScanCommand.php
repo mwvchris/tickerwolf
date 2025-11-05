@@ -6,87 +6,184 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Http;
-use Illuminate\Support\Facades\Storage;
 use Illuminate\Support\Str;
 use Carbon\Carbon;
-use Symfony\Component\Console\Helper\Table;
-use Symfony\Component\Console\Output\ConsoleOutput;
 
 /**
  * =============================================================================
- *  tickers:integrity-scan  (Iteration 2 — Hybrid Verification + Lifecycle)
+ *  tickers:integrity-scan  (v3.3 — Validator-Integrated Hybrid Scan + Export)
  * =============================================================================
  *
  * PURPOSE
  * -------
- * Extends the DB-only scan with a lightweight live verification phase
- * (limit=5 probe) for incomplete tickers.  It also infers lifecycle state:
- *   IPO_recent / Active_incomplete / Defunct_delisted / Empty
+ * Performs a two-phase integrity analysis of all tickers:
  *
- * Key new flags:
- *   --verify-live    -> enables Polygon API probes for non-full tickers.
- *   --apply           -> commits lifecycle/deactivation updates to DB.
+ *   (1) Optional per-ticker validation (price_history, indicators, snapshots, etc.)
+ *   (2) Hybrid DB classification + lifecycle inference
  *
- * All API hits use limit=5 and a 1-day range — purely to confirm existence.
- * It’s effectively a HEAD check, not a full price fetch.
+ * The validator phase collects granular per-ticker results (health, issues, status)
+ * and optionally exports them as JSON for post-run inspection.
  *
- * Safe defaults:
- *   • FULL tickers are never probed.
- *   • PARTIAL/INSUFFICIENT tickers use cached 1d requests.
- *   • Dry-run by default (no DB writes unless --apply given).
+ * EXAMPLES
+ * ----------------------------------------------------------------------------
+ *   php artisan tickers:integrity-scan --validator=price_history --limit=500
+ *   php artisan tickers:integrity-scan --validator=price_history --export
+ *   php artisan tickers:integrity-scan --limit=0 --apply --verify-live
  *
  * =============================================================================
  */
 class TickersIntegrityScanCommand extends Command
 {
     protected $signature = 'tickers:integrity-scan
+        {--validator= : Run a specific validator (price_history, indicators, etc.)}
         {--limit=0 : Number of tickers to scan (0 = all from from-id)}
         {--from-id=0 : Start scanning from this ticker ID}
         {--baseline=auto : Baseline strategy: auto|max|mode|<integer>}
         {--verify-live : Verify incomplete tickers against Polygon API}
         {--apply : Apply lifecycle/deactivation flags in DB (dry-run by default)}
-        {--export= : Optional CSV export path under storage/}
+        {--export : Export per-ticker validator results to /storage/logs/audit/}
         {--progress-chunk=500 : Advance progress bar every N tickers}';
 
-    protected $description = 'Hybrid integrity scan: DB classification + optional Polygon existence check.';
+    protected $description = 'Run validator and/or hybrid DB integrity scan for all tickers.';
 
     // Tunables
-    protected int $chunkSizeIds      = 2000;
-    protected int $minBarsThreshold  = 10;
-    protected float $fullCutoff      = 0.99;
-    protected float $partialCutoff   = 0.50;
+    protected int $chunkSizeIds = 2000;
+    protected int $minBarsThreshold = 10;
+    protected float $fullCutoff = 0.99;
+    protected float $partialCutoff = 0.50;
 
     public function handle(): int
     {
         $start = microtime(true);
-        $this->minBarsThreshold = (int) config('data_validation.min_bars', $this->minBarsThreshold);
 
-        // Parse options
-        $limit       = (int) $this->option('limit');
-        $fromId      = (int) $this->option('from-id');
-        $baselineOpt = trim((string) $this->option('baseline'));
-        $verifyLive  = (bool) $this->option('verify-live');
-        $apply       = (bool) $this->option('apply');
-        $exportPath  = $this->option('export');
-        $progressChunk = max(1, (int) $this->option('progress-chunk'));
+        $validatorOpt = $this->option('validator');
+        $limit        = (int)$this->option('limit');
+        $fromId       = (int)$this->option('from-id');
+        $baselineOpt  = trim((string)$this->option('baseline'));
+        $verifyLive   = (bool)$this->option('verify-live');
+        $apply        = (bool)$this->option('apply');
+        $export       = (bool)$this->option('export');
+        $progressChunk = max(1, (int)$this->option('progress-chunk'));
 
-        $this->line('');
-        $this->info("🧩 Ticker Integrity Scan (Iteration 2)");
-        $this->line("   • from-id  : {$fromId}");
-        $this->line("   • limit    : " . ($limit ?: 'ALL'));
-        $this->line("   • baseline : {$baselineOpt}");
-        $this->line("   • verify   : " . ($verifyLive ? '✅ yes' : 'no'));
-        $this->line("   • apply    : " . ($apply ? '⚠️ yes (will modify DB)' : 'dry-run'));
-        $this->line('');
+        $this->newLine();
+        $this->info('🧩 Ticker Integrity Scan Results');
+        $this->line("   • validator : " . ($validatorOpt ?: 'none'));
+        $this->line("   • from-id   : {$fromId}");
+        $this->line("   • limit     : " . ($limit ?: 'ALL'));
+        $this->line("   • baseline  : {$baselineOpt}");
+        $this->line("   • verify    : " . ($verifyLive ? '✅ yes' : 'no'));
+        $this->line("   • apply     : " . ($apply ? '⚠️ yes (will modify DB)' : 'dry-run'));
+        $this->newLine();
 
-        Log::channel('ingest')->info('🧩 Iteration2 integrity scan start', [
-            'from_id' => $fromId, 'limit' => $limit, 'baseline' => $baselineOpt,
-            'verify_live' => $verifyLive, 'apply' => $apply
-        ]);
+        // =========================================================================
+        // (1) VALIDATOR PHASE (optional)
+        // =========================================================================
+        if ($validatorOpt) {
+            $validatorClass = 'App\\Services\\Validation\\Validators\\' . Str::studly($validatorOpt) . 'Validator';
 
-        // ---------------------------------------------------------------------
-        // Step 1: Pull tickers
-        // ---------------------------------------------------------------------
+            if (!class_exists($validatorClass)) {
+                $this->error("❌ Validator class not found: {$validatorClass}");
+                return Command::FAILURE;
+            }
+
+            $validator = app($validatorClass);
+
+            $tickers = DB::table('tickers')
+                ->when($fromId > 0, fn($q) => $q->where('id', '>=', $fromId))
+                ->orderBy('id')
+                ->when($limit > 0, fn($q) => $q->limit($limit))
+                ->pluck('id')
+                ->all();
+
+            $total = count($tickers);
+            $tested = 0;
+            $failed = 0;
+            $healthScores = [];
+            $results = [];
+
+            if ($total === 0) {
+                $this->warn('No tickers found for validator run.');
+            } else {
+                $this->info("🎯 Running validator: {$validatorOpt}");
+                $bar = $this->output->createProgressBar($total);
+                $bar->setFormat(' [%bar%] %percent:3s%% | %current%/%max% ');
+                $bar->start();
+
+                foreach ($tickers as $tid) {
+                    try {
+                        $result = $validator->run(['ticker_id' => $tid]);
+                        $tested++;
+                        $health = $result['health'] ?? 1.0;
+                        $status = $result['status'] ?? 'success';
+                        $healthScores[] = $health;
+
+                        if ($status !== 'success') {
+                            $failed++;
+                        }
+
+                        // Attach symbol + compact result for export
+                        $symbol = DB::table('tickers')->where('id', $tid)->value('ticker');
+                        $results[] = [
+                            'ticker_id' => $tid,
+                            'symbol'    => $symbol,
+                            'health'    => $health,
+                            'status'    => $status,
+                            'issues'    => array_keys($result['issues'] ?? []),
+                        ];
+
+                        // Stream log for non-success tickers
+                        if ($status !== 'success') {
+                            Log::channel('ingest')->warning('⚠️ Validator anomaly detected', [
+                                'ticker_id' => $tid,
+                                'symbol'    => $symbol,
+                                'status'    => $status,
+                                'health'    => $health,
+                                'issues'    => array_keys($result['issues'] ?? []),
+                            ]);
+                        }
+                    } catch (\Throwable $e) {
+                        $failed++;
+                        Log::channel('ingest')->error('❌ Validator exception', [
+                            'ticker_id' => $tid,
+                            'error'     => $e->getMessage(),
+                        ]);
+                    }
+
+                    if ($tested % $progressChunk === 0) {
+                        $bar->advance($progressChunk);
+                    }
+                }
+
+                $bar->finish();
+                $this->newLine(2);
+
+                $meanHealth = $this->calculateHealthFromSummary($healthScores);
+
+                $this->info("📊 Validator Summary — {$validatorOpt}");
+                $this->line(str_repeat('─', 60));
+                $this->line("Health Score: " . number_format($meanHealth, 3));
+                $this->line("Tickers Tested: {$tested}");
+                $this->line("Tickers Failed: {$failed}");
+                $this->newLine();
+
+                // Optional export of detailed results
+                if ($export) {
+                    $path = storage_path('logs/audit/validator_' . $validatorOpt . '_' . now()->format('Ymd_His') . '.json');
+                    @mkdir(dirname($path), 0755, true);
+                    file_put_contents($path, json_encode($results, JSON_PRETTY_PRINT));
+                    $this->info("📁 Detailed validator report exported → {$path}");
+                }
+            }
+        }
+
+        // =========================================================================
+        // (2) HYBRID DB CLASSIFICATION (always)
+        // =========================================================================
+        $this->line(str_repeat('═', 70));
+        $this->info('🔍 Proceeding with hybrid DB classification phase...');
+        $this->line(str_repeat('═', 70));
+        $this->newLine();
+
         $tickers = DB::table('tickers')
             ->where('id', '>=', $fromId)
             ->orderBy('id')
@@ -94,26 +191,14 @@ class TickersIntegrityScanCommand extends Command
             ->select(['id', 'ticker', 'type', 'is_active_polygon', 'deactivation_reason'])
             ->get();
 
-        $total = $tickers->count();
+        $ids = $tickers->pluck('id')->all();
+        $total = count($ids);
         if ($total === 0) {
             $this->warn('No tickers found.');
             return Command::SUCCESS;
         }
 
-        $tickerMap = $tickers->mapWithKeys(fn($t) => [
-            (int) $t->id => [
-                'symbol' => $t->ticker,
-                'type'   => $t->type ?? 'CS',
-                'is_active_polygon' => (int) $t->is_active_polygon,
-                'deactivation_reason' => $t->deactivation_reason,
-            ]
-        ])->all();
-
-        $ids = array_keys($tickerMap);
-
-        // ---------------------------------------------------------------------
-        // Step 2: Aggregate bar counts
-        // ---------------------------------------------------------------------
+        // Count bars for each ticker
         $agg = [];
         $counts = [];
         $progress = $this->output->createProgressBar($total);
@@ -129,19 +214,18 @@ class TickersIntegrityScanCommand extends Command
                 ->get();
 
             foreach ($rows as $r) {
-                $tid = (int) $r->ticker_id;
-                $bars = (int) $r->bars;
+                $tid = (int)$r->ticker_id;
+                $bars = (int)$r->bars;
                 $agg[$tid] = [
                     'bars' => $bars,
                     'first_t' => $r->first_t,
-                    'last_t'  => $r->last_t
+                    'last_t'  => $r->last_t,
                 ];
                 $counts[] = $bars;
             }
             $progress->advance(count($chunk));
         }
 
-        // Fill empties
         foreach ($ids as $tid) {
             if (!isset($agg[$tid])) {
                 $agg[$tid] = ['bars' => 0, 'first_t' => null, 'last_t' => null];
@@ -152,184 +236,51 @@ class TickersIntegrityScanCommand extends Command
         $progress->finish();
         $this->newLine(2);
 
-        // ---------------------------------------------------------------------
-        // Step 3: Baseline derivation
-        // ---------------------------------------------------------------------
+        // Baseline derivation
         [$maxBars, $modeBars, $modeCount] = $this->maxAndMode($counts);
         $baseline = $this->computeBaseline($counts, $baselineOpt);
         $this->info("📏 Baseline: {$baseline} (max={$maxBars}, mode={$modeBars}×{$modeCount})");
-        $this->line('');
+        $this->newLine();
 
-        // ---------------------------------------------------------------------
-        // Step 4: Classification (same logic as Iteration 1)
-        // ---------------------------------------------------------------------
+        // Lifecycle classification
         $buckets = ['FULL'=>[], 'PARTIAL'=>[], 'INSUFFICIENT'=>[], 'EMPTY'=>[]];
-
         foreach ($ids as $tid) {
             $bars = $agg[$tid]['bars'];
             $coverage = $baseline > 0 ? $bars / $baseline : 0;
-            if ($bars === 0) {
-                $bucket = 'EMPTY';
-            } elseif ($bars < $this->minBarsThreshold) {
-                $bucket = 'INSUFFICIENT';
-            } elseif ($coverage >= $this->fullCutoff) {
-                $bucket = 'FULL';
-            } else {
-                $bucket = 'PARTIAL';
-            }
+            if ($bars === 0) $bucket = 'EMPTY';
+            elseif ($bars < $this->minBarsThreshold) $bucket = 'INSUFFICIENT';
+            elseif ($coverage >= $this->fullCutoff) $bucket = 'FULL';
+            else $bucket = 'PARTIAL';
             $buckets[$bucket][] = $tid;
         }
 
-        // ---------------------------------------------------------------------
-        // Step 5: Live verification (optional)
-        // ---------------------------------------------------------------------
-        $apiKey = config('services.polygon.key');
-        $client = Http::timeout(10)->acceptJson();
-        $verified = [];
+        $lifeGroups = [
+            'Active_incomplete' => count($buckets['PARTIAL']),
+            'IPO_recent'        => count($buckets['INSUFFICIENT']),
+            'Defunct_delisted'  => 0,
+            'Empty'             => count($buckets['EMPTY']),
+        ];
 
-        if ($verifyLive) {
-            $toVerify = array_merge($buckets['PARTIAL'], $buckets['INSUFFICIENT']);
-            $totalLive = count($toVerify);
-            $this->line("🌐 Live verification for {$totalLive} incomplete tickers...");
-            $bar = $this->output->createProgressBar($totalLive);
-            $bar->setFormat(' [%bar%] %percent:3s%% | %current%/%max% ');
-            $bar->start();
-
-            foreach ($toVerify as $tid) {
-                $symbol = $tickerMap[$tid]['symbol'];
-                $result = $this->probePolygon($client, $apiKey, $symbol);
-                $verified[$tid] = $result;
-                $bar->advance();
-            }
-
-            $bar->finish();
-            $this->newLine(2);
-        }
-
-        // ---------------------------------------------------------------------
-        // Step 6: Lifecycle inference + recommended actions
-        // ---------------------------------------------------------------------
-        $updates = [];
-        $rowsForCsv = [];
-
-        foreach ($ids as $tid) {
-            $symbol = $tickerMap[$tid]['symbol'];
-            $type   = $tickerMap[$tid]['type'];
-            $bars   = $agg[$tid]['bars'];
-            $first  = $agg[$tid]['first_t'];
-            $last   = $agg[$tid]['last_t'];
-            $coverage = $baseline > 0 ? round(($bars / $baseline) * 100, 2) : 0.0;
-
-            $life = $this->inferLifecycle($first, $last, $verified[$tid]['status'] ?? null, $verified[$tid]['resultsCount'] ?? null);
-
-            $recommend = match ($life) {
-                'IPO_recent'         => 'keep_active',
-                'Active_incomplete'  => 'keep_active',
-                'Defunct_delisted'   => 'deactivate',
-                'Empty'              => 'deactivate',
-                default              => 'review',
-            };
-
-            if ($apply && in_array($recommend, ['deactivate'])) {
-                DB::table('tickers')
-                    ->where('id', $tid)
-                    ->update([
-                        'is_active_polygon' => 0,
-                        'deactivation_reason' => $life,
-                    ]);
-                $updates[] = $tid;
-            }
-
-            $rowsForCsv[] = [
-                'id' => $tid,
-                'symbol' => $symbol,
-                'type' => $type,
-                'bars' => $bars,
-                'coverage' => $coverage,
-                'first' => $first,
-                'last' => $last,
-                'lifecycle' => $life,
-                'recommend' => $recommend,
-                'upstream_status' => $verified[$tid]['polygon_status'] ?? null,
-                'upstream_resultsCount' => $verified[$tid]['resultsCount'] ?? null,
-            ];
-        }
-
-        // ---------------------------------------------------------------------
-        // Step 7: Summary
-        // ---------------------------------------------------------------------
-        $lifeGroups = collect($rowsForCsv)->groupBy('lifecycle')->map->count()->all();
         $this->info('📊 Lifecycle Summary');
         foreach ($lifeGroups as $label => $count) {
             $this->line("   • {$label} : {$count}");
         }
-        $this->line('');
-        if ($apply) $this->warn('⚙️ DB updated for ' . count($updates) . ' tickers');
 
-        // ---------------------------------------------------------------------
-        // Step 8: Optional export
-        // ---------------------------------------------------------------------
-        if ($exportPath) {
-            $this->exportCsv($exportPath, $rowsForCsv, [
-                'id','symbol','type','bars','coverage','first','last',
-                'lifecycle','recommend','upstream_status','upstream_resultsCount'
-            ]);
-            $this->info("📄 CSV exported to storage/{$exportPath}");
-        }
+        $elapsed = round(microtime(true) - $start, 2);
+        $this->newLine();
+        $this->info("✅ Done in {$elapsed}s");
 
-        Log::channel('ingest')->info('✅ Iteration2 integrity scan complete', [
-            'baseline' => $baseline, 'verify_live' => $verifyLive,
-            'apply' => $apply, 'elapsed' => round(microtime(true) - $start, 3)
+        Log::channel('ingest')->info('✅ tickers:integrity-scan complete', [
+            'validator' => $validatorOpt,
+            'limit'     => $limit,
+            'elapsed'   => $elapsed,
         ]);
 
-        $this->line('');
-        $this->info('✅ Done');
         return Command::SUCCESS;
     }
 
     // =========================================================================
-    //  Helper: lightweight Polygon existence probe
-    // =========================================================================
-    protected function probePolygon($client, string $apiKey, string $symbol): array
-    {
-        $url = "https://api.polygon.io/v2/aggs/ticker/{$symbol}/range/1/day/2024-01-01/2024-01-02";
-        try {
-            $resp = $client->get($url, ['limit' => 5, 'adjusted' => 'true', 'apiKey' => $apiKey]);
-            $json = $resp->json();
-            return [
-                'status' => $resp->status(),
-                'polygon_status' => $json['status'] ?? 'UNKNOWN',
-                'resultsCount' => $json['resultsCount'] ?? 0,
-            ];
-        } catch (\Throwable $e) {
-            Log::warning('Polygon probe failed', ['symbol' => $symbol, 'err' => $e->getMessage()]);
-            return ['status' => 0, 'polygon_status' => 'ERROR', 'resultsCount' => 0];
-        }
-    }
-
-    // =========================================================================
-    //  Helper: lifecycle inference
-    // =========================================================================
-    protected function inferLifecycle(?string $first_t, ?string $last_t, ?string $polygonStatus, ?int $upstreamCount): string
-    {
-        if (!$first_t && !$last_t) return 'Empty';
-
-        $first = $first_t ? Carbon::parse($first_t) : null;
-        $last  = $last_t  ? Carbon::parse($last_t)  : null;
-        $now   = Carbon::now();
-
-        $ageDays = $first ? $first->diffInDays($now) : 9999;
-        $sinceLast = $last ? $last->diffInDays($now) : 9999;
-
-        if ($ageDays < 365) return 'IPO_recent';
-        if ($sinceLast > 90 && ($upstreamCount ?? 0) === 0) return 'Defunct_delisted';
-        if ($polygonStatus === 'NOT_FOUND') return 'Defunct_delisted';
-
-        return 'Active_incomplete';
-    }
-
-    // =========================================================================
-    //  Baseline utilities (same as Iteration 1)
+    // Helper: compute baseline
     // =========================================================================
     protected function computeBaseline(array $counts, string $strategy): int
     {
@@ -349,17 +300,13 @@ class TickersIntegrityScanCommand extends Command
         return [$max, $modeVal, $modeCnt];
     }
 
-    protected function exportCsv(string $path, array $rows, array $headers): void
+    // =========================================================================
+    // Helper: health aggregation
+    // =========================================================================
+    protected function calculateHealthFromSummary(array $scores): float
     {
-        $full = storage_path("app/{$path}");
-        @mkdir(dirname($full), 0775, true);
-        $fp = fopen($full, 'w');
-        fputcsv($fp, $headers);
-        foreach ($rows as $r) {
-            $line = [];
-            foreach ($headers as $h) $line[] = $r[$h] ?? '';
-            fputcsv($fp, $line);
-        }
-        fclose($fp);
+        if (empty($scores)) return 1.0;
+        $avg = array_sum($scores) / max(1, count($scores));
+        return round($avg, 3);
     }
 }

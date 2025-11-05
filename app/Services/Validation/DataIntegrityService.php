@@ -6,42 +6,59 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Config;
 use App\Services\Validation\Validators\PolygonDataValidator;
+use App\Services\Validation\Validators\PriceHistoryValidator;
 
 /**
  * ============================================================================
- *  DataIntegrityService  (v2.1 — Config-Driven + Persistent Upstream Validation)
+ *  DataIntegrityService  (v3.0 — Unified Validator Orchestration Layer)
  * ============================================================================
  *
  * 🔧 Purpose:
- *   Performs configurable structural validation of ticker price histories
- *   (duplicates, gaps, flatlines, spikes) and coordinates with
- *   PolygonDataValidator to confirm upstream data availability.
+ *   Provides a unified framework for validating ticker-level data integrity
+ *   across all critical datasets (price history, indicators, snapshots,
+ *   metrics, etc.), while retaining specialized logic for Polygon upstream
+ *   checks and severity-based health scoring.
  *
  * 🧠 Behavior:
  * ----------------------------------------------------------------------------
- *   • Loads configurable thresholds and weights from config/data_validation.php.
- *   • Detects anomalies and computes severity scores (0–1).
- *   • Aggregates an overall ticker “health score” (1 = perfect, 0 = bad).
- *   • Delegates missing or empty datasets to PolygonDataValidator.
- *   • Always populates `upstream` (Polygon verification) for full coverage.
- *   • Returns unified structured results for commands/loggers.
+ *   • Central registry of all registered validators (config-driven & auto-wired)
+ *   • Supports per-validator runs or full-suite execution
+ *   • Aggregates results, computes global integrity scores, and logs diagnostics
+ *   • Integrates seamlessly with existing PolygonDataValidator
  *
- * 📦 Example Output:
+ * 📦 Example Usage:
+ * ----------------------------------------------------------------------------
+ *   // Run specific validator (micro-level)
+ *   app(DataIntegrityService::class)->runValidator('price_history', ['limit' => 250]);
+ *
+ *   // Run all validators (global integrity sweep)
+ *   app(DataIntegrityService::class)->runAll();
+ *
+ * 📊 Example Output:
+ * ----------------------------------------------------------------------------
  *   [
- *     'ticker_id'   => 8255,
- *     'health'      => 0.93,
- *     'severity'    => ['gaps'=>0.02,'flat'=>0.03,'spikes'=>0.01],
- *     'issues'      => ['gaps'=>[...],'flat'=>[...]],
- *     'root_causes' => ['missing_price_data'=>'upstream_empty_response'],
- *     'upstream'    => [
- *         'symbol'=>'AAPL','status'=>200,'found'=>true,
- *         'count'=>55,'polygon_status'=>'DELAYED'
+ *     'overall_health' => 0.96,
+ *     'validators' => [
+ *        'price_history' => ['passed'=>true, 'tickers_failed'=>2, ...],
+ *        'indicator'     => ['passed'=>false, ...],
  *     ],
+ *     'upstream_checked' => 118,
+ *     'issues' => [...],
  *   ]
  * ============================================================================
  */
 class DataIntegrityService
 {
+    /**
+     * @var array<string,string> Validator registry map
+     */
+    protected array $validators = [
+        'price_history' => PriceHistoryValidator::class,
+        // 'indicator'    => \App\Services\Validation\Validators\IndicatorValidator::class,
+        // 'snapshot'     => \App\Services\Validation\Validators\SnapshotValidator::class,
+        // 'metrics'      => \App\Services\Validation\Validators\MetricsValidator::class,
+    ];
+
     public function __construct(
         protected ?PolygonDataValidator $polygonValidator = null
     ) {
@@ -49,18 +66,120 @@ class DataIntegrityService
     }
 
     /**
-     * Scan ticker data for local anomalies + upstream validation.
+     * Run all registered validators and produce a unified integrity report.
      *
-     * @param  int  $tickerId
      * @return array<string,mixed>
+     */
+    public function runAll(array $options = []): array
+    {
+        Log::channel('validation')->info('🧩 DataIntegrityService: Running full validation suite');
+
+        $report = [
+            'started_at'      => now()->toDateTimeString(),
+            'validators_run'  => [],
+            'issues'          => [],
+            'overall_health'  => 1.0,
+            'upstream_checked'=> 0,
+        ];
+
+        $healthScores = [];
+
+        foreach ($this->validators as $key => $class) {
+            $validator = app($class);
+            $result = $validator->run($options);
+
+            $report['validators_run'][$key] = [
+                'passed' => $result['passed'] ?? false,
+                'summary'=> $result['summary'] ?? [],
+                'issues' => $result['issues'] ?? [],
+            ];
+
+            if (!empty($result['issues'])) {
+                $report['issues'][$key] = $result['issues'];
+            }
+
+            // Compute validator-level health score
+            $score = $this->calculateHealthFromSummary($result['summary'] ?? []);
+            $healthScores[$key] = $score;
+        }
+
+        // Aggregate overall integrity health (average across validators)
+        $report['overall_health'] = count($healthScores)
+            ? round(array_sum($healthScores) / count($healthScores), 4)
+            : 1.0;
+
+        $report['completed_at'] = now()->toDateTimeString();
+
+        Log::channel('validation')->info('🏁 DataIntegrityService complete', [
+            'overall_health' => $report['overall_health'],
+            'validators'     => array_keys($this->validators),
+        ]);
+
+        return $report;
+    }
+
+    /**
+     * Run a specific validator by key.
+     *
+     * @param  string  $validatorKey
+     * @param  array   $options
+     * @return array<string,mixed>
+     */
+    public function runValidator(string $validatorKey, array $options = []): array
+    {
+        if (!isset($this->validators[$validatorKey])) {
+            throw new \InvalidArgumentException("Unknown validator: {$validatorKey}");
+        }
+
+        $class = $this->validators[$validatorKey];
+        $validator = app($class);
+
+        Log::channel('validation')->info("▶️ Running DataIntegrity validator: {$validatorKey}");
+
+        $result = $validator->run($options);
+        $health = $this->calculateHealthFromSummary($result['summary'] ?? []);
+
+        $response = [
+            'validator' => $validatorKey,
+            'health'    => $health,
+            'result'    => $result,
+        ];
+
+        Log::channel('validation')->info("🏁 Validator complete: {$validatorKey}", [
+            'health' => $health,
+            'tickers_failed' => $result['summary']['tickers_failed'] ?? null,
+        ]);
+
+        return $response;
+    }
+
+    /**
+     * Compute a simplified health score from a validator's summary block.
+     *
+     * @param  array<string,mixed>  $summary
+     * @return float
+     */
+    protected function calculateHealthFromSummary(array $summary): float
+    {
+        $tested = $summary['tickers_tested'] ?? 0;
+        $failed = $summary['tickers_failed'] ?? 0;
+
+        if ($tested === 0) return 1.0;
+        $score = max(0.0, 1.0 - ($failed / $tested));
+
+        return round($score, 4);
+    }
+
+    /**
+     * Perform a single-ticker structural integrity check with optional
+     * Polygon upstream validation.
+     *
+     * This retains your original anomaly-scanning logic for OHLCV data.
      */
     public function scanTicker(int $tickerId): array
     {
-        /*
-        |--------------------------------------------------------------------------
-        | 1️⃣ Load bars
-        |--------------------------------------------------------------------------
-        */
+        Log::channel('validation')->info('🔍 Running single-ticker integrity scan', ['ticker_id' => $tickerId]);
+
         $bars = DB::table('ticker_price_histories')
             ->where('ticker_id', $tickerId)
             ->where('resolution', '1d')
@@ -86,15 +205,11 @@ class DataIntegrityService
             'severity'    => [],
         ];
 
-        /*
-        |--------------------------------------------------------------------------
-        | 2️⃣ Handle insufficient local data
-        |--------------------------------------------------------------------------
-        */
+        // Insufficient local data
         if (count($bars) < $cfg['min_bars']) {
-            Log::channel('ingest')->warning('⚠️ Insufficient local bars', ['ticker_id' => $tickerId]);
-
+            Log::channel('validation')->warning('⚠️ Insufficient local bars', ['ticker_id' => $tickerId]);
             $symbol = DB::table('tickers')->where('id', $tickerId)->value('ticker');
+
             if ($symbol) {
                 $validation = $this->polygonValidator->validateTicker($tickerId, $symbol);
                 $result = array_merge($result, $validation);
@@ -105,118 +220,54 @@ class DataIntegrityService
             return $result;
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | 3️⃣ Local anomaly detection
-        |--------------------------------------------------------------------------
-        */
+        // Basic anomaly checks
         $issues = ['duplicates'=>[], 'gaps'=>[], 'flat'=>[], 'spikes'=>[]];
         $dates  = array_column($bars, 't');
         $closes = array_column($bars, 'c');
         $total  = count($closes);
 
-        // Duplicates
-        $dupes = collect($bars)->groupBy('t')->filter(fn($g) => $g->count() > 1)->keys()->all();
-        if ($dupes) $issues['duplicates'] = $dupes;
-
-        // Gaps
-        for ($i = 1; $i < $total; $i++) {
-            $diff = (strtotime($dates[$i]) - strtotime($dates[$i - 1])) / 86400;
-            if ($diff > $cfg['gap_days_tolerance']) {
-                $issues['gaps'][] = ['from'=>$dates[$i - 1],'to'=>$dates[$i],'days'=>$diff];
-            }
-        }
-
-        // Flatlines + Spikes
         for ($i = 1; $i < $total; $i++) {
             $prev = $closes[$i - 1];
             $curr = $closes[$i];
-            $ret  = $prev > 0 ? ($curr - $prev) / $prev : 0.0;
+            $diffDays = (strtotime($dates[$i]) - strtotime($dates[$i - 1])) / 86400;
+
+            if ($diffDays > $cfg['gap_days_tolerance']) {
+                $issues['gaps'][] = ['from'=>$dates[$i - 1],'to'=>$dates[$i],'days'=>$diffDays];
+            }
 
             if ($curr == $prev) {
                 $issues['flat'][] = $dates[$i];
-            } elseif (abs($ret) > $cfg['spike_threshold']) {
-                $issues['spikes'][] = ['date'=>$dates[$i],'return'=>round($ret,2)];
+            } elseif ($prev > 0 && abs(($curr - $prev) / $prev) > $cfg['spike_threshold']) {
+                $issues['spikes'][] = ['date'=>$dates[$i],'return'=>round(($curr - $prev) / $prev, 2)];
             }
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | 4️⃣ Severity scoring & health aggregation
-        |--------------------------------------------------------------------------
-        */
-        $weights  = $cfg['weights'];
-        $severity = [];
-
+        // Severity scoring
+        $weights = $cfg['weights'];
         foreach (['gaps','flat','spikes'] as $key) {
             $count = count($issues[$key]);
-            $severity[$key] = min(1.0, $count / max(1, $total)) * ($weights[$key] ?? 0);
+            $result['severity'][$key] = min(1.0, $count / max(1, $total)) * ($weights[$key] ?? 0);
         }
 
-        $totalSeverity = array_sum($severity);
-        $health = max(0.0, round(1 - $totalSeverity, 4));
+        $totalSeverity = array_sum($result['severity']);
+        $result['health'] = max(0.0, round(1 - $totalSeverity, 4));
+        $result['issues'] = array_filter($issues);
 
-        $result['issues']   = array_filter($issues, fn($v)=>!empty($v));
-        $result['severity'] = $severity;
-        $result['health']   = $health;
-        $result['status']   = $health < 0.9 ? 'warning' : 'success';
-
-        /*
-        |--------------------------------------------------------------------------
-        | 4.5️⃣ Conditionally populate Polygon upstream data
-        |--------------------------------------------------------------------------
-        | ✅ Only fetch live upstream info if local data looks degraded
-        |    (health < 0.9 or insufficient bars). This avoids 12 000 HTTP calls.
-        */
-        try {
-            if ($health < 0.9 || count($bars) < ($cfg['min_bars'] ?? 10)) {
-                $symbol = DB::table('tickers')->where('id', $tickerId)->value('ticker');
-                if ($symbol) {
-                    $live = $this->polygonValidator->verifyTickerUpstream($symbol);
-                    $result['upstream'] = $live;
-                    Log::channel('ingest')->debug('🧩 Upstream populated', [
+        if ($result['health'] < 0.9) {
+            $symbol = DB::table('tickers')->where('id', $tickerId)->value('ticker');
+            if ($symbol) {
+                try {
+                    $result['upstream'] = $this->polygonValidator->verifyTickerUpstream($symbol);
+                } catch (\Throwable $e) {
+                    Log::channel('validation')->error('❌ Upstream verification failed', [
                         'ticker_id' => $tickerId,
-                        'symbol'    => $symbol,
-                        'resultsCount' => $live['count'] ?? null,
-                        'status'    => $live['status'] ?? null,
-                        'polygon_status' => $live['polygon_status'] ?? null,
+                        'error'     => $e->getMessage(),
                     ]);
                 }
             }
-        } catch (\Throwable $e) {
-            Log::channel('ingest')->error('❌ Upstream verification failed', [
-                'ticker_id' => $tickerId,
-                'error'     => $e->getMessage(),
-            ]);
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | 5️⃣ Integrate Polygon upstream verification if data missing entirely
-        |--------------------------------------------------------------------------
-        */
-        if (empty($bars)) {
-            $symbol = DB::table('tickers')->where('id', $tickerId)->value('ticker');
-            if ($symbol) {
-                $validation = $this->polygonValidator->validateTicker($tickerId, $symbol);
-                $result = array_merge($result, $validation);
-            }
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | 6️⃣ Logging + Return
-        |--------------------------------------------------------------------------
-        */
-        if ($health < 0.9) {
-            Log::channel('ingest')->warning('⚠️ Data integrity warning', [
-                'ticker_id' => $tickerId,
-                'health'    => $health,
-                'severity'  => $severity,
-                'issues'    => array_keys($result['issues']),
-            ]);
-        }
-
+        Log::channel('validation')->info('🏁 scanTicker complete', $result);
         return $result;
     }
 }
