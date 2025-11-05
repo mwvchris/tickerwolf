@@ -1,4 +1,4 @@
-===== GPT DUMP GENERATED: 2025-10-30T00:32:43Z =====
+===== GPT DUMP GENERATED: 2025-11-03T10:24:19Z =====
 ===== DIRECTORY: app/Models =====
 
 app/Models/TickerIndicator.php
@@ -18,6 +18,8 @@ class TickerIndicator extends Model
 {
     use HasFactory;
 
+    protected $table = 'ticker_indicators';
+
     protected $fillable = [
         'ticker_id',
         'resolution',
@@ -33,38 +35,89 @@ class TickerIndicator extends Model
         'value' => 'float',
     ];
 
+    public function ticker()
+    {
+        return $this->belongsTo(Ticker::class);
+    }
+
+    /** Scope: by symbol (joins ticker) */
+    public function scopeForTicker($query, string $symbol)
+    {
+        return $query->whereHas('ticker', fn($q) => $q->where('ticker', strtoupper($symbol)));
+    }
+
+    /** Scope: by indicator name */
+    public function scopeIndicator($query, string $name)
+    {
+        return $query->where('indicator', $name);
+    }
+
+    /** Scope: recent N trading days */
+    public function scopeSince($query, string $date)
+    {
+        return $query->where('t', '>=', $date);
+    }
+
+    public function getDateAttribute(): ?string
+    {
+        return $this->t ? Carbon::parse($this->t)->toDateString() : null;
+    }
+}
+app/Models/TickerFeatureSnapshot.php
+
+
+===== FILE: app/Models/TickerFeatureSnapshot.php =====
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+/**
+ * Class TickerFeatureSnapshot
+ *
+ * Represents a compact JSON "feature vector" of all computed indicators and analytics
+ * for a given ticker and date. Serves as an AI-ready, ML-friendly dataset structure.
+ *
+ * Example:
+ *   {
+ *     "sma_20": 142.54,
+ *     "ema_12": 144.21,
+ *     "rsi_14": 63.2,
+ *     "macd": 0.84,
+ *     "atr_14": 1.13,
+ *     "boll_20_upper": 146.2,
+ *     "boll_20_lower": 138.9,
+ *     "beta_60": 1.07,
+ *     "sharpe_60": 0.94
+ *   }
+ *
+ * Each record corresponds to a unique (ticker_id, t) pair.
+ */
+class TickerFeatureSnapshot extends Model
+{
+    protected $table = 'ticker_feature_snapshots';
+
+    protected $fillable = [
+        'ticker_id',
+        't',
+        'indicators',
+        'embedding',
+    ];
+
+    protected $casts = [
+        't' => 'date',
+        'indicators' => 'array',
+        'embedding' => 'array',
+    ];
+
     /**
      * Relationships
      */
     public function ticker()
     {
         return $this->belongsTo(Ticker::class);
-    }
-
-    /**
-     * Scopes
-     */
-    public function scopeForTicker($query, string $symbol)
-    {
-        return $query->whereHas('ticker', fn($q) => $q->where('ticker', strtoupper($symbol)));
-    }
-
-    public function scopeIndicator($query, string $name)
-    {
-        return $query->where('indicator', $name);
-    }
-
-    public function scopeLatest($query)
-    {
-        return $query->orderByDesc('t');
-    }
-
-    /**
-     * Accessors
-     */
-    public function getDateAttribute(): ?string
-    {
-        return $this->t ? Carbon::parse($this->t)->toDateString() : null;
     }
 }app/Models/TickerNewsItem.php
 
@@ -191,7 +244,7 @@ class TickerPriceHistory extends Model
     ];
 
     protected $casts = [
-        't' => 'integer',
+        't' => 'datetime',
         'o' => 'float',
         'h' => 'float',
         'l' => 'float',
@@ -213,7 +266,43 @@ class TickerPriceHistory extends Model
     {
         return $query->where('year', $year);
     }
-}app/Models/LatestTickerPrice.php
+}app/Models/TickerCorrelation.php
+
+
+===== FILE: app/Models/TickerCorrelation.php =====
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+/**
+ * TickerCorrelation
+ *
+ * Stores pairwise correlation metrics between two tickers on a given date.
+ */
+class TickerCorrelation extends Model
+{
+    protected $fillable = [
+        'ticker_id_a',
+        'ticker_id_b',
+        'as_of_date',
+        'corr',
+        'beta',
+        'r2',
+    ];
+
+    protected $casts = [
+        'as_of_date' => 'date',
+        'corr' => 'float',
+        'beta' => 'float',
+        'r2' => 'float',
+    ];
+
+    public $timestamps = true;
+}
+app/Models/LatestTickerPrice.php
 
 
 ===== FILE: app/Models/LatestTickerPrice.php =====
@@ -246,7 +335,32 @@ class LatestTickerPrice extends Model
         'c' => 'float', // close
         'v' => 'float', // volume
     ];
-}app/Models/TickerAnalysis.php
+}app/Models/DataIntegrityLog.php
+
+
+===== FILE: app/Models/DataIntegrityLog.php =====
+
+<?php
+
+namespace App\Models;
+
+/**
+ * ============================================================================
+ *  DataIntegrityLog (alias of DataValidationLog)
+ * ============================================================================
+ *
+ * A logical alias of DataValidationLog that specifically tracks
+ * *integrity-level* audits (e.g., null checks, duplicate detection,
+ * orphaned foreign keys, or schema anomalies).
+ *
+ * Uses the same underlying table `data_validation_logs`.
+ * ============================================================================
+ */
+class DataIntegrityLog extends DataValidationLog
+{
+    // Uses same fillable, casts, and table
+}
+app/Models/TickerAnalysis.php
 
 
 ===== FILE: app/Models/TickerAnalysis.php =====
@@ -467,6 +581,52 @@ class Ticker extends Model
     {
         return $query->whereRaw('LOWER(ticker) = ?', [strtolower($symbol)]);
     }
+}app/Models/DataValidationLog.php
+
+
+===== FILE: app/Models/DataValidationLog.php =====
+
+<?php
+
+namespace App\Models;
+
+use Illuminate\Database\Eloquent\Model;
+
+/**
+ * ============================================================================
+ *  DataValidationLog
+ * ============================================================================
+ *
+ * Represents a persisted record of a validation run — used by:
+ *  - tickers:validate-data
+ *  - tickers:integrity-scan
+ *  - (future) sentiment & fundamentals validation jobs
+ *
+ * Each record stores summary metrics, details JSON, and run metadata.
+ * ============================================================================
+ */
+class DataValidationLog extends Model
+{
+    protected $table = 'data_validation_logs';
+
+    protected $fillable = [
+        'entity_type',
+        'command_name',
+        'total_entities',
+        'validated_count',
+        'missing_count',
+        'details',
+        'status',
+        'started_at',
+        'completed_at',
+        'initiated_by',
+    ];
+
+    protected $casts = [
+        'details' => 'array',
+        'started_at' => 'datetime',
+        'completed_at' => 'datetime',
+    ];
 }app/Models/JobBatch.php
 
 
@@ -478,14 +638,49 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Str;
 
+/**
+ * ============================================================================
+ *  JobBatch Model (Final - Eloquent-safe)
+ * ============================================================================
+ *
+ * Represents records in the `job_batches` table, used by:
+ *   • Laravel's native Bus batching system
+ *   • TickerWolf's custom ingestion monitoring layer
+ *
+ * Key behaviors:
+ *   • UUID primary keys
+ *   • Hybrid timestamp model:
+ *       - created_at, finished_at, cancelled_at → UNIX epoch (INT)
+ *       - updated_at → DATETIME (timestamp)
+ *   • Disables Eloquent’s built-in timestamp mutation to prevent
+ *     overwriting of integer timestamps with formatted datetime strings.
+ * ============================================================================
+ */
 class JobBatch extends Model
 {
     use HasFactory;
 
+    /** @var string The table associated with this model. */
     protected $table = 'job_batches';
 
+    /** @var bool Indicates if the model's primary key is auto-incrementing. */
+    public $incrementing = false;
+
+    /** @var string The data type of the primary key. */
+    protected $keyType = 'string';
+
+    /**
+     * Disable automatic timestamp management.
+     *
+     * We handle created_at/updated_at manually to keep schema consistency.
+     */
+    public $timestamps = false; // ✅ CRUCIAL FIX
+
+    /** @var array Attributes that can be mass-assigned. */
     protected $fillable = [
+        'id',
         'name',
         'total_jobs',
         'pending_jobs',
@@ -496,40 +691,60 @@ class JobBatch extends Model
         'updated_at',
     ];
 
+    /** @var array Attribute casting definitions. */
     protected $casts = [
-        'total_jobs'    => 'integer',
-        'pending_jobs'  => 'integer',
-        'processed_jobs'=> 'integer',
-        'failed_jobs'   => 'integer',
+        'total_jobs'     => 'integer',
+        'pending_jobs'   => 'integer',
+        'processed_jobs' => 'integer',
+        'failed_jobs'    => 'integer',
+        'created_at'     => 'integer',   // UNIX timestamp
+        'updated_at'     => 'datetime',  // full timestamp
     ];
 
     /**
-     * Determine if the batch is complete.
+     * Boot the model and handle UUID + manual timestamps.
      */
+    protected static function booted(): void
+    {
+        static::creating(function ($model) {
+            // Generate UUID primary key
+            if (empty($model->{$model->getKeyName()})) {
+                $model->{$model->getKeyName()} = (string) Str::uuid();
+            }
+
+            // Only set timestamps manually
+            if (empty($model->created_at)) {
+                $model->created_at = now()->getTimestamp();
+            }
+            if (empty($model->updated_at)) {
+                $model->updated_at = now();
+            }
+        });
+    }
+
+    /* ----------------------------------------------------------------------
+     |  Domain convenience helpers
+     | ---------------------------------------------------------------------- */
+
+    /** Determine if the batch is complete. */
     public function isComplete(): bool
     {
         return $this->pending_jobs <= 0 && $this->failed_jobs === 0;
     }
 
-    /**
-     * Determine if the batch has failures.
-     */
+    /** Determine if the batch has failures. */
     public function hasFailures(): bool
     {
         return $this->failed_jobs > 0;
     }
 
-    /**
-     * Mark the batch as complete.
-     */
+    /** Mark the batch as complete. */
     public function markComplete(): void
     {
         $this->update(['status' => 'complete']);
     }
 
-    /**
-     * Mark the batch as failed.
-     */
+    /** Mark the batch as failed. */
     public function markFailed(): void
     {
         $this->update(['status' => 'failed']);

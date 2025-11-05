@@ -9,7 +9,7 @@ use App\Services\Validation\Validators\PolygonDataValidator;
 
 /**
  * ============================================================================
- *  DataIntegrityService  (v2 — Config-Driven + Severity Scoring)
+ *  DataIntegrityService  (v2.1 — Config-Driven + Persistent Upstream Validation)
  * ============================================================================
  *
  * 🔧 Purpose:
@@ -23,6 +23,7 @@ use App\Services\Validation\Validators\PolygonDataValidator;
  *   • Detects anomalies and computes severity scores (0–1).
  *   • Aggregates an overall ticker “health score” (1 = perfect, 0 = bad).
  *   • Delegates missing or empty datasets to PolygonDataValidator.
+ *   • Always populates `upstream` (Polygon verification) for full coverage.
  *   • Returns unified structured results for commands/loggers.
  *
  * 📦 Example Output:
@@ -32,7 +33,10 @@ use App\Services\Validation\Validators\PolygonDataValidator;
  *     'severity'    => ['gaps'=>0.02,'flat'=>0.03,'spikes'=>0.01],
  *     'issues'      => ['gaps'=>[...],'flat'=>[...]],
  *     'root_causes' => ['missing_price_data'=>'upstream_empty_response'],
- *     'upstream'    => ['status'=>200,'found'=>false],
+ *     'upstream'    => [
+ *         'symbol'=>'AAPL','status'=>200,'found'=>true,
+ *         'count'=>55,'polygon_status'=>'DELAYED'
+ *     ],
  *   ]
  * ============================================================================
  */
@@ -156,6 +160,35 @@ class DataIntegrityService
         $result['severity'] = $severity;
         $result['health']   = $health;
         $result['status']   = $health < 0.9 ? 'warning' : 'success';
+
+        /*
+        |--------------------------------------------------------------------------
+        | 4.5️⃣ Conditionally populate Polygon upstream data
+        |--------------------------------------------------------------------------
+        | ✅ Only fetch live upstream info if local data looks degraded
+        |    (health < 0.9 or insufficient bars). This avoids 12 000 HTTP calls.
+        */
+        try {
+            if ($health < 0.9 || count($bars) < ($cfg['min_bars'] ?? 10)) {
+                $symbol = DB::table('tickers')->where('id', $tickerId)->value('ticker');
+                if ($symbol) {
+                    $live = $this->polygonValidator->verifyTickerUpstream($symbol);
+                    $result['upstream'] = $live;
+                    Log::channel('ingest')->debug('🧩 Upstream populated', [
+                        'ticker_id' => $tickerId,
+                        'symbol'    => $symbol,
+                        'resultsCount' => $live['count'] ?? null,
+                        'status'    => $live['status'] ?? null,
+                        'polygon_status' => $live['polygon_status'] ?? null,
+                    ]);
+                }
+            }
+        } catch (\Throwable $e) {
+            Log::channel('ingest')->error('❌ Upstream verification failed', [
+                'ticker_id' => $tickerId,
+                'error'     => $e->getMessage(),
+            ]);
+        }
 
         /*
         |--------------------------------------------------------------------------

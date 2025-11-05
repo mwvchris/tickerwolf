@@ -5,408 +5,361 @@ namespace App\Console\Commands;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\Schema;
-use App\Services\Validation\DataIntegrityService;
-use App\Services\Validation\Validators\PolygonDataValidator;
-use App\Models\DataValidationLog;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
 use Carbon\Carbon;
+use Symfony\Component\Console\Helper\Table;
+use Symfony\Component\Console\Output\ConsoleOutput;
 
 /**
- * ============================================================================
- *  tickers:integrity-scan  (v3.0.0 — Diagnostic Expansion + Deep Health Metrics)
- * ============================================================================
+ * =============================================================================
+ *  tickers:integrity-scan  (Iteration 2 — Hybrid Verification + Lifecycle)
+ * =============================================================================
  *
- * 🔧 Purpose:
- *   Performs configurable, severity-weighted integrity scans across ticker data,
- *   combining local anomaly scoring with optional live Polygon.io verification.
- *   Now includes detailed per-ticker diagnostics (bar count, coverage ratio,
- *   flatness, average volume, first/last bar dates) and aggregate issue summaries.
+ * PURPOSE
+ * -------
+ * Extends the DB-only scan with a lightweight live verification phase
+ * (limit=5 probe) for incomplete tickers.  It also infers lifecycle state:
+ *   IPO_recent / Active_incomplete / Defunct_delisted / Empty
  *
- * 🚀 New in v3.0.0:
- * ----------------------------------------------------------------------------
- *   • Extended diagnostic table (Bars, Expected, Coverage%, AvgVol, Issues)
- *   • Inline classification of "empty", "sparse", "flat", "partial", "illiquid"
- *   • Aggregate diagnostic summary (counts by issue type)
- *   • Retains bulk re-ingestion and live verification (v2.6.4 feature set)
- *   • Structured logging of all scan + verification actions
+ * Key new flags:
+ *   --verify-live    -> enables Polygon API probes for non-full tickers.
+ *   --apply           -> commits lifecycle/deactivation updates to DB.
  *
- * ============================================================================
+ * All API hits use limit=5 and a 1-day range — purely to confirm existence.
+ * It’s effectively a HEAD check, not a full price fetch.
+ *
+ * Safe defaults:
+ *   • FULL tickers are never probed.
+ *   • PARTIAL/INSUFFICIENT tickers use cached 1d requests.
+ *   • Dry-run by default (no DB writes unless --apply given).
+ *
+ * =============================================================================
  */
 class TickersIntegrityScanCommand extends Command
 {
     protected $signature = 'tickers:integrity-scan
-                            {--limit=100 : Number of tickers to scan}
-                            {--from-id=0 : Start scanning from this ticker ID}
-                            {--verify-live : Recheck all critical tickers directly against Polygon.io}';
+        {--limit=0 : Number of tickers to scan (0 = all from from-id)}
+        {--from-id=0 : Start scanning from this ticker ID}
+        {--baseline=auto : Baseline strategy: auto|max|mode|<integer>}
+        {--verify-live : Verify incomplete tickers against Polygon API}
+        {--apply : Apply lifecycle/deactivation flags in DB (dry-run by default)}
+        {--export= : Optional CSV export path under storage/}
+        {--progress-chunk=500 : Advance progress bar every N tickers}';
 
-    protected $description = 'Perform configurable, severity-scored integrity checks for ticker data, with config-driven re-ingest parameters and optional live verification.';
+    protected $description = 'Hybrid integrity scan: DB classification + optional Polygon existence check.';
+
+    // Tunables
+    protected int $chunkSizeIds      = 2000;
+    protected int $minBarsThreshold  = 10;
+    protected float $fullCutoff      = 0.99;
+    protected float $partialCutoff   = 0.50;
 
     public function handle(): int
     {
-        $limit      = (int) $this->option('limit');
-        $fromId     = (int) $this->option('from-id');
-        $verifyLive = (bool) $this->option('verify-live');
+        $start = microtime(true);
+        $this->minBarsThreshold = (int) config('data_validation.min_bars', $this->minBarsThreshold);
 
-        $this->info("🧩 Starting integrity scan for {$limit} tickers (from ID {$fromId})…");
-        if ($verifyLive) {
-            $this->warn('🌐 Live verification mode enabled — Polygon API will be queried for critical tickers.');
-        }
+        // Parse options
+        $limit       = (int) $this->option('limit');
+        $fromId      = (int) $this->option('from-id');
+        $baselineOpt = trim((string) $this->option('baseline'));
+        $verifyLive  = (bool) $this->option('verify-live');
+        $apply       = (bool) $this->option('apply');
+        $exportPath  = $this->option('export');
+        $progressChunk = max(1, (int) $this->option('progress-chunk'));
 
-        Log::channel('ingest')->info('🧩 tickers:integrity-scan started', [
-            'limit'       => $limit,
-            'fromId'      => $fromId,
-            'verify_live' => $verifyLive,
+        $this->line('');
+        $this->info("🧩 Ticker Integrity Scan (Iteration 2)");
+        $this->line("   • from-id  : {$fromId}");
+        $this->line("   • limit    : " . ($limit ?: 'ALL'));
+        $this->line("   • baseline : {$baselineOpt}");
+        $this->line("   • verify   : " . ($verifyLive ? '✅ yes' : 'no'));
+        $this->line("   • apply    : " . ($apply ? '⚠️ yes (will modify DB)' : 'dry-run'));
+        $this->line('');
+
+        Log::channel('ingest')->info('🧩 Iteration2 integrity scan start', [
+            'from_id' => $fromId, 'limit' => $limit, 'baseline' => $baselineOpt,
+            'verify_live' => $verifyLive, 'apply' => $apply
         ]);
 
-        $startedAt = now();
-
-        /*
-        |--------------------------------------------------------------------------
-        | 1️⃣ Create persistent log entry
-        |--------------------------------------------------------------------------
-        */
-        $log = DataValidationLog::create([
-            'entity_type'  => 'ticker_integrity',
-            'command_name' => 'tickers:integrity-scan',
-            'status'       => 'running',
-            'started_at'   => $startedAt,
-            'initiated_by' => get_current_user() ?: 'system',
-        ]);
-
-        /*
-        |--------------------------------------------------------------------------
-        | 2️⃣ Initialize service + ticker selection
-        |--------------------------------------------------------------------------
-        */
-        $service = new DataIntegrityService();
+        // ---------------------------------------------------------------------
+        // Step 1: Pull tickers
+        // ---------------------------------------------------------------------
         $tickers = DB::table('tickers')
             ->where('id', '>=', $fromId)
             ->orderBy('id')
-            ->limit($limit)
-            ->get(['id', 'ticker', 'type']);
+            ->when($limit > 0, fn($q) => $q->limit($limit))
+            ->select(['id', 'ticker', 'type', 'is_active_polygon', 'deactivation_reason'])
+            ->get();
 
-        $results = [];
-        $healths = [];
-        $sourceHealth = [];
+        $total = $tickers->count();
+        if ($total === 0) {
+            $this->warn('No tickers found.');
+            return Command::SUCCESS;
+        }
 
-        /*
-        |--------------------------------------------------------------------------
-        | 3️⃣ Per-ticker scans (local + upstream) + diagnostics
-        |--------------------------------------------------------------------------
-        */
-        foreach ($tickers as $ticker) {
-            $id     = $ticker->id;
-            $symbol = $ticker->ticker;
-            $type   = $ticker->type ?? 'CS';
+        $tickerMap = $tickers->mapWithKeys(fn($t) => [
+            (int) $t->id => [
+                'symbol' => $t->ticker,
+                'type'   => $t->type ?? 'CS',
+                'is_active_polygon' => (int) $t->is_active_polygon,
+                'deactivation_reason' => $t->deactivation_reason,
+            ]
+        ])->all();
 
-            try {
-                $r = $service->scanTicker($id);
-                $health = $r['health'] ?? 0;
-                $results[$id] = $r;
-                $healths[] = $health;
+        $ids = array_keys($tickerMap);
 
-                // Diagnostics
-                $bars = DB::table('ticker_price_histories')
-                    ->where('ticker_id', $id)
-                    ->count();
+        // ---------------------------------------------------------------------
+        // Step 2: Aggregate bar counts
+        // ---------------------------------------------------------------------
+        $agg = [];
+        $counts = [];
+        $progress = $this->output->createProgressBar($total);
+        $progress->setFormat(' [%bar%] %percent:3s%% | %current%/%max% ');
+        $progress->start();
 
-                $minDate = DB::table('ticker_price_histories')
-                    ->where('ticker_id', $id)
-                    ->min('t');
+        foreach (array_chunk($ids, $this->chunkSizeIds) as $chunk) {
+            $rows = DB::table('ticker_price_histories')
+                ->selectRaw('ticker_id, COUNT(*) AS bars, MIN(t) AS first_t, MAX(t) AS last_t')
+                ->whereIn('ticker_id', $chunk)
+                ->where('resolution', '1d')
+                ->groupBy('ticker_id')
+                ->get();
 
-                $maxDate = DB::table('ticker_price_histories')
-                    ->where('ticker_id', $id)
-                    ->max('t');
-
-                $expected = 0;
-                if ($minDate && $maxDate) {
-                    $expected = Carbon::parse($minDate)->diffInDays(Carbon::parse($maxDate));
-                }
-
-                $coverage = $expected > 0 ? round(($bars / $expected) * 100, 2) : 0;
-                $avgVol = DB::table('ticker_price_histories')
-                    ->where('ticker_id', $id)
-                    ->avg('v');
-
-                $flatBars = DB::table('ticker_price_histories')
-                    ->where('ticker_id', $id)
-                    ->whereColumn('o', '=', 'c')
-                    ->whereColumn('h', '=', 'l')
-                    ->count();
-
-                $flags = [];
-                if ($bars == 0) $flags[] = 'empty';
-                elseif ($bars < 10) $flags[] = 'sparse';
-                elseif ($coverage < 25) $flags[] = 'partial';
-                if ($avgVol !== null && $avgVol < 100) $flags[] = 'illiquid';
-                if ($flatBars > 0 && $bars > 0 && ($flatBars / $bars) > 0.5) $flags[] = 'flat';
-
-                $results[$id]['diagnostics'] = [
-                    'bars'      => $bars,
-                    'expected'  => $expected,
-                    'coverage'  => $coverage,
-                    'avg_vol'   => $avgVol,
-                    'first'     => $minDate ? Carbon::parse($minDate)->format('Y-m-d') : '—',
-                    'last'      => $maxDate ? Carbon::parse($maxDate)->format('Y-m-d') : '—',
-                    'issues'    => implode(', ', $flags) ?: 'none',
+            foreach ($rows as $r) {
+                $tid = (int) $r->ticker_id;
+                $bars = (int) $r->bars;
+                $agg[$tid] = [
+                    'bars' => $bars,
+                    'first_t' => $r->first_t,
+                    'last_t'  => $r->last_t
                 ];
+                $counts[] = $bars;
+            }
+            $progress->advance(count($chunk));
+        }
 
-                if (!empty($r['upstream'])) {
-                    $sourceHealth[$id] = $r['upstream'];
-                }
-
-                if (isset($r['root_causes']['missing_price_data'])
-                    && $r['root_causes']['missing_price_data'] === 'upstream_empty_response') {
-                    DB::table('tickers')->where('id', $id)->update([
-                        'is_active_polygon'   => false,
-                        'deactivation_reason' => 'no_data_from_polygon',
-                        'updated_at'          => now(),
-                    ]);
-                }
-            } catch (\Throwable $e) {
-                $results[$id] = ['error' => $e->getMessage()];
-                $healths[] = 0;
-                Log::channel('ingest')->error("❌ Integrity scan failed for ticker {$id}", [
-                    'message' => $e->getMessage(),
-                    'trace'   => substr($e->getTraceAsString(), 0, 400),
-                ]);
+        // Fill empties
+        foreach ($ids as $tid) {
+            if (!isset($agg[$tid])) {
+                $agg[$tid] = ['bars' => 0, 'first_t' => null, 'last_t' => null];
+                $counts[] = 0;
             }
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | 4️⃣ Aggregate overall health stats
-        |--------------------------------------------------------------------------
-        */
-        $total  = count($tickers);
-        $avg    = round(array_sum($healths) / max(1, $total), 4);
-        sort($healths);
-        $median = $healths[intdiv($total, 2)] ?? 0;
+        $progress->finish();
+        $this->newLine(2);
 
-        $bands = [
-            'healthy'  => count(array_filter($healths, fn($h) => $h >= 0.9)),
-            'moderate' => count(array_filter($healths, fn($h) => $h >= 0.6 && $h < 0.9)),
-            'critical' => count(array_filter($healths, fn($h) => $h < 0.6)),
-        ];
+        // ---------------------------------------------------------------------
+        // Step 3: Baseline derivation
+        // ---------------------------------------------------------------------
+        [$maxBars, $modeBars, $modeCount] = $this->maxAndMode($counts);
+        $baseline = $this->computeBaseline($counts, $baselineOpt);
+        $this->info("📏 Baseline: {$baseline} (max={$maxBars}, mode={$modeBars}×{$modeCount})");
+        $this->line('');
 
-        $status = $bands['critical'] > 0 ? 'warning' : 'success';
+        // ---------------------------------------------------------------------
+        // Step 4: Classification (same logic as Iteration 1)
+        // ---------------------------------------------------------------------
+        $buckets = ['FULL'=>[], 'PARTIAL'=>[], 'INSUFFICIENT'=>[], 'EMPTY'=>[]];
 
-        $payload = [
-            'total_entities'     => $total,
-            'validated_count'    => $bands['healthy'],
-            'missing_count'      => $bands['critical'],
-            'status'             => $status,
-            'completed_at'       => now(),
-            'data_source_health' => json_encode($sourceHealth, JSON_UNESCAPED_SLASHES),
-            'details'            => json_encode($results, JSON_UNESCAPED_SLASHES),
-        ];
-        if (Schema::hasColumn('data_validation_logs', 'validation_ratio')) {
-            $payload['validation_ratio'] = round($bands['healthy'] / max(1, $total), 4);
+        foreach ($ids as $tid) {
+            $bars = $agg[$tid]['bars'];
+            $coverage = $baseline > 0 ? $bars / $baseline : 0;
+            if ($bars === 0) {
+                $bucket = 'EMPTY';
+            } elseif ($bars < $this->minBarsThreshold) {
+                $bucket = 'INSUFFICIENT';
+            } elseif ($coverage >= $this->fullCutoff) {
+                $bucket = 'FULL';
+            } else {
+                $bucket = 'PARTIAL';
+            }
+            $buckets[$bucket][] = $tid;
         }
-        $log->update($payload);
 
-        /*
-        |--------------------------------------------------------------------------
-        | 5️⃣ Summary display (high-level bands)
-        |--------------------------------------------------------------------------
-        */
-        $this->line('');
-        $this->info('📊 Health Distribution:');
-        $this->line("   ✅ Healthy  : {$bands['healthy']}");
-        $this->line("   ⚠️  Moderate : {$bands['moderate']}");
-        $this->line("   🔴 Critical : {$bands['critical']}");
-        $this->line("   ———————————————————————————————");
-        $this->line("   Avg Health : {$avg}");
-        $this->line("   Median     : {$median}");
-        $this->line('');
+        // ---------------------------------------------------------------------
+        // Step 5: Live verification (optional)
+        // ---------------------------------------------------------------------
+        $apiKey = config('services.polygon.key');
+        $client = Http::timeout(10)->acceptJson();
+        $verified = [];
 
-        /*
-        |--------------------------------------------------------------------------
-        | 6️⃣ Detailed diagnostics table (Moderate + Critical)
-        |--------------------------------------------------------------------------
-        */
-        $flagged = [];
-        foreach ($results as $id => $r) {
-            $h = $r['health'] ?? 1;
-            if ($h >= 0.9) continue;
+        if ($verifyLive) {
+            $toVerify = array_merge($buckets['PARTIAL'], $buckets['INSUFFICIENT']);
+            $totalLive = count($toVerify);
+            $this->line("🌐 Live verification for {$totalLive} incomplete tickers...");
+            $bar = $this->output->createProgressBar($totalLive);
+            $bar->setFormat(' [%bar%] %percent:3s%% | %current%/%max% ');
+            $bar->start();
 
-            $d = $r['diagnostics'] ?? [];
-            $flagged[] = [
-                'id'        => $id,
-                'symbol'    => DB::table('tickers')->where('id', $id)->value('ticker'),
-                'type'      => DB::table('tickers')->where('id', $id)->value('type'),
-                'health'    => $h,
-                'severity'  => $h < 0.6 ? 'Critical' : 'Moderate',
-                'bars'      => $d['bars'] ?? 0,
-                'expected'  => $d['expected'] ?? 0,
-                'coverage'  => $d['coverage'] ?? 0,
-                'first'     => $d['first'] ?? '—',
-                'last'      => $d['last'] ?? '—',
-                'avg_vol'   => $d['avg_vol'] ?? 0,
-                'issues'    => $d['issues'] ?? 'none',
+            foreach ($toVerify as $tid) {
+                $symbol = $tickerMap[$tid]['symbol'];
+                $result = $this->probePolygon($client, $apiKey, $symbol);
+                $verified[$tid] = $result;
+                $bar->advance();
+            }
+
+            $bar->finish();
+            $this->newLine(2);
+        }
+
+        // ---------------------------------------------------------------------
+        // Step 6: Lifecycle inference + recommended actions
+        // ---------------------------------------------------------------------
+        $updates = [];
+        $rowsForCsv = [];
+
+        foreach ($ids as $tid) {
+            $symbol = $tickerMap[$tid]['symbol'];
+            $type   = $tickerMap[$tid]['type'];
+            $bars   = $agg[$tid]['bars'];
+            $first  = $agg[$tid]['first_t'];
+            $last   = $agg[$tid]['last_t'];
+            $coverage = $baseline > 0 ? round(($bars / $baseline) * 100, 2) : 0.0;
+
+            $life = $this->inferLifecycle($first, $last, $verified[$tid]['status'] ?? null, $verified[$tid]['resultsCount'] ?? null);
+
+            $recommend = match ($life) {
+                'IPO_recent'         => 'keep_active',
+                'Active_incomplete'  => 'keep_active',
+                'Defunct_delisted'   => 'deactivate',
+                'Empty'              => 'deactivate',
+                default              => 'review',
+            };
+
+            if ($apply && in_array($recommend, ['deactivate'])) {
+                DB::table('tickers')
+                    ->where('id', $tid)
+                    ->update([
+                        'is_active_polygon' => 0,
+                        'deactivation_reason' => $life,
+                    ]);
+                $updates[] = $tid;
+            }
+
+            $rowsForCsv[] = [
+                'id' => $tid,
+                'symbol' => $symbol,
+                'type' => $type,
+                'bars' => $bars,
+                'coverage' => $coverage,
+                'first' => $first,
+                'last' => $last,
+                'lifecycle' => $life,
+                'recommend' => $recommend,
+                'upstream_status' => $verified[$tid]['polygon_status'] ?? null,
+                'upstream_resultsCount' => $verified[$tid]['resultsCount'] ?? null,
             ];
         }
 
-        if ($flagged) {
-            usort($flagged, fn($a, $b) =>
-                ($a['severity'] === $b['severity'])
-                    ? ($a['id'] <=> $b['id'])
-                    : (($a['severity'] === 'Critical') ? -1 : 1)
-            );
+        // ---------------------------------------------------------------------
+        // Step 7: Summary
+        // ---------------------------------------------------------------------
+        $lifeGroups = collect($rowsForCsv)->groupBy('lifecycle')->map->count()->all();
+        $this->info('📊 Lifecycle Summary');
+        foreach ($lifeGroups as $label => $count) {
+            $this->line("   • {$label} : {$count}");
+        }
+        $this->line('');
+        if ($apply) $this->warn('⚙️ DB updated for ' . count($updates) . ' tickers');
 
-            $this->warn("⚠️ Detailed Report (Moderate & Critical):");
-            $this->line(str_pad('ID', 8)
-                . str_pad('Symbol', 10)
-                . str_pad('Type', 10)
-                . str_pad('Health', 10)
-                . str_pad('Severity', 12)
-                . str_pad('Bars', 8)
-                . str_pad('Expect', 10)
-                . str_pad('Cover%', 10)
-                . str_pad('First', 12)
-                . str_pad('Last', 12)
-                . str_pad('AvgVol', 10)
-                . "Issues");
-            $this->line(str_repeat('-', 128));
-
-            foreach ($flagged as $f) {
-                $sevLabel = $f['severity'] === 'Critical'
-                    ? $this->formatRed('Critical')
-                    : $this->formatYellow('Moderate');
-
-                $this->line(
-                    str_pad($f['id'], 8)
-                    . str_pad($f['symbol'], 10)
-                    . str_pad($f['type'], 10)
-                    . str_pad(number_format($f['health'], 3), 10)
-                    . str_pad($sevLabel, 14)
-                    . str_pad($f['bars'], 8)
-                    . str_pad($f['expected'], 10)
-                    . str_pad($f['coverage'] . '%', 10)
-                    . str_pad($f['first'], 12)
-                    . str_pad($f['last'], 12)
-                    . str_pad(number_format((float)$f['avg_vol'], 0), 10)
-                    . $f['issues']
-                );
-            }
-
-            $this->newLine();
-            // Aggregate issue summary
-            $this->info('📈 Diagnostic Summary:');
-            $this->line('   - Empty tickers     : ' . collect($flagged)->filter(fn($x) => str_contains($x['issues'], 'empty'))->count());
-            $this->line('   - Sparse tickers    : ' . collect($flagged)->filter(fn($x) => str_contains($x['issues'], 'sparse'))->count());
-            $this->line('   - Partial coverage  : ' . collect($flagged)->filter(fn($x) => str_contains($x['issues'], 'partial'))->count());
-            $this->line('   - Flat tickers      : ' . collect($flagged)->filter(fn($x) => str_contains($x['issues'], 'flat'))->count());
-            $this->line('   - Illiquid tickers  : ' . collect($flagged)->filter(fn($x) => str_contains($x['issues'], 'illiquid'))->count());
-            $this->newLine();
+        // ---------------------------------------------------------------------
+        // Step 8: Optional export
+        // ---------------------------------------------------------------------
+        if ($exportPath) {
+            $this->exportCsv($exportPath, $rowsForCsv, [
+                'id','symbol','type','bars','coverage','first','last',
+                'lifecycle','recommend','upstream_status','upstream_resultsCount'
+            ]);
+            $this->info("📄 CSV exported to storage/{$exportPath}");
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | 7️⃣ Live verification + bulk re-ingest (unchanged core logic)
-        |--------------------------------------------------------------------------
-        */
-        $actions = [];
-
-        if ($verifyLive && $flagged) {
-            $critical = array_filter($flagged, fn($x) => $x['severity'] === 'Critical');
-            $this->warn('🔍 Performing live Polygon verification for critical tickers...');
-
-            $validator = new PolygonDataValidator(app('App\Services\Validation\Probes\PolygonProbe'));
-            $live = [];
-
-            foreach ($critical as $ct) {
-                $symbol = $ct['symbol'];
-                $type   = $ct['type'];
-                $check  = $validator->verifyTickerUpstream($symbol);
-                $live[$symbol] = $check;
-                $statusMark = $check['found'] ? '✅' : '❌';
-                $this->line("   {$statusMark} {$symbol} ({$type}) → {$check['message']} ({$check['status']})");
-                usleep(250_000);
-            }
-
-            $log->update(['data_source_health' => json_encode($live, JSON_UNESCAPED_SLASHES)]);
-            $this->newLine();
-
-            $minDate = config('polygon.price_history_min_date', '2020-01-01');
-            $maxDate = now()->toDateString();
-            $resolution = config('polygon.default_timespan', 'day');
-            $multiplier = config('polygon.default_multiplier', 1);
-
-            $verified = array_keys(array_filter($live, fn($res) => $res['found'] && $res['status'] == 200));
-            $notFound = array_keys(array_filter($live, fn($res) => !$res['found']));
-
-            if ($verified) {
-                $this->info("✅ " . (is_array($verified) ? count($verified) : 0) . " tickers verified with Polygon (200 OK).");
-                if ($this->confirm('Re-ingest all verified (200) critical tickers at once?', true)) {
-                    foreach ($verified as $symbol) {
-                        $this->callSilent('polygon:ticker-price-histories:ingest', [
-                            '--symbol'     => $symbol,
-                            '--resolution' => "{$multiplier}{$resolution[0]}",
-                            '--from'       => $minDate,
-                            '--to'         => $maxDate,
-                            '--limit'      => 1,
-                        ]);
-                        $actions[$symbol] = [
-                            'action'      => 're-ingest',
-                            'status'      => 'queued',
-                            'from'        => $minDate,
-                            'to'          => $maxDate,
-                            'resolution'  => $resolution,
-                            'checked_at'  => now()->toIso8601String(),
-                        ];
-                    }
-                    $this->info("🚀 Queued re-ingestion for " . count($verified) . " tickers.");
-                }
-            }
-
-            foreach ($notFound as $symbol) {
-                if ($this->confirm("Deactivate {$symbol}? Polygon has no upstream data.", true)) {
-                    DB::table('tickers')
-                        ->where('ticker', $symbol)
-                        ->update([
-                            'is_active_polygon'   => false,
-                            'deactivation_reason' => 'no_data_from_polygon',
-                            'updated_at'          => now(),
-                        ]);
-                    $actions[$symbol] = [
-                        'action'     => 'deactivated',
-                        'status'     => 'complete',
-                        'checked_at' => now()->toIso8601String(),
-                    ];
-                }
-            }
-
-            if ($actions) {
-                $log->update(['actions' => json_encode($actions, JSON_UNESCAPED_SLASHES)]);
-            }
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | 🔚 Final summary + structured log
-        |--------------------------------------------------------------------------
-        */
-        Log::channel('ingest')->info('✅ tickers:integrity-scan complete', [
-            'bands'       => $bands,
-            'avg_health'  => $avg,
-            'median'      => $median,
-            'status'      => $status,
-            'verify_live' => $verifyLive,
-            'actions'     => $actions,
+        Log::channel('ingest')->info('✅ Iteration2 integrity scan complete', [
+            'baseline' => $baseline, 'verify_live' => $verifyLive,
+            'apply' => $apply, 'elapsed' => round(microtime(true) - $start, 3)
         ]);
 
+        $this->line('');
+        $this->info('✅ Done');
         return Command::SUCCESS;
     }
 
-    /** 🎨 Console color helpers */
-    private function formatRed(string $text): string
+    // =========================================================================
+    //  Helper: lightweight Polygon existence probe
+    // =========================================================================
+    protected function probePolygon($client, string $apiKey, string $symbol): array
     {
-        return "\033[1;31m{$text}\033[0m";
+        $url = "https://api.polygon.io/v2/aggs/ticker/{$symbol}/range/1/day/2024-01-01/2024-01-02";
+        try {
+            $resp = $client->get($url, ['limit' => 5, 'adjusted' => 'true', 'apiKey' => $apiKey]);
+            $json = $resp->json();
+            return [
+                'status' => $resp->status(),
+                'polygon_status' => $json['status'] ?? 'UNKNOWN',
+                'resultsCount' => $json['resultsCount'] ?? 0,
+            ];
+        } catch (\Throwable $e) {
+            Log::warning('Polygon probe failed', ['symbol' => $symbol, 'err' => $e->getMessage()]);
+            return ['status' => 0, 'polygon_status' => 'ERROR', 'resultsCount' => 0];
+        }
     }
 
-    private function formatYellow(string $text): string
+    // =========================================================================
+    //  Helper: lifecycle inference
+    // =========================================================================
+    protected function inferLifecycle(?string $first_t, ?string $last_t, ?string $polygonStatus, ?int $upstreamCount): string
     {
-        return "\033[1;33m{$text}\033[0m";
+        if (!$first_t && !$last_t) return 'Empty';
+
+        $first = $first_t ? Carbon::parse($first_t) : null;
+        $last  = $last_t  ? Carbon::parse($last_t)  : null;
+        $now   = Carbon::now();
+
+        $ageDays = $first ? $first->diffInDays($now) : 9999;
+        $sinceLast = $last ? $last->diffInDays($now) : 9999;
+
+        if ($ageDays < 365) return 'IPO_recent';
+        if ($sinceLast > 90 && ($upstreamCount ?? 0) === 0) return 'Defunct_delisted';
+        if ($polygonStatus === 'NOT_FOUND') return 'Defunct_delisted';
+
+        return 'Active_incomplete';
+    }
+
+    // =========================================================================
+    //  Baseline utilities (same as Iteration 1)
+    // =========================================================================
+    protected function computeBaseline(array $counts, string $strategy): int
+    {
+        [$maxBars, $modeBars] = $this->maxAndMode($counts);
+        if (ctype_digit($strategy) && (int)$strategy > 0) return (int)$strategy;
+        return ($strategy === 'mode' ? $modeBars : $maxBars);
+    }
+
+    protected function maxAndMode(array $counts): array
+    {
+        if (empty($counts)) return [0,0,0];
+        $max = max($counts);
+        $freq = array_count_values($counts);
+        arsort($freq);
+        $modeVal = (int) array_key_first($freq);
+        $modeCnt = (int) array_values($freq)[0];
+        return [$max, $modeVal, $modeCnt];
+    }
+
+    protected function exportCsv(string $path, array $rows, array $headers): void
+    {
+        $full = storage_path("app/{$path}");
+        @mkdir(dirname($full), 0775, true);
+        $fp = fopen($full, 'w');
+        fputcsv($fp, $headers);
+        foreach ($rows as $r) {
+            $line = [];
+            foreach ($headers as $h) $line[] = $r[$h] ?? '';
+            fputcsv($fp, $line);
+        }
+        fclose($fp);
     }
 }

@@ -26,4 +26,25 @@ return [
 
     // Minimum number of bars required before meaningful validation
     'min_bars' => 10,
+
+    // Data completeness thresholds (used by integrity scan)
+    'coverage_thresholds' => [
+        'moderate' => 75,   // below this => "partial"
+        'critical' => 25,   // below this => "very sparse"
+    ],
+
+    // Liquidity thresholds (used by integrity scan)
+    'liquidity' => [
+        'min_avg_volume' => 100, // below this => "illiquid"
+    ],
+
+    // Optional flatness tolerance override (integrity scan)
+    'flat_ratio_threshold' => 0.5, // >50% flat bars = 'flat'
+
+    // Label display preferences (used for console reporting)
+    'label_colors' => [
+        'critical' => 'red',
+        'moderate' => 'yellow',
+        'healthy'  => 'green',
+    ],
 ];

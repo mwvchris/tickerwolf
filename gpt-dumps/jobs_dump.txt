@@ -1,4 +1,4 @@
-===== GPT DUMP GENERATED: 2025-10-30T00:32:43Z =====
+===== GPT DUMP GENERATED: 2025-11-03T10:24:19Z =====
 ===== DIRECTORY: app/Jobs =====
 
 app/Jobs/IngestTickerPriceHistoryJob.php
@@ -256,37 +256,145 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
+/**
+ * Class IngestTickerIndicatorsJob
+ *
+ * A queued job that ingests raw technical indicator data
+ * from the Polygon.io API for one or more tickers.
+ *
+ * Overview:
+ * - Each job processes a batch of ticker IDs for specific indicators.
+ * - It invokes the PolygonIndicatorsService for each ticker individually.
+ * - Supports execution as part of distributed batches (Bus::batch()).
+ *
+ * Example usage:
+ *   Bus::batch([
+ *       new IngestTickerIndicatorsJob([1, 2, 3], ['sma_20','ema_50'])
+ *   ])->dispatch();
+ *
+ * Design notes:
+ * - All network I/O is isolated in the service layer.
+ * - This job is network-bound, so concurrency can be high.
+ * - Logging is routed to the 'ingest' channel for consistency.
+ */
 class IngestTickerIndicatorsJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels, Batchable;
 
-    public int $tickerId;
-    public array $indicators;
+    /** @var array<int> */
+    protected array $tickerIds;
 
-    public function __construct(int $tickerId, array $indicators = ['sma_20', 'ema_50', 'rsi_14', 'macd'])
+    /** @var array<string> */
+    protected array $indicators;
+
+    /** @var array{from?:string,to?:string} */
+    protected array $range;
+
+    /** @var int Maximum retry attempts */
+    public int $tries = 3;
+
+    /** @var int Seconds to wait before retrying */
+    public int $backoff = 30;
+
+    /**
+     * @param array<int> $tickerIds
+     * @param array<string> $indicators
+     * @param array{from?:string,to?:string} $range
+     */
+    public function __construct(array $tickerIds = [], array $indicators = [], array $range = [])
     {
-        $this->tickerId = $tickerId;
-        $this->indicators = $indicators;
+        // Defensive initialization ensures non-null before serialization
+        $this->tickerIds  = $tickerIds ?: [];
+        $this->indicators = $indicators ?: [];
+        $this->range      = $range ?: [];
     }
 
+    /**
+     * Execute the ingestion job for all tickers in this batch.
+     */
     public function handle(PolygonIndicatorsService $service): void
     {
-        $ticker = Ticker::find($this->tickerId);
-
-        if (! $ticker) {
-            Log::warning("Ticker ID {$this->tickerId} not found for indicator job.");
+        // Batch safety check — avoids "pendingJobs on null" errors
+        if (method_exists($this, 'batch') && $this->batch()?->cancelled()) {
+            Log::channel('ingest')->warning('⏭️ Skipping IngestTickerIndicatorsJob because the batch was cancelled or missing.', [
+                'class' => static::class,
+                'ticker_ids' => $this->tickerIds,
+            ]);
             return;
         }
 
-        try {
-            $service->fetchIndicators($ticker->ticker, $this->indicators);
-        } catch (Throwable $e) {
-            Log::error("Indicator job failed for {$ticker->ticker}: {$e->getMessage()}");
-            throw $e;
+        // Defensive reinitialization after unserialization
+        $tickerIds  = $this->tickerIds ?? [];
+        $indicators = $this->indicators ?? [];
+        $range      = $this->range ?? [];
+
+        // Job start log marker
+        Log::channel('ingest')->info('🚀 Starting IngestTickerIndicatorsJob', [
+            'ticker_count' => count($tickerIds),
+            'indicators' => $indicators,
+            'range' => $range,
+            'batch_id' => $this->batchId ?? null,
+        ]);
+
+        // Fetch all tickers by ID
+        $tickers = Ticker::whereIn('id', $tickerIds)->get(['id', 'ticker']);
+
+        foreach ($tickers as $ticker) {
+            $symbol = $ticker->ticker;
+
+            // Begin ticker-level ingestion
+            Log::channel('ingest')->info("🌐 Fetching indicators from Polygon", [
+                'ticker' => $symbol,
+                'indicators' => $indicators,
+                'range' => $range,
+            ]);
+
+            try {
+                $service->fetchIndicators($symbol, $indicators, $range);
+
+                // Success marker for this ticker
+                Log::channel('ingest')->info("✅ Polygon indicators ingested successfully", [
+                    'ticker' => $symbol,
+                    'ticker_id' => $ticker->id,
+                    'indicators' => $indicators,
+                ]);
+            } catch (Throwable $e) {
+                // ❌ Handle any failures gracefully with detailed logging
+                Log::channel('ingest')->error("❌ Polygon indicator ingestion failed", [
+                    'ticker' => $symbol,
+                    'ticker_id' => $ticker->id,
+                    'indicators' => $indicators,
+                    'message' => $e->getMessage(),
+                    'trace' => substr($e->getTraceAsString(), 0, 800),
+                ]);
+
+                // Rethrow to mark the job failed for Laravel's retry handling
+                throw $e;
+            }
         }
+
+        // Job complete marker
+        Log::channel('ingest')->info("🏁 IngestTickerIndicatorsJob finished successfully", [
+            'batch_id' => $this->batchId ?? null,
+            'tickers_processed' => count($tickerIds),
+            'indicators' => $indicators,
+        ]);
     }
-}
-app/Jobs/RunTickerAnalysis.php
+
+    /**
+     * Tags for Laravel Horizon monitoring / job grouping.
+     */
+    public function tags(): array
+    {
+        return [
+            'ingest',
+            'polygon',
+            'resolution:1d',
+            'batch:' . ($this->batchId ?? 'none'),
+            'tickers:' . implode(',', $this->tickerIds),
+        ];
+    }
+}app/Jobs/RunTickerAnalysis.php
 
 
 ===== FILE: app/Jobs/RunTickerAnalysis.php =====
@@ -420,6 +528,349 @@ class RunTickerAnalysis implements ShouldQueue
                 $this->analysis->update(['status' => 'unknown']);
             }
         }
+    }
+}app/Jobs/ComputeTickerIndicatorsJob.php
+
+
+===== FILE: app/Jobs/ComputeTickerIndicatorsJob.php =====
+
+<?php
+
+namespace App\Jobs;
+
+use App\Services\Compute\FeaturePipeline;
+use Illuminate\Bus\Batchable;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * ============================================================================
+ *  ComputeTickerIndicatorsJob
+ * ============================================================================
+ *
+ * 🔧 Purpose:
+ *   Queued job responsible for computing technical indicators
+ *   (MACD, ATR, ADX, VWAP, etc.) for one or more tickers.
+ *
+ * 🧠 Design Overview:
+ * ----------------------------------------------------------------------------
+ *   • Delegates all compute logic to `FeaturePipeline`
+ *   • Supports batched execution for thousands of tickers
+ *   • Handles automatic persistence to:
+ *       - `ticker_indicators` (core indicator storage)
+ *       - `ticker_feature_snapshots` (optional)
+ *   • Fully Horizon/queue-monitoring compatible
+ *
+ * 💡 Usage Example:
+ * ----------------------------------------------------------------------------
+ *   // Standard dispatch for explicit tickers + indicators
+ *   dispatch(new ComputeTickerIndicatorsJob(
+ *       tickerIds: [1, 2, 3],
+ *       indicators: ['macd', 'atr', 'adx', 'vwap'],
+ *       range: ['from' => '2023-01-01', 'to' => '2023-12-31']
+ *   ));
+ *
+ *   // Minimal dispatch (used by tickers:backfill-indicators)
+ *   dispatch(new ComputeTickerIndicatorsJob([1, 2, 3], ['macd','atr']));
+ *
+ * ============================================================================
+ */
+class ComputeTickerIndicatorsJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels, Batchable;
+
+    /** @var array<int> IDs of tickers to process. */
+    public array $tickerIds;
+
+    /** @var array<string> Indicator names to compute (e.g. ['macd','atr']). */
+    public array $indicators;
+
+    /** @var array{from?:string,to?:string} Optional date range. */
+    public array $range;
+
+    /** @var array Arbitrary parameter overrides. */
+    public array $params;
+
+    /** @var bool Whether to also generate feature snapshots after DB writes. */
+    public bool $writeSnapshots;
+
+    /** @var int Maximum retry attempts before job is marked as failed. */
+    public int $tries = 3;
+
+    /** @var int Maximum job runtime (seconds). */
+    public int $timeout = 900; // extended slightly for larger batches
+
+    /**
+     * -------------------------------------------------------------------------
+     *  Constructor
+     * -------------------------------------------------------------------------
+     *
+     * @param  array<int>  $tickerIds
+     * @param  array<string>  $indicators
+     * @param  array{from?:string,to?:string}  $range
+     * @param  array  $params
+     * @param  bool  $writeSnapshots
+     */
+    public function __construct(
+        array $tickerIds,
+        array $indicators = [],
+        array $range = [],
+        array $params = [],
+        bool $writeSnapshots = true
+    ) {
+        $this->tickerIds      = $tickerIds;
+        $this->indicators     = $indicators ?: ['macd', 'atr', 'adx', 'vwap'];
+        $this->range          = $range;
+        $this->params         = $params;
+        $this->writeSnapshots = $writeSnapshots;
+    }
+
+    /**
+     * -------------------------------------------------------------------------
+     *  Handle
+     * -------------------------------------------------------------------------
+     * Executes the indicator computation pipeline for each ticker.
+     * Writes results to the database and optionally updates snapshots.
+     * -------------------------------------------------------------------------
+     */
+    public function handle(FeaturePipeline $pipeline): void
+    {
+        // Safety: skip if batch has been cancelled.
+        if (method_exists($this, 'batch') && $this->batch()?->cancelled()) {
+            Log::channel('ingest')->warning('⏭️ Skipping ComputeTickerIndicatorsJob — batch cancelled.', [
+                'tickers' => $this->tickerIds,
+            ]);
+            return;
+        }
+
+        Log::channel('ingest')->info('🚀 Starting ComputeTickerIndicatorsJob', [
+            'tickers'   => $this->tickerIds,
+            'indicators'=> $this->indicators,
+            'range'     => $this->range,
+            'snapshots' => $this->writeSnapshots ? 'enabled' : 'disabled',
+        ]);
+
+        foreach ($this->tickerIds as $tickerId) {
+            try {
+                $result = $pipeline->runForTicker(
+                    tickerId: $tickerId,
+                    indicatorNames: $this->indicators,
+                    range: $this->range,
+                    params: $this->params,
+                    writeCoreToDb: true,
+                    buildSnapshots: $this->writeSnapshots,
+                    primeCache: false
+                );
+
+                Log::channel('ingest')->info('✅ Indicators computed successfully', [
+                    'ticker_id'        => $tickerId,
+                    'rows_inserted'    => $result['inserted'] ?? null,
+                    'snapshots_written'=> $result['snapshots'] ?? null,
+                ]);
+            } catch (\Throwable $e) {
+                Log::channel('ingest')->error('❌ Indicator computation failed', [
+                    'ticker_id' => $tickerId,
+                    'message'   => $e->getMessage(),
+                    'trace'     => substr($e->getTraceAsString(), 0, 800),
+                ]);
+                throw $e; // Allow Laravel retry/backoff
+            }
+        }
+
+        Log::channel('ingest')->info('🏁 ComputeTickerIndicatorsJob complete', [
+            'tickers'    => $this->tickerIds,
+            'indicators' => $this->indicators,
+        ]);
+    }
+
+    /**
+     * -------------------------------------------------------------------------
+     *  Tags for Horizon / Job Monitoring
+     * -------------------------------------------------------------------------
+     */
+    public function tags(): array
+    {
+        return [
+            'compute',
+            'tickers:' . implode(',', array_slice($this->tickerIds, 0, 5)) . (count($this->tickerIds) > 5 ? '...' : ''),
+            'indicators:' . implode(',', $this->indicators),
+            'snapshots:' . ($this->writeSnapshots ? 'on' : 'off'),
+        ];
+    }
+}app/Jobs/BuildTickerSnapshotJob.php
+
+
+===== FILE: app/Jobs/BuildTickerSnapshotJob.php =====
+
+<?php
+
+namespace App\Jobs;
+
+use App\Services\Analytics\FeatureSnapshotBuilder;
+use Illuminate\Bus\Batchable;
+use Illuminate\Bus\Queueable;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Foundation\Bus\Dispatchable;
+use Illuminate\Queue\InteractsWithQueue;
+use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * Class BuildTickerSnapshotJob
+ *
+ * Queued job responsible for building (or previewing) JSON feature snapshots
+ * for one or more tickers across a specified date range.
+ *
+ * Each snapshot represents a merged analytics vector containing:
+ *   - Computed indicators from ticker_indicators
+ *   - Derived analytics (Sharpe Ratio, Beta, Volatility, etc.)
+ *   - Optional placeholders for sentiment/embeddings
+ *
+ * Designed for parallel execution under Laravel’s Bus::batch()
+ * via the TickersBuildSnapshots command.
+ */
+class BuildTickerSnapshotJob implements ShouldQueue
+{
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels, Batchable;
+
+    /** @var array<int> List of ticker IDs to process. */
+    public array $tickerIds;
+
+    /** @var array{from?:string,to?:string} Optional date range for computation. */
+    public array $range;
+
+    /** @var array Optional runtime parameters (unused for now). */
+    public array $params;
+
+    /** @var bool Whether this job runs in dry-run preview mode. */
+    public bool $preview;
+
+    /** @var int Maximum retry attempts for transient failures. */
+    public int $tries = 3;
+
+    /** @var int Timeout (in seconds) per job execution. */
+    public int $timeout = 600;
+
+    /** @var int Backoff delay (seconds) before retrying failed jobs. */
+    public int $backoff = 15;
+
+    /**
+     * @param array<int> $tickerIds
+     * @param array{from?:string,to?:string} $range
+     * @param array $params
+     * @param bool $preview
+     */
+    public function __construct(array $tickerIds, array $range = [], array $params = [], bool $preview = false)
+    {
+        $this->tickerIds = $tickerIds;
+        $this->range     = $range;
+        $this->params    = $params;
+        $this->preview   = $preview;
+    }
+
+    /**
+     * Execute the job.
+     *
+     * For each ticker:
+     *  - Loads indicator data
+     *  - Computes derived metrics
+     *  - Builds JSON feature snapshots
+     *  - Writes or logs results depending on --preview mode
+     */
+    public function handle(FeatureSnapshotBuilder $builder): void
+    {
+        // ---------------------------------------------------------------------
+        // 1️⃣ Batch cancellation safety check
+        // ---------------------------------------------------------------------
+        if (method_exists($this, 'batch') && $this->batch()?->cancelled()) {
+            Log::channel('ingest')->warning('⏭️ Skipping BuildTickerSnapshotJob — parent batch cancelled.', [
+                'class'   => static::class,
+                'tickers' => $this->tickerIds,
+            ]);
+            return;
+        }
+
+        // ---------------------------------------------------------------------
+        // 2️⃣ Job start log
+        // ---------------------------------------------------------------------
+        Log::channel('ingest')->info('🚀 Starting BuildTickerSnapshotJob', [
+            'tickers' => $this->tickerIds,
+            'range'   => $this->range,
+            'preview' => $this->preview,
+            'job_id'  => $this->job?->getJobId() ?? null,
+        ]);
+
+        if ($this->preview) {
+            Log::channel('ingest')->info('💡 Preview mode active — snapshots will be simulated only (no DB writes).', [
+                'tickers' => $this->tickerIds,
+            ]);
+        }
+
+        // ---------------------------------------------------------------------
+        // 3️⃣ Sequentially build snapshots for each ticker
+        // ---------------------------------------------------------------------
+        $totalSnapshots = 0;
+
+        foreach ($this->tickerIds as $index => $tickerId) {
+            $pos = $index + 1;
+            $total = count($this->tickerIds);
+
+            try {
+                Log::channel('ingest')->info("▶️ Building snapshot for ticker {$tickerId} ({$pos}/{$total})", [
+                    'range'   => $this->range,
+                    'preview' => $this->preview,
+                ]);
+
+                $res = $builder->buildForTicker($tickerId, $this->range, $this->params, $this->preview);
+                $snapCount = $res['snapshots'] ?? 0;
+                $totalSnapshots += $snapCount;
+
+                Log::channel('ingest')->info('✅ Snapshot built successfully', [
+                    'ticker_id' => $tickerId,
+                    'snapshots' => $snapCount,
+                    'range'     => $this->range,
+                    'preview'   => $this->preview,
+                ]);
+            } catch (\Throwable $e) {
+                // Handle per-ticker failure safely; let Laravel retry if needed
+                Log::channel('ingest')->error('❌ Snapshot build failed', [
+                    'ticker_id' => $tickerId,
+                    'error'     => $e->getMessage(),
+                    'trace'     => substr($e->getTraceAsString(), 0, 900),
+                    'range'     => $this->range,
+                    'preview'   => $this->preview,
+                ]);
+
+                // Allow retry by rethrowing exception
+                throw $e;
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // 4️⃣ Completion log
+        // ---------------------------------------------------------------------
+        Log::channel('ingest')->info('🏁 BuildTickerSnapshotJob complete', [
+            'tickers'        => $this->tickerIds,
+            'snapshots_total'=> $totalSnapshots,
+            'preview'        => $this->preview,
+        ]);
+    }
+
+    /**
+     * Tags for Laravel Horizon monitoring.
+     */
+    public function tags(): array
+    {
+        return [
+            'snapshots',
+            'tickers:' . implode(',', $this->tickerIds),
+            'preview:' . ($this->preview ? 'true' : 'false'),
+            'range:' . ($this->range['from'] ?? 'none') . '-' . ($this->range['to'] ?? 'none'),
+        ];
     }
 }app/Jobs/IngestTickerFundamentalsJob.php
 

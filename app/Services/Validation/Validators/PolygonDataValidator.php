@@ -6,66 +6,27 @@ use App\Services\Validation\Probes\PolygonProbe;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Carbon\Carbon;
 
 /**
  * ============================================================================
- *  PolygonDataValidator (v2.2 — adds live verifyTickerUpstream)
+ *  PolygonDataValidator
+ *  (v3.1.0 — Hybrid Range Verification + Configurable Quick Window)
  * ============================================================================
  *
  * 🔧 Purpose:
- *   Bridges local Polygon.io–sourced data validation with live upstream
- *   verification. Performs both local completeness checks and on-the-fly
- *   Polygon API probes.
+ *   Enhances live verification logic to support both "quick" (short look-back)
+ *   and "full-range" Polygon API queries, selectable per call. Used by
+ *   TickersIntegrityScanCommand v3.4+ for hybrid scanning performance.
  *
- * 🧠 Behavior:
+ * 🆕 v3.1.0 Enhancements:
  * ----------------------------------------------------------------------------
- *   • validateTicker() → existing local+upstream completeness logic.
- *   • verifyTickerUpstream() → NEW: direct live API check for recent bars.
- * ============================================================================
- *   This validator acts as the “bridge” between **local data health** and
- *   **Polygon upstream truth**. It performs a two-phase analysis:
- *
- *   1️⃣ **Local Completeness Check**
- *       - Confirms the ticker has sufficient rows in `ticker_price_histories`
- *         for the expected date range (e.g. several hundred trading days).
- *       - Flags any tickers with *zero* records or extremely small counts
- *         (`< 5` bars total) as “missing_price_data”.
- *       - Optionally could later expand to detect *partial ranges* (e.g.,
- *         a symbol with data only from 2024 but missing 2023).
- *
- *   2️⃣ **Upstream Root-Cause Probe**
- *       - When local data is missing or empty, the validator calls
- *         `PolygonProbe::checkTickerData()` to determine whether Polygon.io
- *         also reports no data.
- *       - This distinguishes:
- *           🟢 Upstream Empty (Polygon has no data) → “upstream_empty_response”
- *           🟠 Local Failure  (Polygon has data, but we failed to ingest it)
- *           🔴 Upstream Error (Polygon API returned 4xx/5xx or rate-limit)
- *
- *   3️⃣ **Gap and Coverage Analysis**
- *       - The validator can be extended to check for time gaps between
- *         local bars (e.g. ≥5 consecutive missing weekdays) to identify
- *         *partial data availability* cases.
- *       - These “coverage anomalies” will be surfaced as
- *         `'partial_price_history' => ['missing_days' => N]` in results.
- *
- * 🧮 Decision Logic:
- * ----------------------------------------------------------------------------
- *   • If 0 bars locally → mark `missing_price_data` and call PolygonProbe.
- *   • If 1–4 bars → mark as “insufficient sample”.
- *   • If Polygon returns HTTP 200 but empty → `upstream_empty_response`.
- *   • If Polygon returns non-200 → `upstream_error`.
- *   • If Polygon returns valid bars but none locally → `local_ingestion_failure`.
- *
- * 📦 Example Result:
- * ----------------------------------------------------------------------------
- *   [
- *     'issues'       => ['missing_price_data'],
- *     'root_causes'  => ['missing_price_data' => 'upstream_empty_response'],
- *     'upstream'     => ['status' => 200, 'found' => false],
- *     'valid'        => false,
- *   ]
- *
+ *   • Adds `$fullRange` flag to verifyTickerUpstream($symbol, $fullRange = false)
+ *   • Quick mode uses polygon.quick_verify_days_back (default 60)
+ *   • Full range mode uses config date window (2020-01-01 → today)
+ *   • Logs both window type and date boundaries for clarity
+ *   • Retains retries, exponential back-off, and stub-detection logic
+ *   • Produces uniform response structure (`resultsCount` + `count`)
  * ============================================================================
  */
 class PolygonDataValidator
@@ -73,7 +34,7 @@ class PolygonDataValidator
     public function __construct(protected PolygonProbe $probe) {}
 
     /**
-     * Validate Polygon-sourced data for one ticker (local + probe).
+     * ✅ Local DB validation
      */
     public function validateTicker(int $tickerId, string $symbol): array
     {
@@ -84,7 +45,6 @@ class PolygonDataValidator
             'valid'       => true,
         ];
 
-        // 1️⃣ Local completeness check
         $count = DB::table('ticker_price_histories')
             ->where('ticker_id', $tickerId)
             ->count();
@@ -93,7 +53,6 @@ class PolygonDataValidator
             $result['issues'][] = 'missing_price_data';
             $result['valid']    = false;
 
-            // 2️⃣ Probe Polygon upstream (cached probe class)
             $probeResult = $this->probe->checkTickerData($symbol);
             $result['upstream'] = $probeResult;
 
@@ -113,71 +72,164 @@ class PolygonDataValidator
     }
 
     /**
-     * 🔍 Live Polygon.io verification for a ticker (read-only).
+     * 🔍 Live Polygon.io verification (hybrid: quick or full range)
      *
-     * @param  string  $symbol
-     * @param  int     $daysBack  Defaults to 30
-     * @return array<string,mixed>
+     * @param string $symbol     The ticker symbol
+     * @param bool   $fullRange  If true → use full historical window (slow)
+     *                           If false → use quick look-back window (fast)
      */
-    public function verifyTickerUpstream(string $symbol, int $daysBack = 30): array
+    public function verifyTickerUpstream(string $symbol, bool $fullRange = false): array
     {
-        $apiKey = config('services.polygon.key');
-        $now  = now()->format('Y-m-d');
-        $past = now()->subDays($daysBack)->format('Y-m-d');
-        $url  = "https://api.polygon.io/v2/aggs/ticker/{$symbol}/range/1/day/{$past}/{$now}";
+        $apiKey   = config('services.polygon.key');
+        $attempts = (int) config('polygon.verify_stub_retry_attempts', 3);
+        $delays   = (array) config('polygon.verify_stub_delay_schedule', [1, 3, 6]);
 
-        try {
-            $resp = Http::timeout(8)->get($url, ['apiKey' => $apiKey, 'limit' => 5]);
-            $status = $resp->status();
-
-            if ($status === 429) {
-                Log::warning("⚠️ Polygon rate-limit hit during verifyTickerUpstream", ['symbol' => $symbol]);
-                return [
-                    'symbol'     => $symbol,
-                    'status'     => 429,
-                    'found'      => false,
-                    'count'      => 0,
-                    'message'    => 'rate_limited',
-                    'checked_at' => now()->toIso8601String(),
-                ];
-            }
-
-            if (!$resp->ok()) {
-                return [
-                    'symbol'     => $symbol,
-                    'status'     => $status,
-                    'found'      => false,
-                    'count'      => 0,
-                    'message'    => "HTTP {$status}",
-                    'checked_at' => now()->toIso8601String(),
-                ];
-            }
-
-            $json  = $resp->json();
-            $count = $json['resultsCount'] ?? 0;
-            $found = $count > 0;
-
-            return [
-                'symbol'     => $symbol,
-                'status'     => $status,
-                'found'      => $found,
-                'count'      => $count,
-                'message'    => $found ? 'ok' : 'empty',
-                'checked_at' => now()->toIso8601String(),
-            ];
-        } catch (\Throwable $e) {
-            Log::error("❌ verifyTickerUpstream failed", [
-                'symbol' => $symbol,
-                'error'  => $e->getMessage(),
-            ]);
-            return [
-                'symbol'     => $symbol,
-                'status'     => 0,
-                'found'      => false,
-                'count'      => 0,
-                'message'    => $e->getMessage(),
-                'checked_at' => now()->toIso8601String(),
-            ];
+        /*
+        |--------------------------------------------------------------------------
+        | Determine time window (quick vs full)
+        |--------------------------------------------------------------------------
+        */
+        if ($fullRange) {
+            $from = config('polygon.price_history_min_date', '2020-01-01');
+            $to   = config('polygon.price_history_max_date', Carbon::now()->toDateString());
+            $rangeType = 'full';
+        } else {
+            $daysBack = (int) config('polygon.quick_verify_days_back', 60);
+            $from     = Carbon::now()->subDays($daysBack)->toDateString();
+            $to       = Carbon::now()->toDateString();
+            $rangeType = "quick_{$daysBack}d";
         }
+
+        $multiplier = config('polygon.default_multiplier', 1);
+        $timespan   = config('polygon.default_timespan', 'day');
+        $url        = "https://api.polygon.io/v2/aggs/ticker/{$symbol}/range/{$multiplier}/{$timespan}/{$from}/{$to}";
+
+        /*
+        |--------------------------------------------------------------------------
+        | Retry logic (stub detection, back-off, and full JSON normalization)
+        |--------------------------------------------------------------------------
+        */
+        for ($attempt = 1; $attempt <= $attempts; $attempt++) {
+            $t0 = microtime(true);
+
+            try {
+                $resp = Http::timeout(config('polygon.request_timeout', 15))
+                    ->withHeaders(['Accept' => 'application/json'])
+                    ->get($url, [
+                        'adjusted' => 'true',
+                        'sort'     => 'asc',
+                        'limit'    => 50000,
+                        'apiKey'   => $apiKey,
+                    ]);
+
+                $elapsed = round((microtime(true) - $t0) * 1000, 2);
+                $status  = $resp->status();
+                $body    = $resp->body();
+                $bodyLen = strlen($body);
+
+                $json = $resp->json();
+                if (!is_array($json)) {
+                    $json = json_decode($body, true);
+                }
+
+                if (!is_array($json)) {
+                    Log::channel('ingest')->error('❌ Invalid JSON from Polygon', [
+                        'symbol' => $symbol,
+                        'status' => $status,
+                        'range'  => $rangeType,
+                        'body_snippet' => substr($body, 0, 400),
+                    ]);
+                    return $this->emptyResponse($symbol, $status, 'invalid_json', $rangeType);
+                }
+
+                $polygonStatus = $json['status'] ?? 'UNKNOWN';
+                $hasResults    = isset($json['results']) && is_array($json['results']);
+                $count         = $json['resultsCount']
+                    ?? $json['count']
+                    ?? ($hasResults ? count($json['results']) : 0);
+                $found = $count > 0;
+
+                $isStub = (
+                    $polygonStatus === 'DELAYED' &&
+                    !$hasResults &&
+                    $count === 0 &&
+                    $bodyLen < 200
+                );
+
+                Log::channel('ingest')->info('📡 Polygon verifyTickerUpstream', [
+                    'symbol'         => $symbol,
+                    'attempt'        => $attempt,
+                    'status'         => $status,
+                    'polygon_status' => $polygonStatus,
+                    'resultsCount'   => $count,
+                    'found'          => $found,
+                    'hasResults'     => $hasResults,
+                    'isStub'         => $isStub,
+                    'body_bytes'     => $bodyLen,
+                    'latency_ms'     => $elapsed,
+                    'from'           => $from,
+                    'to'             => $to,
+                    'range_type'     => $rangeType,
+                ]);
+
+                if ($isStub && $attempt < $attempts) {
+                    $wait = $delays[$attempt - 1] ?? 2;
+                    Log::channel('ingest')->warning("⏳ Polygon DELAYED stub detected — retrying in {$wait}s", [
+                        'symbol'  => $symbol,
+                        'attempt' => $attempt,
+                        'range'   => $rangeType,
+                    ]);
+                    sleep($wait);
+                    continue;
+                }
+
+                return [
+                    'symbol'         => $symbol,
+                    'status'         => $status,
+                    'polygon_status' => $polygonStatus,
+                    'found'          => $found,
+                    'resultsCount'   => $count,
+                    'count'          => $count,
+                    'message'        => $found ? 'ok' : 'empty',
+                    'range_type'     => $rangeType,
+                    'checked_at'     => now()->toIso8601String(),
+                ];
+
+            } catch (\Throwable $e) {
+                Log::channel('ingest')->error('❌ verifyTickerUpstream exception', [
+                    'symbol'  => $symbol,
+                    'attempt' => $attempt,
+                    'range'   => $rangeType,
+                    'error'   => $e->getMessage(),
+                ]);
+
+                if ($attempt < $attempts) {
+                    $wait = $delays[$attempt - 1] ?? 2;
+                    sleep($wait);
+                    continue;
+                }
+
+                return $this->emptyResponse($symbol, 0, $e->getMessage(), $rangeType);
+            }
+        }
+
+        return $this->emptyResponse($symbol, 0, 'max_attempts_exceeded', $rangeType);
+    }
+
+    /**
+     * 🧩 Empty / fallback response factory
+     */
+    private function emptyResponse(string $symbol, int $status, string $message, string $rangeType = 'unknown'): array
+    {
+        return [
+            'symbol'       => $symbol,
+            'status'       => $status,
+            'found'        => false,
+            'resultsCount' => 0,
+            'count'        => 0,
+            'message'      => $message,
+            'range_type'   => $rangeType,
+            'checked_at'   => now()->toIso8601String(),
+        ];
     }
 }

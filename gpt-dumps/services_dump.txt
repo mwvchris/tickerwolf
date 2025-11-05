@@ -1,4 +1,4 @@
-===== GPT DUMP GENERATED: 2025-10-30T00:32:43Z =====
+===== GPT DUMP GENERATED: 2025-11-03T10:24:19Z =====
 ===== DIRECTORY: app/Services =====
 
 app/Services/TickerSlugService.php
@@ -379,6 +379,24 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Carbon;
 use Throwable;
 
+/**
+ * Service: PolygonPriceHistoryService
+ * -----------------------------------
+ * Responsible for retrieving and persisting historical OHLCV bar data
+ * from the Polygon.io Aggregates API (/v2/aggs/ticker/...).
+ *
+ * This service is used by higher-level ingestion services to:
+ *  - Fetch remote daily bars (open/high/low/close/volume)
+ *  - Handle retry logic, throttling, and server exceptions
+ *  - Upsert resulting bars into ticker_price_histories efficiently
+ *
+ * Logging verbosity is intentionally high to enable granular debugging
+ * of ingestion, response counts, and API behavior differences across
+ * instrument types (CS, PFD, UNIT, ETF, etc.).
+ *
+ * 🚀 v2.6.5 — Added pre-upsert sanitization to skip abnormal numeric values
+ *             that exceed safe column ranges (prevents 22003 SQLSTATE errors).
+ */
 class PolygonPriceHistoryService
 {
     protected string $baseUrl;
@@ -387,15 +405,29 @@ class PolygonPriceHistoryService
     protected int $maxRetries;
     protected string $logChannel;
 
+    /**
+     * Constructor: Initializes configuration and HTTP defaults.
+     */
     public function __construct()
     {
         $this->baseUrl = rtrim(config('services.polygon.base') ?? env('POLYGON_API_BASE', 'https://api.polygon.io'), '/');
         $this->apiKey = config('services.polygon.key') ?? env('POLYGON_API_KEY');
         $this->timeout = (int)(env('POLYGON_API_TIMEOUT', 30));
         $this->maxRetries = (int)(env('POLYGON_API_RETRIES', 3));
-        $this->logChannel = 'polygon';
+        $this->logChannel = 'ingest';
     }
 
+    /**
+     * Fetch aggregated OHLCV data for a ticker between two dates.
+     *
+     * @param  string  $symbol      The ticker symbol (case-sensitive)
+     * @param  int     $multiplier  The aggregation multiplier (usually 1)
+     * @param  string  $timespan    The unit of time (e.g. 'day')
+     * @param  string  $from        ISO date string (YYYY-MM-DD)
+     * @param  string  $to          ISO date string (YYYY-MM-DD)
+     * @param  array   $extraParams Optional extra query params
+     * @return array   The list of returned bars (may be empty)
+     */
     public function fetchAggregates(string $symbol, int $multiplier, string $timespan, string $from, string $to, array $extraParams = []): array
     {
         $endpoint = "/v2/aggs/ticker/{$symbol}/range/{$multiplier}/{$timespan}/{$from}/{$to}";
@@ -404,83 +436,216 @@ class PolygonPriceHistoryService
 
         $attempt = 0;
         $wait = 1;
+        $log = Log::channel($this->logChannel);
+        $startedAt = now()->toDateTimeString();
+
+        $log->info("🧭 [{$startedAt}] FetchAggregates called", [
+            'symbol' => $symbol,
+            'endpoint' => $endpoint,
+            'from' => $from,
+            'to' => $to,
+            'url' => $url,
+        ]);
 
         while (true) {
             $attempt++;
-            try {
-                $resp = Http::timeout($this->timeout)->get($url);
+            $log->debug("📡 Attempt {$attempt} to fetch {$symbol} (wait={$wait}s)");
 
+            try {
+                // Send HTTP request
+                $resp = Http::timeout($this->timeout)->get($url);
+                $status = $resp->status();
+                $body = $resp->body();
+
+                // ✅ Successful HTTP 200
                 if ($resp->successful()) {
                     $json = $resp->json();
-                    Log::channel($this->logChannel)->debug("Polygon raw response for {$symbol} ({$from}→{$to}): " . json_encode($json));
+
+                    if (!is_array($json)) {
+                        $log->error("❌ Invalid JSON response for {$symbol}", [
+                            'status' => $status,
+                            'body_snippet' => substr($body, 0, 300),
+                        ]);
+                        return [];
+                    }
+
+                    $count = $json['resultsCount'] ?? count($json['results'] ?? []);
+                    $log->info("✅ Polygon response for {$symbol}: status={$status}, count={$count}", [
+                        'queryCount' => $json['queryCount'] ?? null,
+                        'statusField' => $json['status'] ?? null,
+                    ]);
+
+                    if ($count === 0) {
+                        $log->warning("⚠️ No results returned for {$symbol}", [
+                            'queryCount' => $json['queryCount'] ?? null,
+                            'resultsCount' => $json['resultsCount'] ?? null,
+                            'statusField' => $json['status'] ?? null,
+                        ]);
+                    }
+
                     return $json['results'] ?? [];
                 }
 
-                if ($resp->status() == 429) {
+                // 🚦 Rate-limited: 429 Too Many Requests
+                if ($status === 429) {
                     $retryAfter = $resp->header('Retry-After') ?? $wait;
-                    Log::channel($this->logChannel)->warning("Polygon 429 for {$symbol}. Retry after {$retryAfter}s (attempt {$attempt})");
+                    $log->warning("⏳ 429 Too Many Requests for {$symbol}, retrying in {$retryAfter}s (attempt {$attempt})");
                     sleep((int)$retryAfter);
-                } elseif ($resp->serverError()) {
+                }
+                // 💥 5xx Server Error
+                elseif ($resp->serverError()) {
+                    $log->warning("⚠️ Server error for {$symbol}: status={$status}");
                     if ($attempt >= $this->maxRetries) {
-                        Log::channel($this->logChannel)->error("Polygon server error for {$symbol} after {$attempt} attempts. Status: {$resp->status()}");
+                        $log->error("❌ Aborting {$symbol} after {$attempt} server errors");
                         break;
                     }
                     sleep($wait);
                     $wait *= 2;
-                } else {
-                    Log::channel($this->logChannel)->warning("Polygon client error for {$symbol}: status {$resp->status()} body: {$resp->body()}");
+                }
+                // ⚠️ 4xx Client Error (e.g. 400/404)
+                else {
+                    $log->warning("⚠️ Client error for {$symbol}: status={$status}", [
+                        'body_snippet' => substr($body, 0, 300),
+                    ]);
                     return [];
                 }
+
             } catch (Throwable $e) {
-                Log::channel($this->logChannel)->error("HTTP error fetching aggregates for {$symbol}: {$e->getMessage()}");
-                if ($attempt >= $this->maxRetries) break;
+                $log->error("💥 HTTP exception on attempt {$attempt} for {$symbol}: {$e->getMessage()}");
+                if ($attempt >= $this->maxRetries) {
+                    $log->error("🚫 Giving up on {$symbol} after {$attempt} attempts");
+                    break;
+                }
                 sleep($wait);
                 $wait *= 2;
             }
 
-            if ($attempt >= ($this->maxRetries + 3)) break;
+            // Stop looping after repeated failures
+            if ($attempt >= ($this->maxRetries + 3)) {
+                $log->error("🛑 Max retry limit reached for {$symbol}");
+                break;
+            }
         }
 
+        $log->warning("🚫 Returning empty result for {$symbol} after {$attempt} attempts");
         return [];
     }
 
+    /**
+     * Upsert Polygon bar data into ticker_price_histories.
+     *
+     * v2.7.0 — Hardened Sanitization Layer
+     * ------------------------------------
+     * This version adds stronger guards against malformed or extreme values
+     * that could trigger SQLSTATE[22003] or silently corrupt analytics data.
+     *
+     * Key protections:
+     *  • Skips bars with any NaN, INF, negative, or absurdly large values.
+     *  • Ensures all numeric fields are finite, positive, and within sane bounds.
+     *  • Logs granular warnings per skipped bar.
+     *
+     * @param  int    $tickerId
+     * @param  string $symbol
+     * @param  string $resolution
+     * @param  array  $bars
+     * @return int
+     */
     public function upsertBars(int $tickerId, string $symbol, string $resolution, array $bars): int
     {
-        if (empty($bars)) return 0;
+        $logger = Log::channel($this->logChannel);
+
+        if (empty($bars)) {
+            $logger->warning("⚠️ No bars provided to upsert for {$symbol}");
+            return 0;
+        }
 
         $now = Carbon::now()->toDateTimeString();
         $rows = [];
+        $mappedCount = 0;
 
         foreach ($bars as $b) {
-            $ts = isset($b['t']) ? Carbon::createFromTimestampMs((int)$b['t']) : null;
-            if (!$ts) continue;
+            try {
+                if (empty($b['t'])) {
+                    $logger->debug("⏳ Skipping bar with missing timestamp for {$symbol}");
+                    continue;
+                }
 
-            $rows[] = [
-                'ticker_id' => $tickerId,
-                'resolution' => $resolution,
-                't' => $ts->toDateTimeString(),
-                'year' => (int)$ts->year,
-                'o' => $b['o'] ?? null,
-                'h' => $b['h'] ?? null,
-                'l' => $b['l'] ?? null,
-                'c' => $b['c'] ?? null,
-                'v' => isset($b['v']) ? (int)$b['v'] : null,
-                'vw' => $b['vw'] ?? null,
-                'raw' => json_encode($b),
-                'created_at' => $now,
-                'updated_at' => $now,
-            ];
+                // 🧩 SANITIZATION: Hardened numeric checks
+                // ------------------------------------------------------
+                $fields = ['o', 'h', 'l', 'c', 'vw'];
+                $valid = true;
+                foreach ($fields as $field) {
+                    if (!array_key_exists($field, $b)) {
+                        continue;
+                    }
+
+                    $val = (float)$b[$field];
+
+                    // Reject NaN, INF, absurdly large, or non-sensical values
+                    if (
+                        !is_finite($val) ||
+                        $val <= 0 ||                        // zero or negative price
+                        $val > 10_000_000 ||                // 10 million upper limit
+                        $val < 0.0001                       // lower bound sanity floor
+                    ) {
+                        $logger->warning("⚠️ Skipping abnormal {$field}={$b[$field]} for {$symbol} at {$b['t']}");
+                        $valid = false;
+                        break;
+                    }
+                }
+
+                if (!$valid) {
+                    continue; // Skip entire bar
+                }
+
+                // Convert Polygon’s millisecond timestamp (UTC) → MySQL datetime
+                $ts = Carbon::createFromTimestampMsUTC((int)$b['t'])->format('Y-m-d H:i:s');
+
+                $rows[] = [
+                    'ticker_id'   => $tickerId,
+                    'resolution'  => $resolution,
+                    't'           => $ts,
+                    'year'        => (int)substr($ts, 0, 4),
+                    'o'           => $b['o'] ?? null,
+                    'h'           => $b['h'] ?? null,
+                    'l'           => $b['l'] ?? null,
+                    'c'           => $b['c'] ?? null,
+                    'v'           => isset($b['v']) ? (int)$b['v'] : null,
+                    'vw'          => $b['vw'] ?? null,
+                    'raw'         => json_encode($b),
+                    'created_at'  => $now,
+                    'updated_at'  => $now,
+                ];
+
+                $mappedCount++;
+            } catch (Throwable $e) {
+                $logger->warning("⚠️ Skipped malformed bar for {$symbol}: {$e->getMessage()}");
+            }
         }
 
-        if (empty($rows)) return 0;
+        if ($mappedCount === 0) {
+            $logger->warning("⚠️ All bars failed to map for {$symbol}");
+            return 0;
+        }
 
-        DB::table('ticker_price_histories')->upsert(
-            $rows,
-            ['ticker_id', 'resolution', 't'],
-            ['o', 'h', 'l', 'c', 'v', 'vw', 'raw', 'updated_at']
-        );
+        try {
+            $before = DB::table('ticker_price_histories')->where('ticker_id', $tickerId)->count();
 
-        return count($rows);
+            DB::table('ticker_price_histories')->upsert(
+                $rows,
+                ['ticker_id', 'resolution', 't'],
+                ['o', 'h', 'l', 'c', 'v', 'vw', 'raw', 'updated_at']
+            );
+
+            $after = DB::table('ticker_price_histories')->where('ticker_id', $tickerId)->count();
+            $inserted = max($after - $before, 0);
+
+            $logger->info("💾 Upserted {$mappedCount} mapped bars for {$symbol} (net change: +{$inserted})");
+            return $mappedCount;
+        } catch (Throwable $e) {
+            $logger->error("❌ Upsert failed for {$symbol}: {$e->getMessage()}");
+            return 0;
+        }
     }
 }app/Services/LLMProviderFactory.php
 
@@ -518,53 +683,2612 @@ namespace App\Services;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
+/**
+ * Service: PolygonTickerPriceHistoryService
+ * -----------------------------------------
+ * Coordinates fetching and storing of historical price data
+ * for a given ticker symbol by delegating API retrieval to
+ * PolygonPriceHistoryService and managing ingestion behavior
+ * (logging, retries, normalization, and data persistence).
+ *
+ * This service adds robustness for ticker symbol casing issues
+ * that arise with non-CS (Common Stock) instruments such as:
+ *   - Preferred shares (e.g., ABRpD, AHTpF)
+ *   - Units (e.g., XYZ.U)
+ *   - ETFs and structured products
+ *
+ * Polygon’s /v2/aggs endpoint is case-sensitive for such symbols,
+ * so this service preserves their mixed case to ensure valid responses.
+ */
 class PolygonTickerPriceHistoryService
 {
+    /**
+     * The underlying low-level Polygon API interface.
+     */
     protected PolygonPriceHistoryService $polygon;
+
+    /**
+     * The logging channel used for ingestion tracking.
+     */
     protected string $logChannel;
 
+    /**
+     * Construct the service.
+     */
     public function __construct(PolygonPriceHistoryService $polygon)
     {
         $this->polygon = $polygon;
-        $this->logChannel = 'polygon';
+        $this->logChannel = 'ingest';
     }
 
     /**
      * Fetch and store historical price bars for a given ticker.
+     *
+     * This method:
+     *  - Normalizes ticker casing based on asset type
+     *  - Requests historical aggregates from Polygon
+     *  - Retries automatically with alternate casing if no results
+     *  - Delegates persistence to PolygonPriceHistoryService::upsertBars()
+     *  - Logs all key steps and results for visibility
+     *
+     * @param  object  $ticker      The Ticker model instance or object
+     * @param  string  $rangeFrom   ISO date string for start of range (e.g. '2020-01-01')
+     * @param  string  $rangeTo     ISO date string for end of range (e.g. '2025-11-03')
      */
     public function fetchAndStore(object $ticker, string $rangeFrom, string $rangeTo): void
     {
         $logger = Log::channel($this->logChannel);
 
-        // ✅ Use correct column from your model
-        $symbol = $ticker->ticker ?? null;
+        // Resolve symbol and sanity-check required attributes
+        $symbol = $ticker->ticker ?? $ticker->symbol ?? null;
 
         if (empty($symbol) || empty($ticker->id)) {
-            $logger->error('Ticker object missing symbol or id', ['ticker' => $ticker]);
+            $logger->error('❌ Ticker object missing symbol or ID', ['ticker' => $ticker]);
             return;
         }
 
-        $symbol = strtoupper(trim($symbol));
+        // Normalize symbol according to asset type
+        $normalizedSymbol = $this->normalizeSymbol($ticker);
         $tickerId = (int)$ticker->id;
         $resolution = '1d';
         $multiplier = 1;
         $timespan = 'day';
 
-        $logger->info("📈 Fetching Polygon data for {$symbol} ({$rangeFrom} → {$rangeTo})");
+        $logger->info("📈 Fetching Polygon data for {$normalizedSymbol} ({$rangeFrom} → {$rangeTo})");
 
         try {
-            $bars = $this->polygon->fetchAggregates($symbol, $multiplier, $timespan, $rangeFrom, $rangeTo);
+            // Attempt initial fetch
+            $bars = $this->polygon->fetchAggregates($normalizedSymbol, $multiplier, $timespan, $rangeFrom, $rangeTo);
 
+            // If Polygon returns nothing, retry with raw/original symbol casing
             if (empty($bars)) {
-                $logger->warning("⚠️ No data returned for {$symbol} ({$rangeFrom} → {$rangeTo}).");
+                $altSymbol = $symbol;
+                if ($altSymbol !== $normalizedSymbol) {
+                    $logger->warning("🔁 No results for {$normalizedSymbol}, retrying with alt case: {$altSymbol}");
+                    $bars = $this->polygon->fetchAggregates($altSymbol, $multiplier, $timespan, $rangeFrom, $rangeTo);
+                }
+            }
+
+            // Still no data? Likely illiquid or unsupported instrument
+            if (empty($bars)) {
+                $logger->warning("⚠️ No data returned for {$normalizedSymbol} ({$rangeFrom} → {$rangeTo}). Possibly illiquid or unsupported.");
                 return;
             }
 
-            $count = $this->polygon->upsertBars($tickerId, $symbol, $resolution, $bars);
-            $logger->info("✅ Stored {$count} bars for {$symbol} ({$rangeFrom} → {$rangeTo})");
+            // Persist to database
+            $count = $this->polygon->upsertBars($tickerId, $normalizedSymbol, $resolution, $bars);
+
+            $logger->info("✅ Stored {$count} bars for {$normalizedSymbol} ({$rangeFrom} → {$rangeTo})");
         } catch (Throwable $e) {
-            $logger->error("❌ Exception fetching/storing data for {$symbol}: {$e->getMessage()}");
+            // Catch and log unexpected runtime exceptions
+            $logger->error("❌ Exception fetching/storing data for {$normalizedSymbol}: {$e->getMessage()}", [
+                'ticker_id' => $ticker->id,
+                'symbol'    => $normalizedSymbol,
+                'trace'     => $e->getTraceAsString(),
+            ]);
         }
+    }
+
+    /**
+     * Normalize ticker casing for Polygon endpoints.
+     *
+     * Polygon’s API is case-sensitive for non-common-stock tickers.
+     * This helper:
+     *   - Uppercases symbols for common stock (type 'CS')
+     *   - Preserves mixed case for preferreds, units, ETFs, etc.
+     *
+     * Example:
+     *   CS   → 'AAPL'
+     *   PFD  → 'ABRpD'
+     *   UNIT → 'XYZ.U'
+     *
+     * @param  object  $ticker
+     * @return string  Normalized symbol string ready for Polygon API
+     */
+    protected function normalizeSymbol(object $ticker): string
+    {
+        $raw = trim($ticker->ticker ?? $ticker->symbol ?? '');
+
+        // Detect asset type if available
+        $type = strtoupper($ticker->type ?? $ticker->asset_type ?? '');
+
+        // Only force-uppercase for standard common stock
+        if ($type === 'CS') {
+            return strtoupper($raw);
+        }
+
+        // Preserve case otherwise
+        return $raw;
+    }
+}app/Services/Compute/FeatureSnapshotBuilder.php
+
+
+===== FILE: app/Services/Compute/FeatureSnapshotBuilder.php =====
+
+<?php
+
+namespace App\Services\Analytics;
+
+use App\Services\Compute\FeaturePipeline;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * Class FeatureSnapshotBuilder
+ *
+ * Generates JSON-encoded “feature vectors” for a given ticker using the
+ * configured snapshot-layer indicators. Each vector represents a daily
+ * aggregation of multiple indicator values (per config/indicators.php).
+ *
+ * Responsibilities:
+ * - Delegates actual math to FeaturePipeline.
+ * - Persists results to ticker_feature_snapshots.
+ * - Called by BuildTickerSnapshotJob or artisan command.
+ *
+ * Example usage:
+ *   $builder = app(FeatureSnapshotBuilder::class);
+ *   $builder->buildForTicker($id, ['from'=>'2020-01-01']);
+ */
+class FeatureSnapshotBuilder
+{
+    public function __construct(private FeaturePipeline $pipeline)
+    {
+    }
+
+    /**
+     * Execute snapshot computation for a single ticker.
+     *
+     * @param int  $tickerId   The ticker’s numeric ID.
+     * @param array{from?:string,to?:string} $range  Optional date filters.
+     * @param array $params  Optional indicator-specific overrides.
+     * @return array{snapshots:int} Number of snapshot records inserted/updated.
+     */
+    public function buildForTicker(int $tickerId, array $range = [], array $params = []): array
+    {
+        $snapshotSet = config('indicators.storage.ticker_feature_snapshots', []);
+
+        if (empty($snapshotSet)) {
+            Log::channel('ingest')->warning('⚠️ No snapshot indicators configured in config/indicators.php.');
+            return ['snapshots' => 0];
+        }
+
+        $result = $this->pipeline->runForTicker(
+            tickerId: $tickerId,
+            indicatorNames: $snapshotSet,
+            range: $range,
+            params: $params,
+            writeCoreToDb: false,
+            buildSnapshots: true,
+            primeCache: false
+        );
+
+        Log::channel('ingest')->info('🧱 Feature snapshot built', [
+            'ticker_id' => $tickerId,
+            'snapshot_count' => $result['snapshots'],
+        ]);
+
+        return ['snapshots' => $result['snapshots']];
+    }
+}app/Services/Compute/FeatureSnapshotService.php
+
+
+===== FILE: app/Services/Compute/FeatureSnapshotService.php =====
+
+<?php
+
+namespace App\Services\Compute;
+
+use App\Models\TickerFeatureSnapshot;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * Class FeatureSnapshotService
+ *
+ * Responsible for consolidating per-indicator rows into compact per-day feature vectors.
+ *
+ * Role in pipeline:
+ * - After indicators are computed for a ticker (via FeaturePipeline),
+ *   this service aggregates all indicator results for each timestamp
+ *   and writes a JSON blob into `ticker_feature_snapshots`.
+ *
+ * Benefits:
+ * - Reduces 20+ indicator rows into one daily record.
+ * - Provides AI/ML-ready structure for model ingestion.
+ * - Decouples heavy computation from data consumption layers.
+ */
+class FeatureSnapshotService
+{
+    /**
+     * Build or update feature snapshots for a single ticker.
+     *
+     * @param int   $tickerId
+     * @param array $rows Array of computed indicators (from FeaturePipeline)
+     *
+     * Expected input format:
+     * [
+     *   ['t' => '2025-10-30', 'indicator' => 'sma_20', 'value' => 142.5, 'meta' => null],
+     *   ['t' => '2025-10-30', 'indicator' => 'ema_12', 'value' => 143.0, 'meta' => null],
+     *   ...
+     * ]
+     *
+     * This will consolidate by timestamp:
+     * {
+     *   "sma_20": 142.5,
+     *   "ema_12": 143.0,
+     *   ...
+     * }
+     */
+    public function upsertSnapshots(int $tickerId, array $rows): void
+    {
+        if (empty($rows)) {
+            Log::channel('ingest')->info("🟡 No rows passed to FeatureSnapshotService", ['ticker_id' => $tickerId]);
+            return;
+        }
+
+        // Group indicators by timestamp
+        $grouped = [];
+        foreach ($rows as $r) {
+            $t = substr($r['t'], 0, 10); // daily resolution
+            $grouped[$t][$r['indicator']] = $r['value'];
+        }
+
+        $now = now()->toDateTimeString();
+        $payload = [];
+
+        foreach ($grouped as $date => $indicators) {
+            $payload[] = [
+                'ticker_id'  => $tickerId,
+                't'          => $date,
+                'indicators' => json_encode($indicators),
+                'created_at' => $now,
+                'updated_at' => $now,
+            ];
+        }
+
+        DB::table('ticker_feature_snapshots')->upsert(
+            $payload,
+            ['ticker_id', 't'],
+            ['indicators', 'updated_at']
+        );
+
+        Log::channel('ingest')->info("📦 Feature snapshots upserted", [
+            'ticker_id' => $tickerId,
+            'snapshots' => count($payload),
+        ]);
+    }
+}app/Services/Compute/Indicators/VolatilityIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/VolatilityIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * VolatilityIndicator
+ *
+ * Computes rolling price volatility using standard deviation of returns.
+ *
+ * Math summary:
+ *   Volatility = StdDev(returns over N) * sqrt(252)
+ *
+ * Characteristics:
+ * - Represents annualized historical volatility (percentage).
+ * - Core metric for portfolio risk and derivative pricing.
+ *
+ * Params:
+ *   - period (int): rolling window (default: 20)
+ */
+class VolatilityIndicator extends BaseIndicator
+{
+    public string $name = 'volatility';
+    public string $displayName = 'Historical Volatility';
+    public bool $multiSeries = false;
+
+    public array $defaults = [
+        'period' => 20,
+    ];
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $opts = $this->opts($params);
+        $period = (int)$opts['period'];
+
+        $closes = array_column($bars, 'c');
+        $returns = $this->returns($closes);
+        $rows = [];
+
+        // Rolling volatility (annualized)
+        for ($i = $period; $i < count($returns); $i++) {
+            $slice = array_slice($returns, $i - $period, $period);
+            $std = $this->stddev($slice);
+            $vol = $std * sqrt(252); // annualize
+            $rows[] = [
+                't' => $bars[$i]['t'],
+                'indicator' => "volatility_{$period}",
+                'value' => round($vol * 100, 6), // convert to %
+                'meta' => json_encode(['std' => $std]),
+            ];
+        }
+
+        return $rows;
+    }
+}app/Services/Compute/Indicators/ADXIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/ADXIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * ADXIndicator
+ *
+ * Computes the Average Directional Index — a trend strength indicator
+ * derived from directional movement (+DI, -DI).
+ *
+ * Math summary:
+ *   +DM = High_t - High_(t-1) if greater than (Low_(t-1) - Low_t)
+ *   -DM = Low_(t-1) - Low_t   if greater than (High_t - High_(t-1))
+ *   TR  = max(High - Low, abs(High - Close_(t-1)), abs(Low - Close_(t-1)))
+ *
+ *   +DI = 100 * (Smoothed +DM / Smoothed TR)
+ *   -DI = 100 * (Smoothed -DM / Smoothed TR)
+ *   DX  = 100 * |(+DI - -DI)| / (+DI + -DI)
+ *   ADX = SMA(DX, N)
+ *
+ * Characteristics:
+ * - Quantifies trend strength (0–100), independent of direction.
+ * - ADX < 20 → weak trend; > 40 → strong trend.
+ *
+ * Params:
+ *   - period (int): smoothing period. Default = 14.
+ */
+class ADXIndicator extends BaseIndicator
+{
+    public string $name = 'adx';
+    public string $displayName = 'Average Directional Index';
+    public bool $multiSeries = true;
+
+    public array $defaults = [
+        'period' => 14,
+    ];
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $opts = $this->opts($params);
+        $period = (int)$opts['period'];
+
+        $n = count($bars);
+        $tr = $plusDM = $minusDM = [];
+
+        // Step 1: Compute TR, +DM, and -DM
+        for ($i = 1; $i < $n; $i++) {
+            $upMove = $bars[$i]['h'] - $bars[$i - 1]['h'];
+            $downMove = $bars[$i - 1]['l'] - $bars[$i]['l'];
+            $plusDM[] = ($upMove > $downMove && $upMove > 0) ? $upMove : 0;
+            $minusDM[] = ($downMove > $upMove && $downMove > 0) ? $downMove : 0;
+            $tr[] = max(
+                $bars[$i]['h'] - $bars[$i]['l'],
+                abs($bars[$i]['h'] - $bars[$i - 1]['c']),
+                abs($bars[$i]['l'] - $bars[$i - 1]['c'])
+            );
+        }
+
+        // Step 2: Compute smoothed DI and DX
+        $rows = [];
+        for ($i = $period - 1; $i < count($tr); $i++) {
+            $trN = array_sum(array_slice($tr, $i - $period + 1, $period));
+            $plusDIN = 100 * (array_sum(array_slice($plusDM, $i - $period + 1, $period)) / $trN);
+            $minusDIN = 100 * (array_sum(array_slice($minusDM, $i - $period + 1, $period)) / $trN);
+            $dx = ($plusDIN + $minusDIN) > 0 ? (abs($plusDIN - $minusDIN) / ($plusDIN + $minusDIN)) * 100 : 0;
+
+            $rows[] = [
+                't' => $bars[$i + 1]['t'],
+                'indicator' => "adx_{$period}",
+                'value' => round($dx, 6),
+                'meta' => json_encode([
+                    '+DI' => round($plusDIN, 6),
+                    '-DI' => round($minusDIN, 6),
+                ]),
+            ];
+        }
+
+        return $rows;
+    }
+}app/Services/Compute/Indicators/BetaIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/BetaIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * BetaIndicator
+ *
+ * Computes the Beta coefficient of a stock relative to a benchmark index.
+ *
+ * Math summary:
+ *   Beta = Covariance(stock_returns, benchmark_returns) / Variance(benchmark_returns)
+ *
+ * Characteristics:
+ * - Measures sensitivity of a stock’s returns relative to market movement.
+ * - Beta > 1: more volatile than market; < 1: less volatile.
+ *
+ * Params:
+ *   - benchmark (array): benchmark series (e.g., S&P500 closes)
+ *   - period (int): lookback window (default: 60)
+ */
+class BetaIndicator extends BaseIndicator
+{
+    public string $name = 'beta';
+    public string $displayName = 'Beta Coefficient';
+    public bool $multiSeries = false;
+
+    public array $defaults = [
+        'period' => 60,
+    ];
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $opts = $this->opts($params);
+        $period = (int)$opts['period'];
+
+        if (empty($params['beta']['benchmark'] ?? null)) {
+            // No benchmark data → skip computation
+            return [];
+        }
+
+        $benchmark = $params['beta']['benchmark'];
+        $closes = array_column($bars, 'c');
+        $rows = [];
+
+        // Compute daily returns
+        $retStock = $this->returns($closes);
+        $retBench = $this->returns($benchmark);
+
+        for ($i = $period; $i < count($retStock); $i++) {
+            $stockSlice = array_slice($retStock, $i - $period, $period);
+            $benchSlice = array_slice($retBench, $i - $period, $period);
+
+            $cov = $this->covariance($stockSlice, $benchSlice);
+            $var = $this->variance($benchSlice);
+            $beta = $var != 0 ? $cov / $var : null;
+
+            if ($beta !== null) {
+                $rows[] = [
+                    't' => $bars[$i]['t'],
+                    'indicator' => "beta_{$period}",
+                    'value' => round($beta, 6),
+                    'meta' => null,
+                ];
+            }
+        }
+
+        return $rows;
+    }
+}app/Services/Compute/Indicators/VWAPIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/VWAPIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * VWAPIndicator
+ *
+ * Computes the Volume Weighted Average Price (VWAP).
+ *
+ * For daily resolution:
+ *   - If Polygon provides 'vw', we use it directly.
+ *   - Otherwise, we approximate:
+ *       VWAP_t = Σ(P_typical_i * V_i) / Σ(V_i)
+ *       where P_typical = (H + L + C) / 3
+ *
+ * Characteristics:
+ * - Represents the average price weighted by volume.
+ * - Often used as intraday fair value benchmark.
+ */
+class VWAPIndicator extends BaseIndicator
+{
+    public string $name = 'vwap';
+    public string $displayName = 'Volume Weighted Average Price';
+    public array $defaults = [];
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $outRows = [];
+
+        $cumPV = 0.0; // cumulative price*volume
+        $cumV  = 0.0; // cumulative volume
+
+        foreach ($bars as $i => $b) {
+            $v  = (float)($b['v'] ?? 0);
+            $vw = $b['vw'] ?? null;
+
+            if ($vw !== null) {
+                // Polygon’s daily VWAP field available
+                $val = (float)$vw;
+            } else {
+                // Compute from running average of typical price * volume
+                $tp = ((float)$b['h'] + (float)$b['l'] + (float)$b['c']) / 3.0;
+                $cumPV += $tp * $v;
+                $cumV  += $v;
+                $val = $cumV > 0 ? $cumPV / $cumV : null;
+            }
+
+            if ($val !== null) {
+                $outRows[] = [
+                    't' => $b['t'],
+                    'indicator' => 'vwap',
+                    'value' => $val,
+                    'meta' => null,
+                ];
+            }
+        }
+
+        return $outRows;
+    }
+}app/Services/Compute/Indicators/EMAIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/EMAIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * EMAIndicator
+ *
+ * Computes exponential moving averages (EMA) on closing prices.
+ *
+ * Math summary:
+ *   EMA_t = (C_t - EMA_{t-1}) * k + EMA_{t-1}, where k = 2 / (n + 1)
+ *
+ * Characteristics:
+ * - Reacts faster than SMA by emphasizing recent prices.
+ * - Common windows: 12, 26, 50, 200.
+ * - Core component for MACD and trend-following systems.
+ */
+class EMAIndicator extends BaseIndicator
+{
+    public string $name = 'ema';
+    public string $displayName = 'Exponential Moving Average';
+    public array $defaults = [
+        'windows' => [12, 26, 50, 200],
+    ];
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $opts = $this->opts($params);
+        $windows = $opts['windows'];
+
+        $closes = array_column($bars, 'c');
+        $outRows = [];
+
+        foreach ($windows as $w) {
+            $series = $this->ema($closes, (int)$w);
+            foreach ($series as $i => $val) {
+                if ($val === null) continue;
+                $outRows[] = [
+                    't' => $bars[$i]['t'],
+                    'indicator' => "ema_{$w}",
+                    'value' => (float)$val,
+                    'meta' => null,
+                ];
+            }
+        }
+
+        return $outRows;
+    }
+}app/Services/Compute/Indicators/SharpeRatioIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/SharpeRatioIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * SharpeRatioIndicator
+ *
+ * Computes the Sharpe Ratio — a measure of risk-adjusted return.
+ *
+ * Math summary:
+ *   Sharpe = (Mean(Returns) - RiskFreeRate) / StdDev(Returns)
+ *
+ * Characteristics:
+ * - Evaluates reward per unit of volatility.
+ * - Higher values indicate better risk-adjusted performance.
+ *
+ * Params:
+ *   - period (int): rolling window (default: 60)
+ *   - risk_free (float): annualized risk-free rate (default: 0.02)
+ */
+class SharpeRatioIndicator extends BaseIndicator
+{
+    public string $name = 'sharpe_ratio';
+    public string $displayName = 'Sharpe Ratio';
+    public bool $multiSeries = false;
+
+    public array $defaults = [
+        'period' => 60,
+        'risk_free' => 0.02,
+    ];
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $opts = $this->opts($params);
+        $period = (int)$opts['period'];
+        $rf = (float)$opts['risk_free'];
+
+        $closes = array_column($bars, 'c');
+        $returns = $this->returns($closes);
+        $rows = [];
+
+        for ($i = $period; $i < count($returns); $i++) {
+            $slice = array_slice($returns, $i - $period, $period);
+            $mean = array_sum($slice) / count($slice);
+            $std = $this->stddev($slice);
+            $sharpe = $std != 0 ? ($mean - ($rf / 252)) / $std : null; // 252 trading days/year
+
+            if ($sharpe !== null) {
+                $rows[] = [
+                    't' => $bars[$i]['t'],
+                    'indicator' => "sharpe_{$period}",
+                    'value' => round($sharpe, 6),
+                    'meta' => json_encode(['mean_return' => $mean, 'std' => $std]),
+                ];
+            }
+        }
+
+        return $rows;
+    }
+}app/Services/Compute/Indicators/RollingCorrelationIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/RollingCorrelationIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * RollingCorrelationIndicator
+ *
+ * Computes the rolling Pearson correlation coefficient between
+ * two price series (e.g., the ticker vs a benchmark like SPY).
+ *
+ * Formula:
+ *   Corr_t = Cov(X_t, Y_t) / (σ_X * σ_Y)
+ *
+ * Characteristics:
+ * - Measures co-movement between two return streams.
+ * - Range: [-1, +1], where 1 = perfect positive correlation.
+ * - Useful for pair-trading and sector alignment studies.
+ *
+ * Params:
+ * - window: int   → Rolling period (e.g., 20)
+ * - benchmark: array<float> → Optional benchmark close series (must align in length)
+ */
+class RollingCorrelationIndicator extends BaseIndicator
+{
+    public string $name = 'rolling_corr';
+    public string $displayName = 'Rolling Correlation Coefficient';
+    public bool $multiSeries = false;
+
+    public array $defaults = [
+        'window' => 20,
+        'benchmark' => [],
+    ];
+
+    /**
+     * Compute rolling correlation between the ticker’s closes and a benchmark.
+     */
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $opts = $this->opts($params);
+
+        $window = (int)$opts['window'];
+        $benchmark = $opts['benchmark'] ?? [];
+
+        $closes = array_column($bars, 'c');
+
+        // If no benchmark provided, correlation cannot be computed.
+        if (empty($benchmark) || count($benchmark) < count($closes)) {
+            return [];
+        }
+
+        // Compute daily returns
+        $retStock = $this->returns($closes);
+        $retBench = $this->returns($benchmark);
+
+        // Align lengths
+        $minCount = min(count($retStock), count($retBench));
+        $retStock = array_slice($retStock, -$minCount);
+        $retBench = array_slice($retBench, -$minCount);
+        $bars = array_slice($bars, -$minCount);
+
+        // Rolling correlation
+        $corr = $this->rollingCorrelation($retStock, $retBench, $window);
+
+        // Output rows
+        $rows = [];
+        foreach ($corr as $i => $val) {
+            if ($val === null) continue;
+            $rows[] = [
+                't' => $bars[$i]['t'],
+                'indicator' => 'rolling_corr_' . $window,
+                'value' => (float)$val,
+                'meta' => null,
+            ];
+        }
+
+        return $rows;
+    }
+}app/Services/Compute/Indicators/MFIIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/MFIIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * MFIIndicator
+ *
+ * Computes the Money Flow Index — a volume-weighted variant of RSI.
+ *
+ * Math summary:
+ *   TP  = (High + Low + Close) / 3
+ *   MF  = TP * Volume
+ *   Positive MF = sum of MF on up days
+ *   Negative MF = sum of MF on down days
+ *   MFI = 100 - (100 / (1 + (PosMF / NegMF)))
+ *
+ * Characteristics:
+ * - Identifies overbought/oversold conditions using both price and volume.
+ * - Range: 0–100; >80 = overbought, <20 = oversold.
+ *
+ * Params:
+ *   - period (int): lookback period (default: 14)
+ */
+class MFIIndicator extends BaseIndicator
+{
+    public string $name = 'mfi';
+    public string $displayName = 'Money Flow Index';
+    public bool $multiSeries = false;
+
+    public array $defaults = [
+        'period' => 14,
+    ];
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $opts = $this->opts($params);
+        $period = (int)$opts['period'];
+
+        $rows = [];
+        $tp = array_map(fn($b) => ($b['h'] + $b['l'] + $b['c']) / 3, $bars);
+        $mf = [];
+
+        // Step 1: Compute Raw Money Flow (TP * Volume)
+        foreach ($bars as $i => $b) {
+            $mf[$i] = $tp[$i] * $b['v'];
+        }
+
+        // Step 2: Calculate MFI based on up/down price changes
+        for ($i = $period; $i < count($bars); $i++) {
+            $posMF = $negMF = 0;
+            for ($j = $i - $period + 1; $j <= $i; $j++) {
+                if ($tp[$j] > $tp[$j - 1]) {
+                    $posMF += $mf[$j];
+                } elseif ($tp[$j] < $tp[$j - 1]) {
+                    $negMF += $mf[$j];
+                }
+            }
+
+            $ratio = $negMF == 0 ? INF : ($posMF / $negMF);
+            $mfi = 100 - (100 / (1 + $ratio));
+
+            $rows[] = [
+                't' => $bars[$i]['t'],
+                'indicator' => "mfi_{$period}",
+                'value' => round($mfi, 6),
+                'meta' => json_encode(['pos_mf' => $posMF, 'neg_mf' => $negMF]),
+            ];
+        }
+
+        return $rows;
+    }
+}app/Services/Compute/Indicators/MACDIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/MACDIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * MACDIndicator
+ *
+ * Computes the MACD oscillator — difference between two EMAs of price.
+ *
+ * Math summary:
+ *   MACD = EMA_fast(C) - EMA_slow(C)
+ *   Signal = EMA(MACD, signal_period)
+ *   Histogram = MACD - Signal
+ *
+ * Characteristics:
+ * - Tracks the convergence/divergence of short vs long EMAs.
+ * - Histogram visually represents momentum.
+ * - Common settings: fast=12, slow=26, signal=9.
+ */
+class MACDIndicator extends BaseIndicator
+{
+    public string $name = 'macd';
+    public string $displayName = 'Moving Average Convergence Divergence';
+    public bool $multiSeries = true;
+
+    public array $defaults = [
+        'fast'   => 12,
+        'slow'   => 26,
+        'signal' => 9,
+    ];
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $opts = $this->opts($params);
+
+        $fast = (int)$opts['fast'];
+        $slow = (int)$opts['slow'];
+        $sig  = (int)$opts['signal'];
+
+        $closes = array_column($bars, 'c');
+
+        // Compute fast and slow EMAs
+        $emaFast = $this->ema($closes, $fast);
+        $emaSlow = $this->ema($closes, $slow);
+
+        $n = count($closes);
+        $macd = array_fill(0, $n, null);
+
+        // MACD = EMA_fast - EMA_slow
+        for ($i = 0; $i < $n; $i++) {
+            if ($emaFast[$i] === null || $emaSlow[$i] === null) continue;
+            $macd[$i] = $emaFast[$i] - $emaSlow[$i];
+        }
+
+        // Determine first valid MACD index
+        $startIdx = null;
+        for ($i = 0; $i < $n; $i++) {
+            if ($macd[$i] !== null) {
+                $startIdx = $i;
+                break;
+            }
+        }
+
+        $signalArr = array_fill(0, $n, null);
+        $histArr   = array_fill(0, $n, null);
+
+        // Compute signal line (EMA of MACD) and histogram
+        if ($startIdx !== null) {
+            $macdValid = array_slice($macd, $startIdx);
+            $sigSeries = $this->ema($macdValid, $sig);
+            foreach ($sigSeries as $k => $sv) {
+                $i = $k + $startIdx;
+                if ($sv === null || $macd[$i] === null) continue;
+                $signalArr[$i] = $sv;
+                $histArr[$i]   = $macd[$i] - $sv;
+            }
+        }
+
+        // Build output rows (MACD in value, signal/histo in meta)
+        $outRows = [];
+        for ($i = 0; $i < $n; $i++) {
+            if ($macd[$i] === null) continue;
+            $meta = json_encode([
+                'signal'    => $signalArr[$i],
+                'histogram' => $histArr[$i],
+            ]);
+            $outRows[] = [
+                't' => $bars[$i]['t'],
+                'indicator' => 'macd',
+                'value' => (float)$macd[$i],
+                'meta' => $meta,
+            ];
+        }
+
+        return $outRows;
+    }
+}app/Services/Compute/Indicators/OBVIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/OBVIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * OBVIndicator
+ *
+ * Computes On-Balance Volume (OBV) — a cumulative volume-based momentum indicator.
+ *
+ * Math summary:
+ *   OBV(t) = OBV(t-1) + Volume(t)   if Close(t) > Close(t-1)
+ *             OBV(t-1) - Volume(t)   if Close(t) < Close(t-1)
+ *             OBV(t-1)               if Close(t) = Close(t-1)
+ *
+ * Characteristics:
+ * - Measures buying/selling pressure as cumulative volume flow.
+ * - Confirms price trends or warns of potential reversals.
+ * - Often used alongside moving averages or divergences.
+ */
+class OBVIndicator extends BaseIndicator
+{
+    public string $name = 'obv';
+    public string $displayName = 'On-Balance Volume';
+    public bool $multiSeries = false;
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $rows = [];
+
+        $obv = 0.0;
+        $prevClose = null;
+
+        // Loop through each bar and accumulate OBV
+        foreach ($bars as $i => $b) {
+            if ($i === 0) {
+                $prevClose = $b['c'];
+                continue;
+            }
+
+            if ($b['c'] > $prevClose) {
+                $obv += $b['v'];
+            } elseif ($b['c'] < $prevClose) {
+                $obv -= $b['v'];
+            }
+
+            $rows[] = [
+                't' => $b['t'],
+                'indicator' => 'obv',
+                'value' => (float)$obv,
+                'meta' => null,
+            ];
+
+            $prevClose = $b['c'];
+        }
+
+        return $rows;
+    }
+}app/Services/Compute/Indicators/DrawdownIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/DrawdownIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * DrawdownIndicator
+ *
+ * Computes the maximum drawdown — the largest peak-to-trough decline over time.
+ *
+ * Math summary:
+ *   Drawdown = (Peak - Current) / Peak
+ *
+ * Characteristics:
+ * - Quantifies downside risk and volatility.
+ * - Expressed as a fraction or percentage.
+ *
+ * Params:
+ *   - none (computed cumulatively)
+ */
+class DrawdownIndicator extends BaseIndicator
+{
+    public string $name = 'drawdown';
+    public string $displayName = 'Maximum Drawdown';
+    public bool $multiSeries = false;
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $rows = [];
+
+        $peak = -INF;
+
+        foreach ($bars as $b) {
+            $peak = max($peak, $b['c']);
+            $dd = $peak > 0 ? (($peak - $b['c']) / $peak) * 100 : 0;
+
+            $rows[] = [
+                't' => $b['t'],
+                'indicator' => 'drawdown',
+                'value' => round($dd, 6),
+                'meta' => json_encode(['peak' => $peak]),
+            ];
+        }
+
+        return $rows;
+    }
+}app/Services/Compute/Indicators/RollingBetaIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/RollingBetaIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * RollingBetaIndicator
+ *
+ * Computes the rolling beta of a stock relative to a benchmark index.
+ *
+ * Formula:
+ *   Beta_t = Cov(returns_stock_t, returns_bench_t) / Var(returns_bench_t)
+ *
+ * Characteristics:
+ * - Captures systematic risk over a rolling window.
+ * - Beta > 1 → stock is more volatile than benchmark.
+ * - Beta < 1 → stock moves less than benchmark.
+ *
+ * Params:
+ * - window: int   → Rolling period (default: 60 days)
+ * - benchmark: array<float> → Benchmark close series (must align in length)
+ */
+class RollingBetaIndicator extends BaseIndicator
+{
+    public string $name = 'rolling_beta';
+    public string $displayName = 'Rolling Beta';
+    public bool $multiSeries = false;
+
+    public array $defaults = [
+        'window' => 60,
+        'benchmark' => [],
+    ];
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $opts = $this->opts($params);
+
+        $window = (int)$opts['window'];
+        $benchmark = $opts['benchmark'] ?? [];
+
+        $closes = array_column($bars, 'c');
+        if (empty($benchmark) || count($benchmark) < count($closes)) {
+            return [];
+        }
+
+        // Compute returns for both
+        $retStock = $this->returns($closes);
+        $retBench = $this->returns($benchmark);
+
+        $minCount = min(count($retStock), count($retBench));
+        $retStock = array_slice($retStock, -$minCount);
+        $retBench = array_slice($retBench, -$minCount);
+        $bars = array_slice($bars, -$minCount);
+
+        // Rolling beta
+        $beta = $this->rollingBeta($retStock, $retBench, $window);
+
+        $rows = [];
+        foreach ($beta as $i => $val) {
+            if ($val === null) continue;
+            $rows[] = [
+                't' => $bars[$i]['t'],
+                'indicator' => 'rolling_beta_' . $window,
+                'value' => (float)$val,
+                'meta' => null,
+            ];
+        }
+
+        return $rows;
+    }
+}app/Services/Compute/Indicators/RSIIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/RSIIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * RSIIndicator
+ *
+ * Computes the RSI (Relative Strength Index), a momentum oscillator.
+ *
+ * Math summary:
+ *   RSI = 100 - [100 / (1 + RS)], where RS = avgGain / avgLoss
+ *   Uses Wilder’s smoothing for avgGain/avgLoss.
+ *
+ * Characteristics:
+ * - Bounded [0,100].
+ * - Commonly interpreted as:
+ *   - Overbought: RSI > 70
+ *   - Oversold: RSI < 30
+ * - Period 14 is the classical default.
+ */
+class RSIIndicator extends BaseIndicator
+{
+    public string $name = 'rsi';
+    public string $displayName = 'Relative Strength Index';
+    public array $defaults = [
+        'period' => 14,
+    ];
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $opts = $this->opts($params);
+        $p = (int)$opts['period'];
+
+        $closes = array_column($bars, 'c');
+        $series = $this->rsi($closes, $p);
+
+        $outRows = [];
+        foreach ($series as $i => $val) {
+            if ($val === null) continue;
+            $outRows[] = [
+                't' => $bars[$i]['t'],
+                'indicator' => "rsi_{$p}",
+                'value' => (float)$val,
+                'meta' => null,
+            ];
+        }
+        return $outRows;
+    }
+}app/Services/Compute/Indicators/ATRIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/ATRIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * ATRIndicator
+ *
+ * Computes the Average True Range — a measure of volatility.
+ *
+ * Math summary:
+ *   TR_t = max(High_t - Low_t, |High_t - Close_{t-1}|, |Low_t - Close_{t-1}|)
+ *   ATR_t = (ATR_{t-1} * (n - 1) + TR_t) / n  (Wilder’s smoothing)
+ *
+ * Characteristics:
+ * - Captures both intraday and gap volatility.
+ * - Unbounded — higher values = higher volatility.
+ * - Common period: 14.
+ */
+class ATRIndicator extends BaseIndicator
+{
+    public string $name = 'atr';
+    public string $displayName = 'Average True Range';
+    public array $defaults = [
+        'period' => 14,
+        'wilder' => true,
+    ];
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $opts = $this->opts($params);
+        $p = (int)$opts['period'];
+
+        $highs  = array_column($bars, 'h');
+        $lows   = array_column($bars, 'l');
+        $closes = array_column($bars, 'c');
+
+        $tr = $this->trueRangeSeries($highs, $lows, $closes);
+        $n  = count($tr);
+        $atr = array_fill(0, $n, null);
+
+        if ($n === 0 || $p <= 0) return [];
+
+        // Wilder’s ATR smoothing: recursive moving average
+        $sum = 0.0;
+        for ($i = 0; $i < $n; $i++) {
+            if ($i < $p) {
+                $sum += (float)$tr[$i];
+                if ($i === $p - 1) $atr[$i] = $sum / $p;
+            } else {
+                $atr[$i] = (($atr[$i - 1] * ($p - 1)) + (float)$tr[$i]) / $p;
+            }
+        }
+
+        // Build output rows
+        $outRows = [];
+        foreach ($atr as $i => $val) {
+            if ($val === null) continue;
+            $outRows[] = [
+                't' => $bars[$i]['t'],
+                'indicator' => "atr_{$p}",
+                'value' => (float)$val,
+                'meta' => null,
+            ];
+        }
+
+        return $outRows;
+    }
+}app/Services/Compute/Indicators/SMAIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/SMAIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * SMAIndicator
+ *
+ * Computes simple moving averages (SMA) over closing prices.
+ *
+ * Math summary:
+ *   SMA_t = (C_t + C_{t-1} + ... + C_{t-n+1}) / n
+ *
+ * Characteristics:
+ * - Non-exponential, equal-weighted moving average.
+ * - Smoother than raw price, but slower to react.
+ * - Often used for support/resistance and trend confirmation.
+ *
+ * Extendability:
+ * - Supports multiple windows (20, 50, 200 by default).
+ * - Each window generates its own indicator series: "sma_20", "sma_50", etc.
+ */
+class SMAIndicator extends BaseIndicator
+{
+    public string $name = 'sma';
+    public string $displayName = 'Simple Moving Average';
+    public array $defaults = [
+        'windows' => [20, 50, 200],
+    ];
+
+    public function compute(array $bars, array $params = []): array
+    {
+        // Normalize bar order to ascending timestamps
+        $bars = $this->normalizeBars($bars);
+
+        // Merge runtime params (from CLI/queue) with module defaults
+        $opts = $this->opts($params);
+        $windows = $opts['windows'];
+
+        // Extract closing prices from bar data
+        $closes = array_column($bars, 'c');
+        $outRows = [];
+
+        // For each requested window, compute SMA and produce one record per valid bar
+        foreach ($windows as $w) {
+            $series = $this->rollingMean($closes, (int)$w);
+            foreach ($series as $i => $val) {
+                if ($val === null) continue; // skip until enough bars exist
+                $outRows[] = [
+                    't' => $bars[$i]['t'],
+                    'indicator' => "sma_{$w}",
+                    'value' => (float)$val,
+                    'meta' => null,
+                ];
+            }
+        }
+
+        return $outRows;
+    }
+}app/Services/Compute/Indicators/BollingerIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/BollingerIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * BollingerIndicator
+ *
+ * Computes Bollinger Bands around a simple moving average.
+ *
+ * Math summary:
+ *   Mid  = SMA(C, period)
+ *   Std  = rolling standard deviation(C, period)
+ *   Upper = Mid + k * Std
+ *   Lower = Mid - k * Std
+ *
+ * Characteristics:
+ * - Dynamic volatility envelope.
+ * - k = 2 (2σ) captures ~95% of price action statistically.
+ * - Squeezes = low volatility, Breakouts = high volatility.
+ */
+class BollingerIndicator extends BaseIndicator
+{
+    public string $name = 'bb';
+    public string $displayName = 'Bollinger Bands';
+    public bool $multiSeries = true;
+
+    public array $defaults = [
+        'period' => 20,
+        'stdevs' => 2.0,
+    ];
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $opts = $this->opts($params);
+        $p = (int)$opts['period'];
+        $k = (float)$opts['stdevs'];
+
+        $closes = array_column($bars, 'c');
+        $sma  = $this->rollingMean($closes, $p);
+        $std  = $this->rollingStd($closes, $p);
+
+        $outRows = [];
+        foreach ($closes as $i => $_) {
+            if ($sma[$i] === null || $std[$i] === null) continue;
+            $mid = $sma[$i];
+            $upper = $mid + $k * $std[$i];
+            $lower = $mid - $k * $std[$i];
+            $meta = json_encode([
+                'mid'   => $mid,
+                'upper' => $upper,
+                'lower' => $lower,
+                'stdev' => $std[$i],
+            ]);
+            $outRows[] = [
+                't' => $bars[$i]['t'],
+                'indicator' => "bb_{$p}_{$k}",
+                'value' => (float)$mid,
+                'meta' => $meta,
+            ];
+        }
+        return $outRows;
+    }
+}app/Services/Compute/Indicators/R2Indicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/R2Indicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * R2Indicator
+ *
+ * Computes the rolling coefficient of determination (R²) between
+ * a ticker’s returns and a benchmark’s returns.
+ *
+ * Formula:
+ *   R²_t = Corr(X_t, Y_t)^2
+ *
+ * Interpretation:
+ * - Measures how much of a stock’s variance is explained by the benchmark.
+ * - R² near 1 means highly benchmark-driven; near 0 means idiosyncratic.
+ *
+ * Params:
+ * - window: int   → Rolling period (e.g., 60 days)
+ * - benchmark: array<float> → Benchmark close series
+ */
+class R2Indicator extends BaseIndicator
+{
+    public string $name = 'r2';
+    public string $displayName = 'Rolling R² (Coefficient of Determination)';
+    public bool $multiSeries = false;
+
+    public array $defaults = [
+        'window' => 60,
+        'benchmark' => [],
+    ];
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $opts = $this->opts($params);
+
+        $window = (int)$opts['window'];
+        $benchmark = $opts['benchmark'] ?? [];
+
+        $closes = array_column($bars, 'c');
+        if (empty($benchmark) || count($benchmark) < count($closes)) {
+            return [];
+        }
+
+        // Compute returns and align
+        $retStock = $this->returns($closes);
+        $retBench = $this->returns($benchmark);
+        $minCount = min(count($retStock), count($retBench));
+        $retStock = array_slice($retStock, -$minCount);
+        $retBench = array_slice($retBench, -$minCount);
+        $bars = array_slice($bars, -$minCount);
+
+        // Rolling correlation → R² = Corr²
+        $corr = $this->rollingCorrelation($retStock, $retBench, $window);
+
+        $rows = [];
+        foreach ($corr as $i => $val) {
+            if ($val === null) continue;
+            $rows[] = [
+                't' => $bars[$i]['t'],
+                'indicator' => 'r2_' . $window,
+                'value' => pow((float)$val, 2),
+                'meta' => null,
+            ];
+        }
+
+        return $rows;
+    }
+}app/Services/Compute/Indicators/StochasticIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/StochasticIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * StochasticIndicator
+ *
+ * Computes the Stochastic Oscillator — a momentum indicator comparing
+ * the current close to a range of recent highs/lows.
+ *
+ * Math summary:
+ *   %K = 100 * (Close - LowestLow(N)) / (HighestHigh(N) - LowestLow(N))
+ *   %D = SMA(%K, 3)
+ *
+ * Characteristics:
+ * - Measures overbought/oversold conditions (0–100 scale).
+ * - %K is the fast line; %D (3-period SMA) is the signal line.
+ * - Common parameters: period = 14.
+ *
+ * Params:
+ *   - period (int): lookback for %K. Default = 14.
+ */
+class StochasticIndicator extends BaseIndicator
+{
+    public string $name = 'stochastic';
+    public string $displayName = 'Stochastic Oscillator';
+    public bool $multiSeries = true;
+
+    public array $defaults = [
+        'period' => 14,
+    ];
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $opts = $this->opts($params);
+        $period = (int)$opts['period'];
+
+        $n = count($bars);
+        $kArr = [];
+        $rows = [];
+
+        // Compute %K line
+        for ($i = $period - 1; $i < $n; $i++) {
+            $window = array_slice($bars, $i - $period + 1, $period);
+            $highs = array_column($window, 'h');
+            $lows  = array_column($window, 'l');
+            $close = $bars[$i]['c'];
+
+            $highN = max($highs);
+            $lowN  = min($lows);
+            $k = ($highN - $lowN) != 0 ? 100 * (($close - $lowN) / ($highN - $lowN)) : 0;
+            $kArr[$i] = $k;
+
+            $rows[] = [
+                't' => $bars[$i]['t'],
+                'indicator' => "stoch_k_{$period}",
+                'value' => round($k, 6),
+                'meta' => null,
+            ];
+        }
+
+        // Compute %D (3-period SMA of %K)
+        $dRows = [];
+        $dPeriod = 3;
+        for ($i = $period - 1 + $dPeriod - 1; $i < $n; $i++) {
+            $slice = array_slice($kArr, $i - $dPeriod + 1, $dPeriod, true);
+            $avg = array_sum($slice) / count($slice);
+            $dRows[] = [
+                't' => $bars[$i]['t'],
+                'indicator' => "stoch_d_{$period}",
+                'value' => round($avg, 6),
+                'meta' => null,
+            ];
+        }
+
+        return array_merge($rows, $dRows);
+    }
+}app/Services/Compute/Indicators/CCIIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/CCIIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * CCIIndicator
+ *
+ * Computes the Commodity Channel Index — a measure of how far the typical price
+ * has diverged from its statistical mean.
+ *
+ * Math summary:
+ *   TP = (High + Low + Close) / 3
+ *   CCI = (TP - SMA(TP, N)) / (0.015 * MeanDeviation(TP, N))
+ *
+ * Characteristics:
+ * - Values above +100 suggest overbought; below -100 suggest oversold.
+ * - More responsive than RSI to short-term price volatility.
+ *
+ * Params:
+ *   - period (int): lookback period. Default = 20.
+ */
+class CCIIndicator extends BaseIndicator
+{
+    public string $name = 'cci';
+    public string $displayName = 'Commodity Channel Index';
+    public bool $multiSeries = false;
+
+    public array $defaults = [
+        'period' => 20,
+    ];
+
+    public function compute(array $bars, array $params = []): array
+    {
+        $bars = $this->normalizeBars($bars);
+        $opts = $this->opts($params);
+        $period = (int)$opts['period'];
+
+        // Compute Typical Price (TP)
+        $tp = array_map(fn($b) => ($b['h'] + $b['l'] + $b['c']) / 3, $bars);
+        $rows = [];
+
+        // For each bar after enough history, compute CCI
+        for ($i = $period - 1; $i < count($tp); $i++) {
+            $slice = array_slice($tp, $i - $period + 1, $period);
+            $sma = array_sum($slice) / $period;
+
+            // Mean deviation of typical price
+            $meanDev = array_sum(array_map(fn($v) => abs($v - $sma), $slice)) / $period;
+            $cci = $meanDev != 0 ? ($tp[$i] - $sma) / (0.015 * $meanDev) : 0;
+
+            $rows[] = [
+                't' => $bars[$i]['t'],
+                'indicator' => "cci_{$period}",
+                'value' => round($cci, 6),
+                'meta' => null,
+            ];
+        }
+
+        return $rows;
+    }
+}app/Services/Compute/Indicators/MomentumIndicator.php
+
+
+===== FILE: app/Services/Compute/Indicators/MomentumIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute\Indicators;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * ============================================================================
+ *  MomentumIndicator
+ * ============================================================================
+ *
+ * Computes the **momentum** of price over one or more configurable lookback windows.
+ *
+ * Formula (absolute mode):
+ *   Momentum = Close(t) - Close(t - N)
+ *
+ * Formula (percentage mode, if `percent` param = true):
+ *   Momentum = ((Close(t) / Close(t - N)) - 1) * 100
+ *
+ * Interpretation:
+ * - Positive → upward acceleration (bullish)
+ * - Negative → downward acceleration (bearish)
+ * - Near zero → neutral or consolidating trend
+ *
+ * Features:
+ * - Supports multiple window configurations (e.g., 10, 20, 50).
+ * - Compatible with hybrid data storage (ticker_indicators + snapshots).
+ * - Returns per-window indicator records using standard key format: momentum_{N}.
+ *
+ * ============================================================================
+ */
+class MomentumIndicator extends BaseIndicator
+{
+    /** @var string Unique short name */
+    public string $name = 'momentum';
+
+    /** @var string Human-readable display name */
+    public string $displayName = 'Momentum';
+
+    /** @var bool Whether this indicator produces multiple keyed outputs */
+    public bool $multiSeries = false;
+
+    /** @var array Default parameters */
+    public array $defaults = [
+        'window'  => 10,        // primary lookback period
+        'period'  => 10,        // alias for backward compatibility
+        'windows' => [10],      // allow multiple simultaneous computations
+        'percent' => false,     // true = percentage change mode
+    ];
+
+    /**
+     * Compute one or more momentum series from OHLCV bar data.
+     *
+     * @param  array $bars   Normalized OHLCV data (ascending by date)
+     * @param  array $params Optional runtime parameters
+     * @return array         Array of ['t','indicator','value','meta'] rows
+     */
+    public function compute(array $bars, array $params = []): array
+    {
+        // Normalize and merge options
+        $bars = $this->normalizeBars($bars);
+        $opts = $this->opts($params);
+
+        // 🔧 Resolve lookback windows
+        $window = (int)($opts['window'] ?? $opts['period'] ?? 10);
+        $windows = (array)($opts['windows'] ?? [$window]);
+        $percent = (bool)($opts['percent'] ?? false);
+
+        $closes = array_column($bars, 'c');
+        $rows   = [];
+
+        foreach ($windows as $win) {
+            $win = (int)$win;
+            if ($win <= 0 || count($closes) <= $win) {
+                continue;
+            }
+
+            for ($i = $win; $i < count($closes); $i++) {
+                $prev = $closes[$i - $win];
+                $curr = $closes[$i];
+
+                if ($prev === 0.0 || $prev === null) {
+                    $value = null;
+                } else {
+                    $value = $percent
+                        ? (($curr / $prev) - 1) * 100
+                        : ($curr - $prev);
+                }
+
+                $rows[] = [
+                    't'         => $bars[$i]['t'],
+                    'indicator' => "momentum_{$win}",
+                    'value'     => $value !== null ? round($value, 6) : null,
+                    'meta'      => null,
+                ];
+            }
+        }
+
+        return $rows;
+    }
+}app/Services/Compute/Registry.php
+
+
+===== FILE: app/Services/Compute/Registry.php =====
+
+<?php
+
+namespace App\Services\Compute;
+
+use App\Services\Compute\Indicators\SMAIndicator;
+use App\Services\Compute\Indicators\EMAIndicator;
+use App\Services\Compute\Indicators\RSIIndicator;
+use App\Services\Compute\Indicators\MACDIndicator;
+use App\Services\Compute\Indicators\ATRIndicator;
+use App\Services\Compute\Indicators\BollingerIndicator;
+use App\Services\Compute\Indicators\VWAPIndicator;
+use App\Services\Compute\Indicators\MomentumIndicator;
+use App\Services\Compute\Indicators\StochasticIndicator;
+use App\Services\Compute\Indicators\CCIIndicator;
+use App\Services\Compute\Indicators\ADXIndicator;
+use App\Services\Compute\Indicators\OBVIndicator;
+use App\Services\Compute\Indicators\MFIIndicator;
+use App\Services\Compute\Indicators\BetaIndicator;
+use App\Services\Compute\Indicators\SharpeRatioIndicator;
+use App\Services\Compute\Indicators\DrawdownIndicator;
+use App\Services\Compute\Indicators\VolatilityIndicator;
+use App\Services\Compute\Indicators\RollingCorrelationIndicator;
+use App\Services\Compute\Indicators\RollingBetaIndicator;
+use App\Services\Compute\Indicators\R2Indicator;
+
+/**
+ * Class Registry
+ *
+ * Central registry that declares which indicator modules are currently active.
+ *
+ * Responsibilities:
+ * - Acts as a discovery hub for all computational indicators.
+ * - Decouples pipeline orchestration (FeaturePipeline) from specific implementations.
+ * - Makes it simple to add, remove, or toggle entire indicator classes.
+ * - Provides dynamic lookup of indicators via their `$name` property.
+ *
+ * Extending the registry:
+ * - When adding a new indicator file under Compute/Indicators, import and append it to activeIndicators().
+ * - Use descriptive `displayName` in indicator classes for clarity in logs/UI.
+ */
+class Registry
+{
+    /**
+     * Return all active indicator module instances.
+     *
+     * Note:
+     * - Each module is stateless; new instances can be safely reused.
+     * - You can disable modules by commenting them out if you want
+     *   to temporarily remove them from the pipeline.
+     *
+     * @return array<BaseIndicator>
+     */
+    public static function activeIndicators(): array
+    {
+        return [
+            // Core trend and moving average indicators
+            new SMAIndicator(),
+            new EMAIndicator(),
+            new RSIIndicator(),
+            new MACDIndicator(),
+            new ATRIndicator(),
+            new BollingerIndicator(),
+            new VWAPIndicator(),
+            new RollingCorrelationIndicator(),
+            new RollingBetaIndicator(),
+            new R2Indicator(),
+
+            // Momentum / Oscillator family
+            new MomentumIndicator(),
+            new StochasticIndicator(),
+            new CCIIndicator(),
+            new ADXIndicator(),
+
+            // Volume-based indicators
+            new OBVIndicator(),
+            new MFIIndicator(),
+
+            // Risk and market-relative indicators
+            new BetaIndicator(),
+            new SharpeRatioIndicator(),
+            new DrawdownIndicator(),
+            new VolatilityIndicator(),
+        ];
+    }
+
+    /**
+     * Select a subset of indicators by short name.
+     *
+     * Example:
+     *   Registry::select(['sma', 'rsi', 'macd']);
+     *
+     * Returns:
+     *   [ SMAIndicator, RSIIndicator, MACDIndicator ]
+     *
+     * Behavior:
+     * - Ignores unknown names to ensure pipeline safety.
+     * - Case-insensitive and whitespace-tolerant.
+     *
+     * @param array<string> $names
+     * @return array<BaseIndicator>
+     */
+    public static function select(array $names): array
+    {
+        $map = [];
+        foreach (self::activeIndicators() as $mod) {
+            $map[strtolower($mod->name)] = $mod;
+        }
+
+        $out = [];
+        foreach ($names as $name) {
+            $k = strtolower(trim($name));
+            if (isset($map[$k])) {
+                $out[] = $map[$k];
+            }
+        }
+
+        return $out;
+    }
+}app/Services/Compute/BaseIndicator.php
+
+
+===== FILE: app/Services/Compute/BaseIndicator.php =====
+
+<?php
+
+namespace App\Services\Compute;
+
+use Illuminate\Support\Facades\Log;
+use Carbon\Carbon;
+
+/**
+ * Class BaseIndicator
+ *
+ * The abstract base for all indicator modules.
+ *
+ * Responsibilities:
+ * - Provide a stable interface for computing indicators from OHLCV bars.
+ * - Offer common math/statistical utilities (SMA, EMA, RSI pieces, rolling stdev, True Range, etc.).
+ * - Normalize/prepare bar inputs and merge module defaults with runtime params.
+ * - Bar normalization (ensures consistent structure for OHLCV data)
+ * - Provide shared math and statistical utilities.
+ * - Offer rolling-window tools for advanced financial analytics.
+ * - Parameter merging (`opts()`)
+ *
+ * Contract:
+ * - Child classes must implement compute(array $bars, array $params = []): array
+ * - compute() returns an array of "rows" (ready to upsert), each row:
+ *   [
+ *     't'         => 'YYYY-MM-DD HH:MM:SS',
+ *     'indicator' => 'sma_20' (or similar),
+ *     'value'     => float|null, // the main series value for that indicator at time t
+ *     'meta'      => ?string,    // optional JSON string for auxiliary series (e.g., MACD signal/histogram)
+ *   ]
+ *
+ * Design goals:
+ * - Keep computation modules clean and math-focused.
+ * - Indicators remain math-only and stateless.
+ * - No DB or API calls at this layer.
+ * - Consistent time alignment and normalized bar inputs.
+ * - Provide reusable helpers for time-series operations.
+ * - All derived classes must define:
+ *      public string $name;
+ *      public string $displayName;
+ *      public bool $multiSeries;
+ *      public array  $defaults;
+ * 
+ * Notes:
+ * - Keep heavy math stateless and pure; avoid DB access here.
+ * - Logging is minimal at this layer; orchestration logs live in pipeline/job/command.
+ */
+
+abstract class BaseIndicator
+{
+    /** @var string Short name of indicator (e.g., 'sma', 'rsi', 'macd'). */
+    public string $name;
+
+    /** @var string Human-readable display name. */
+    public string $displayName = '';
+
+    /** @var array Default parameters for this indicator. */
+    public array $defaults = [];
+
+    /** @var bool Whether this indicator outputs multiple sub-series. */
+    public bool $multiSeries = false;
+
+    /* ======================================================================
+     * ABSTRACT CONTRACT
+     * ====================================================================== */
+
+    /**
+     * Compute normalized indicator rows for upsert.
+     *
+     * @param array<int, array{t:string,o:?float,h:?float,l:?float,c:?float,v:?float,vw:?float}> $bars
+     * @param array $params
+     * @return array<int, array{t:string,indicator:string,value:?float,meta:?string}>
+     */
+    abstract public function compute(array $bars, array $params = []): array;
+
+    /* ======================================================================
+     * CORE NORMALIZATION UTILITIES
+     * ====================================================================== */
+
+    protected function opts(array $params): array
+    {
+        return array_replace_recursive($this->defaults, $params[$this->name] ?? []);
+    }
+
+    protected function normalizeBars(array $bars): array
+    {
+        usort($bars, fn($a, $b) => strcmp($a['t'], $b['t']));
+        return $bars;
+    }
+
+    /* ======================================================================
+     * COMMON MATH / STAT HELPERS
+     * ====================================================================== */
+
+    /** Rolling simple moving average (SMA). */
+    protected function rollingMean(array $values, int $window): array
+    {
+        $n = count($values);
+        $out = array_fill(0, $n, null);
+        if ($window <= 0 || $window > $n) return $out;
+
+        $sum = 0.0;
+        for ($i = 0; $i < $n; $i++) {
+            $sum += (float)($values[$i] ?? 0.0);
+            if ($i >= $window) $sum -= (float)($values[$i - $window] ?? 0.0);
+            if ($i >= $window - 1) $out[$i] = $sum / $window;
+        }
+        return $out;
+    }
+
+    /** Exponential Moving Average (EMA). */
+    protected function ema(array $values, int $window): array
+    {
+        $n = count($values);
+        $out = array_fill(0, $n, null);
+        if ($window <= 0 || $window > $n) return $out;
+
+        $sum = array_sum(array_slice($values, 0, $window));
+        $emaPrev = $sum / $window;
+        $out[$window - 1] = $emaPrev;
+
+        $k = 2 / ($window + 1);
+        for ($i = $window; $i < $n; $i++) {
+            $price = (float)($values[$i] ?? 0.0);
+            $emaPrev = ($price - $emaPrev) * $k + $emaPrev;
+            $out[$i] = $emaPrev;
+        }
+        return $out;
+    }
+
+    /** RSI (Relative Strength Index) using Wilder’s method. */
+    protected function rsi(array $closes, int $period): array
+    {
+        $n = count($closes);
+        $out = array_fill(0, $n, null);
+        if ($period <= 0 || $period >= $n) return $out;
+
+        $gains = [];
+        $losses = [];
+        for ($i = 1; $i < $n; $i++) {
+            $delta = (float)($closes[$i] ?? 0.0) - (float)($closes[$i - 1] ?? 0.0);
+            $gains[$i] = $delta > 0 ? $delta : 0.0;
+            $losses[$i] = $delta < 0 ? -$delta : 0.0;
+        }
+
+        $avgGain = array_sum(array_slice($gains, 1, $period)) / $period;
+        $avgLoss = array_sum(array_slice($losses, 1, $period)) / $period;
+
+        $out[$period] = $avgLoss == 0.0 ? 100.0 : 100.0 - (100.0 / (1.0 + ($avgGain / $avgLoss)));
+
+        for ($i = $period + 1; $i < $n; $i++) {
+            $avgGain = (($avgGain * ($period - 1)) + ($gains[$i] ?? 0.0)) / $period;
+            $avgLoss = (($avgLoss * ($period - 1)) + ($losses[$i] ?? 0.0)) / $period;
+            $out[$i] = $avgLoss == 0.0 ? 100.0 : 100.0 - (100.0 / (1.0 + ($avgGain / $avgLoss)));
+        }
+        return $out;
+    }
+
+    /** Rolling population standard deviation. */
+    protected function rollingStd(array $values, int $window): array
+    {
+        $n = count($values);
+        $out = array_fill(0, $n, null);
+        if ($window <= 1 || $window > $n) return $out;
+
+        $sum = 0.0;
+        $sumSq = 0.0;
+        for ($i = 0; $i < $n; $i++) {
+            $x = (float)($values[$i] ?? 0.0);
+            $sum += $x;
+            $sumSq += $x * $x;
+
+            if ($i >= $window) {
+                $xrm = (float)($values[$i - $window] ?? 0.0);
+                $sum -= $xrm;
+                $sumSq -= $xrm * $xrm;
+            }
+
+            if ($i >= $window - 1) {
+                $mean = $sum / $window;
+                $var = max(0.0, ($sumSq / $window) - ($mean * $mean));
+                $out[$i] = sqrt($var);
+            }
+        }
+        return $out;
+    }
+
+    /** True Range (for ATR). */
+    protected function trueRangeSeries(array $highs, array $lows, array $closes): array
+    {
+        $n = count($highs);
+        $tr = array_fill(0, $n, null);
+        for ($i = 0; $i < $n; $i++) {
+            $h = (float)($highs[$i] ?? 0.0);
+            $l = (float)($lows[$i] ?? 0.0);
+            $cPrev = $i > 0 ? (float)($closes[$i - 1] ?? 0.0) : null;
+            $tr[$i] = max($h - $l, $cPrev !== null ? abs($h - $cPrev) : 0.0, $cPrev !== null ? abs($l - $cPrev) : 0.0);
+        }
+        return $tr;
+    }
+
+    /* ======================================================================
+     * EXTENDED STATISTICS
+     * ====================================================================== */
+
+    protected function returns(array $closes): array
+    {
+        $returns = [];
+        for ($i = 1; $i < count($closes); $i++) {
+            $prev = (float)($closes[$i - 1] ?? 0.0);
+            $curr = (float)($closes[$i] ?? 0.0);
+            $returns[] = ($prev == 0.0) ? 0.0 : ($curr - $prev) / $prev;
+        }
+        return $returns;
+    }
+
+    protected function variance(array $values): float
+    {
+        $values = array_filter($values, fn($v) => is_numeric($v));
+        $n = count($values);
+        if ($n === 0) return 0.0;
+        $mean = array_sum($values) / $n;
+        $sumSq = 0.0;
+        foreach ($values as $v) $sumSq += ($v - $mean) ** 2;
+        return $sumSq / $n;
+    }
+
+    protected function stddev(array $values): float
+    {
+        return sqrt($this->variance($values));
+    }
+
+    protected function covariance(array $x, array $y): float
+    {
+        $n = min(count($x), count($y));
+        if ($n === 0) return 0.0;
+
+        $x = array_slice($x, 0, $n);
+        $y = array_slice($y, 0, $n);
+
+        $meanX = array_sum($x) / $n;
+        $meanY = array_sum($y) / $n;
+
+        $sum = 0.0;
+        for ($i = 0; $i < $n; $i++) $sum += ($x[$i] - $meanX) * ($y[$i] - $meanY);
+        return $sum / $n;
+    }
+
+    /* ======================================================================
+     * GENERIC ROLLING UTILITIES
+     * ====================================================================== */
+
+    protected function rollingApply(array $values, int $window, callable $callback): array
+    {
+        $n = count($values);
+        $out = array_fill(0, $n, null);
+        if ($window <= 0 || $window > $n) return $out;
+
+        for ($i = $window - 1; $i < $n; $i++) {
+            $slice = array_slice($values, $i - $window + 1, $window);
+            $slice = array_filter($slice, fn($v) => is_numeric($v));
+            $out[$i] = !empty($slice) ? $callback($slice) : null;
+        }
+
+        return $out;
+    }
+
+    protected function rollingMeanStd(array $values, int $window): array
+    {
+        $n = count($values);
+        $mean = array_fill(0, $n, null);
+        $std = array_fill(0, $n, null);
+        if ($window <= 1 || $window > $n) return compact('mean', 'std');
+
+        $sum = 0.0;
+        $sumSq = 0.0;
+
+        for ($i = 0; $i < $n; $i++) {
+            $x = (float)($values[$i] ?? 0.0);
+            $sum += $x;
+            $sumSq += $x * $x;
+
+            if ($i >= $window) {
+                $xrm = (float)($values[$i - $window] ?? 0.0);
+                $sum -= $xrm;
+                $sumSq -= $xrm * $xrm;
+            }
+
+            if ($i >= $window - 1) {
+                $mean[$i] = $sum / $window;
+                $var = max(0.0, ($sumSq / $window) - ($mean[$i] * $mean[$i]));
+                $std[$i] = sqrt($var);
+            }
+        }
+
+        return compact('mean', 'std');
+    }
+
+    /* ======================================================================
+     * ADVANCED ROLLING METRICS
+     * ====================================================================== */
+
+    /**
+     * Rolling correlation between two time series.
+     * 
+     * Corr_t = Cov(X_t, Y_t) / (σ_X * σ_Y)
+     */
+    protected function rollingCorrelation(array $x, array $y, int $window): array
+    {
+        $n = min(count($x), count($y));
+        $out = array_fill(0, $n, null);
+        if ($window <= 1 || $window > $n) return $out;
+
+        for ($i = $window - 1; $i < $n; $i++) {
+            $xSlice = array_slice($x, $i - $window + 1, $window);
+            $ySlice = array_slice($y, $i - $window + 1, $window);
+
+            $cov = $this->covariance($xSlice, $ySlice);
+            $stdX = $this->stddev($xSlice);
+            $stdY = $this->stddev($ySlice);
+
+            $out[$i] = ($stdX > 0 && $stdY > 0) ? $cov / ($stdX * $stdY) : null;
+        }
+
+        return $out;
+    }
+
+    /**
+     * Rolling beta: slope of regression of X (stock) vs Y (benchmark).
+     * 
+     * Beta_t = Cov(X_t, Y_t) / Var(Y_t)
+     */
+    protected function rollingBeta(array $x, array $y, int $window): array
+    {
+        $n = min(count($x), count($y));
+        $out = array_fill(0, $n, null);
+        if ($window <= 1 || $window > $n) return $out;
+
+        for ($i = $window - 1; $i < $n; $i++) {
+            $xSlice = array_slice($x, $i - $window + 1, $window);
+            $ySlice = array_slice($y, $i - $window + 1, $window);
+
+            $varY = $this->variance($ySlice);
+            $covXY = $this->covariance($xSlice, $ySlice);
+
+            $out[$i] = ($varY > 0) ? $covXY / $varY : null;
+        }
+
+        return $out;
+    }
+
+    /* ======================================================================
+     * TIMESTAMP NORMALIZATION
+     * ====================================================================== */
+
+    protected function toTimestampString($t): string
+    {
+        if ($t instanceof \DateTimeInterface) return $t->format('Y-m-d H:i:s');
+        if (is_numeric($t)) return Carbon::createFromTimestamp((int)$t)->toDateTimeString();
+        return (string)$t;
+    }
+}app/Services/Compute/FeaturePipeline.php
+
+
+===== FILE: app/Services/Compute/FeaturePipeline.php =====
+
+<?php
+
+namespace App\Services\Compute;
+
+use App\Models\Ticker;
+use App\Models\TickerPriceHistory;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Carbon\Carbon;
+
+/**
+ * ============================================================================
+ *  FeaturePipeline
+ * ============================================================================
+ *
+ * 🔧 Purpose:
+ *   The FeaturePipeline acts as the **hybrid computation orchestrator** for
+ *   TickerWolf’s analytical engine. It coordinates:
+ *     • Retrieval of OHLCV bars (daily price/volume data)
+ *     • Execution of indicator modules (SMA, MACD, Momentum, etc.)
+ *     • Intelligent routing of results to storage layers:
+ *         - Core DB layer      → ticker_indicators
+ *         - Snapshot JSON layer→ ticker_feature_snapshots
+ *         - Cache layer        → in-memory via Laravel Cache
+ *
+ * 🧠 Design Philosophy:
+ *   - Each indicator is computed **once per run**; outputs are routed to all
+ *     relevant destinations (DB, cache, snapshot) according to config policy.
+ *   - The pipeline dynamically adapts to indicator definitions declared in
+ *     `config/indicators.php`.
+ *   - Multi-window indicators (e.g., SMA_50, Momentum_10) are auto-parsed.
+ *   - The system enforces consistent parameter normalization (`period` ⇄ `window`).
+ *
+ * ⚙️ Invocation Contexts:
+ *   - Called by `BuildTickerSnapshotJob` / `TickersComputeIndicators` / others.
+ *   - Safe for parallel execution inside Bus::batch().
+ *
+ * ============================================================================
+ */
+class FeaturePipeline
+{
+    /**
+     * Execute the hybrid computation pipeline for a single ticker.
+     *
+     * @param  int            $tickerId        Database ID of the ticker
+     * @param  array<string>  $indicatorNames  Optional list of indicator names
+     * @param  array{from?:string,to?:string} $range Date range filter (ISO8601)
+     * @param  array          $params          Per-module runtime parameter overrides
+     * @param  bool           $writeCoreToDb   Persist outputs to ticker_indicators
+     * @param  bool           $buildSnapshots  Aggregate and persist JSON snapshots
+     * @param  bool           $primeCache      Cache “cache_only” indicators in Redis/file
+     * @return array{inserted:int,snapshots:int,cache:int} Summary of operation counts
+     */
+    public function runForTicker(
+        int $tickerId,
+        array $indicatorNames = [],
+        array $range = [],
+        array $params = [],
+        bool $writeCoreToDb = true,
+        bool $buildSnapshots = false,
+        bool $primeCache = false
+    ): array {
+        /*
+        |--------------------------------------------------------------------------
+        | 1. Ticker validation
+        |--------------------------------------------------------------------------
+        */
+        $ticker = Ticker::find($tickerId);
+        if (!$ticker) {
+            Log::channel('ingest')->warning('⚠️ FeaturePipeline aborted: ticker not found', [
+                'ticker_id' => $tickerId,
+            ]);
+            return ['inserted' => 0, 'snapshots' => 0, 'cache' => 0];
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 2. Load indicator configuration policy
+        |--------------------------------------------------------------------------
+        | This configuration drives the entire routing logic. Each section in
+        | config/indicators.php defines where indicator results should be stored.
+        */
+        $storage   = config('indicators.storage');
+        $defaults  = config('indicators.defaults');
+        $cacheTtl  = (int) (config('indicators.cache_ttl.cache_only') ?? 86400);
+
+        $coreSet     = $storage['ticker_indicators']        ?? ['macd','atr','adx','vwap'];
+        $snapshotSet = $storage['ticker_feature_snapshots'] ?? [];
+        $cacheSet    = $storage['cache_only']               ?? [];
+        $onDemandSet = $storage['on_demand']                ?? [];
+
+        /*
+        |--------------------------------------------------------------------------
+        | 3. Determine which indicators to compute
+        |--------------------------------------------------------------------------
+        | If no explicit list is passed, we compute the full union of all tiers.
+        */
+        if (empty($indicatorNames)) {
+            $indicatorNames = array_values(array_unique(array_merge(
+                $coreSet, $snapshotSet, $cacheSet, $onDemandSet
+            )));
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 4. Parse indicator names (supporting suffix patterns)
+        |--------------------------------------------------------------------------
+        | Handles flexible module naming such as:
+        |   "sma_50"      → SMA with window=50
+        |   "momentum_10" → Momentum with window=10
+        |   "ema_200"     → EMA with window=200
+        | Also normalizes `period` ⇄ `window` for cross-module compatibility.
+        */
+        $parsedIndicators = [];
+        foreach ($indicatorNames as $name) {
+            $name = trim($name);
+            $paramsForThis = $params;
+
+            if (preg_match('/^([a-zA-Z]+)_(\d{1,4})$/', $name, $m)) {
+                $base   = strtolower($m[1]);
+                $suffix = (int) $m[2];
+                $paramsForThis[$base]['window'] = $suffix;
+                $paramsForThis[$base]['period'] = $suffix; // normalized alias
+                $parsedIndicators[] = [
+                    'name'   => $base,
+                    'params' => $paramsForThis[$base] ?? [],
+                    'alias'  => $name,
+                ];
+            } else {
+                $base = strtolower($name);
+                $parsedIndicators[] = [
+                    'name'   => $base,
+                    'params' => $params[$base] ?? [],
+                    'alias'  => $name,
+                ];
+            }
+        }
+
+        // Debug: show exactly what we intend to compute, and with what params.
+        Log::channel('ingest')->info('🔎 FeaturePipeline parsed indicators', [
+            'parsed' => array_map(fn($p) => [
+                'name'   => $p['name'],
+                'alias'  => $p['alias'],
+                'params' => $p['params'],
+            ], $parsedIndicators),
+        ]);
+
+        /*
+        |--------------------------------------------------------------------------
+        | 5. Resolve active indicator modules
+        |--------------------------------------------------------------------------
+        | Registry::select dynamically maps module names → instantiated classes.
+        */
+        $moduleNames = array_unique(array_map(fn($p) => $p['name'], $parsedIndicators));
+        Log::channel('ingest')->info('🧩 FeaturePipeline selecting modules', [
+            'requested' => $moduleNames,
+        ]);
+        $modules = Registry::select($moduleNames);
+        Log::channel('ingest')->info('✅ Registry selected modules', [
+            'count' => count($modules),
+            'names' => array_map(fn($m) => $m->name, $modules),
+        ]);
+
+        if (empty($modules)) {
+            Log::channel('ingest')->warning('⚠️ No valid indicator modules resolved', [
+                'ticker' => $ticker->ticker,
+            ]);
+            return ['inserted' => 0, 'snapshots' => 0, 'cache' => 0];
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 6. Load OHLCV bars (daily resolution)
+        |--------------------------------------------------------------------------
+        */
+        $q = TickerPriceHistory::query()
+            ->where('ticker_id', $tickerId)
+            ->where('resolution', '1d');
+
+        if (!empty($range['from'])) $q->where('t', '>=', $range['from']);
+        if (!empty($range['to']))   $q->where('t', '<=', $range['to']);
+
+        $bars = $q->orderBy('t', 'asc')
+            ->get(['t', 'o', 'h', 'l', 'c', 'v', 'vw'])
+            ->map(fn($row) => [
+                't'  => Carbon::parse($row->t)->toDateTimeString(),
+                'o'  => (float) $row->o,
+                'h'  => (float) $row->h,
+                'l'  => (float) $row->l,
+                'c'  => (float) $row->c,
+                'v'  => (float) $row->v,
+                'vw' => (float) $row->vw,
+            ])
+            ->values()
+            ->all();
+
+        if (empty($bars)) {
+            Log::channel('ingest')->warning('⚠️ No OHLCV bars found for ticker', [
+                'ticker' => $ticker->ticker,
+                'range'  => $range,
+            ]);
+            return ['inserted' => 0, 'snapshots' => 0, 'cache' => 0];
+        }
+
+        Log::channel('ingest')->info('▶️ FeaturePipeline start', [
+            'ticker'  => $ticker->ticker,
+            'modules' => array_map(fn($m) => $m->name, $modules),
+            'range'   => $range,
+            'bars'    => count($bars),
+        ]);
+
+        /*
+        |--------------------------------------------------------------------------
+        | 7. Compute indicators and route results
+        |--------------------------------------------------------------------------
+        | Each indicator module returns rows in the shape:
+        |   ['t' => timestamp, 'indicator' => name, 'value' => float|null, 'meta' => mixed]
+        */
+        $dbRows         = [];
+        $snapshotByDate = [];
+        $cacheCount     = 0;
+
+        foreach ($parsedIndicators as $pi) {
+            $module = collect($modules)->firstWhere('name', $pi['name']);
+            if (!$module) {
+                Log::channel('ingest')->warning('⚠️ Indicator module missing (skipped)', ['name' => $pi['name']]);
+                continue;
+            }
+
+            // Merge defaults with runtime params. Normalize period ↔ window.
+            $modParams = array_replace_recursive($defaults[$pi['name']] ?? [], $pi['params'] ?? []);
+            if (isset($modParams['period']) && !isset($modParams['window'])) {
+                $modParams['window'] = $modParams['period'];
+            }
+
+            $rows = $module->compute($bars, $modParams);
+
+            // 🔬 Post-compute probe: row count & first row sample (helps debug momentum_10)
+            $firstSample = $rows[0] ?? null;
+            Log::channel('ingest')->info('🧮 Module computed', [
+                'ticker' => $ticker->ticker,
+                'module' => $pi['alias'] ?? $pi['name'],
+                'rows'   => count($rows),
+                'params' => $modParams,
+                'sample' => $firstSample,
+            ]);
+
+            foreach ($rows as $r) {
+                $t = isset($r['t']) ? Carbon::parse($r['t'])->toDateTimeString() : null;
+                if (!$t) continue;
+
+                // Snapshot Layer: collect configured indicators into per-day JSON
+                if (in_array($pi['name'], $snapshotSet, true)) {
+                    $day = substr($t, 0, 10);
+                    $snapshotByDate[$day] = $snapshotByDate[$day] ?? [];
+                    $snapshotByDate[$day][$r['indicator']] = [
+                        'value' => $r['value'],
+                        'meta'  => $r['meta'],
+                    ];
+                }
+
+                // Core DB Layer: write only for explicitly configured core metrics
+                if ($writeCoreToDb && in_array($pi['name'], $coreSet, true)) {
+                    $dbRows[] = [
+                        'ticker_id'  => $ticker->id,
+                        'resolution' => '1d',
+                        't'          => $t,
+                        'indicator'  => $r['indicator'],
+                        'value'      => $r['value'],
+                        'meta'       => $r['meta'],
+                        'created_at' => now()->toDateTimeString(),
+                        'updated_at' => now()->toDateTimeString(),
+                    ];
+                }
+
+                // Cache Layer: compact per-day blob for UI speed
+                if ($primeCache && in_array($pi['name'], $cacheSet, true)) {
+                    $cacheKey = "tw:ind:{$ticker->id}:{$pi['name']}:{$t}";
+                    Cache::put($cacheKey, [
+                        't'         => $t,
+                        'indicator' => $r['indicator'],
+                        'value'     => $r['value'],
+                        'meta'      => $r['meta'],
+                    ], $cacheTtl);
+                    $cacheCount++;
+                }
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 8. Persist results
+        |--------------------------------------------------------------------------
+        | - ticker_indicators           → upsert individual indicator records
+        | - ticker_feature_snapshots   → upsert aggregated JSON blobs
+        */
+        $inserted = 0;
+        foreach (array_chunk($dbRows, 1000) as $chunk) {
+            DB::table('ticker_indicators')->upsert(
+                $chunk,
+                ['ticker_id', 'resolution', 't', 'indicator'],
+                ['value', 'meta', 'updated_at']
+            );
+            $inserted += count($chunk);
+        }
+
+        $snapshots = 0;
+        if ($buildSnapshots && !empty($snapshotByDate)) {
+            $payload = [];
+            $now = now()->toDateTimeString();
+            foreach ($snapshotByDate as $day => $kv) {
+                $payload[] = [
+                    'ticker_id'   => $ticker->id,
+                    't'           => "{$day} 00:00:00",
+                    'indicators'  => json_encode($kv, JSON_UNESCAPED_SLASHES),
+                    'created_at'  => $now,
+                    'updated_at'  => $now,
+                ];
+            }
+            foreach (array_chunk($payload, 1000) as $chunk) {
+                DB::table('ticker_feature_snapshots')->upsert(
+                    $chunk,
+                    ['ticker_id', 't'],
+                    ['indicators', 'updated_at']
+                );
+                $snapshots += count($chunk);
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 9. Final logging and return summary
+        |--------------------------------------------------------------------------
+        */
+        Log::channel('ingest')->info('✅ FeaturePipeline complete', [
+            'ticker' => $ticker->ticker,
+            'inserted_core_rows' => $inserted,
+            'snapshots_upserted' => $snapshots,
+            'cache_primed'       => $cacheCount,
+        ]);
+
+        return ['inserted' => $inserted, 'snapshots' => $snapshots, 'cache' => $cacheCount];
     }
 }app/Services/BatchMonitorService.php
 
@@ -579,62 +3303,126 @@ use App\Models\JobBatch;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
+/**
+ * ============================================================================
+ *  BatchMonitorService
+ * ============================================================================
+ *
+ *  This service provides a thin abstraction layer around the `job_batches`
+ *  table, which is managed by both:
+ *      • Laravel's native Bus batching system (via Bus::batch)
+ *      • TickerWolf's custom ingestion orchestration layer
+ *
+ *  It allows ingestion commands, cron jobs, and queued tasks to:
+ *      - Create new batch records
+ *      - Track incremental progress and completion
+ *      - Record failures and pending counts
+ *      - Keep a hybrid timestamp model:
+ *          • `created_at`, `finished_at`, `cancelled_at` → UNIX epoch (INT)
+ *          • `updated_at` → full DATETIME (timestamp)
+ *
+ *  This dual timestamp model ensures full compatibility with:
+ *      • Laravel’s core `Illuminate\Bus\DatabaseBatchRepository`
+ *      • Custom ORM-based progress tracking and log annotations
+ * ============================================================================
+ */
 class BatchMonitorService
 {
     /**
-     * Create a new batch record.
+     * ------------------------------------------------------------------------
+     *  Create a new batch record
+     * ------------------------------------------------------------------------
+     *  Creates an entry in the `job_batches` table to represent a new
+     *  ingestion or compute batch. This ensures a unified view between
+     *  Laravel's Bus repository and our custom ingestion monitor.
+     *
+     * @param  string  $name       Human-readable batch name (e.g. command name)
+     * @param  int     $totalJobs  Total number of jobs in the batch
+     * @return JobBatch|null
      */
     public static function createBatch(string $name, int $totalJobs): ?JobBatch
     {
         try {
             return JobBatch::create([
-                'name'          => $name,
-                'total_jobs'    => $totalJobs,
-                'pending_jobs'  => $totalJobs,
-                'failed_jobs'   => 0,
-                'processed_jobs'=> 0,
-                'status'        => 'running',
-                'created_at'    => now(),
-                'updated_at'    => now(),
+                'name'           => $name,
+                'total_jobs'     => $totalJobs,
+                'pending_jobs'   => $totalJobs,
+                'failed_jobs'    => 0,
+                'processed_jobs' => 0,
+                'status'         => 'running',
+
+                // ✅ Use UNIX timestamps (INT) for Laravel Bus compatibility
+                'created_at'     => now()->getTimestamp(),
+
+                // ✅ Keep updated_at as full DATETIME for Eloquent touch()
+                'updated_at'     => now(),
             ]);
         } catch (Throwable $e) {
-            Log::channel('ingest')->error("❌ Failed to create batch record: {$e->getMessage()}");
+            Log::channel('ingest')->error("❌ Failed to create batch record", [
+                'batch'  => $name,
+                'error'  => $e->getMessage(),
+            ]);
             return null;
         }
     }
 
     /**
-     * Increment progress for a batch as jobs complete successfully.
+     * ------------------------------------------------------------------------
+     *  Increment progress as jobs complete successfully
+     * ------------------------------------------------------------------------
+     *  Increments the processed count, decrements pending jobs,
+     *  and automatically marks the batch complete if all jobs finish.
+     *
+     * @param  string       $batchName  Batch name to update
+     * @param  string|null  $ticker     Optional ticker symbol for context
+     * @return void
      */
     public static function incrementProgress(string $batchName, ?string $ticker = null): void
     {
         try {
             $batch = JobBatch::where('name', $batchName)->latest('id')->first();
+
             if ($batch) {
                 $batch->increment('processed_jobs');
                 $batch->decrement('pending_jobs', min(1, $batch->pending_jobs));
-                $batch->touch();
+                $batch->touch(); // updates updated_at (DATETIME)
 
-                Log::channel('ingest')->info("📈 Batch progress incremented for {$batchName}", [
-                    'ticker' => $ticker,
+                Log::channel('ingest')->info("📈 Batch progress incremented", [
+                    'batch'          => $batchName,
+                    'ticker'         => $ticker,
                     'processed_jobs' => $batch->processed_jobs,
                     'pending_jobs'   => $batch->pending_jobs,
                 ]);
 
-                // Optionally auto-complete batch if all jobs are done
+                // Auto-complete once all jobs are finished
                 if ($batch->pending_jobs <= 0) {
                     $batch->update(['status' => 'complete']);
+                    Log::channel('ingest')->info("✅ Batch marked complete", [
+                        'batch' => $batchName,
+                    ]);
                 }
             } else {
-                Log::channel('ingest')->warning("⚠️ incrementProgress: No batch found for {$batchName}");
+                Log::channel('ingest')->warning("⚠️ incrementProgress: No batch found", [
+                    'batch' => $batchName,
+                ]);
             }
         } catch (Throwable $e) {
-            Log::channel('ingest')->error("❌ incrementProgress failed for {$batchName}: {$e->getMessage()}");
+            Log::channel('ingest')->error("❌ incrementProgress failed", [
+                'batch' => $batchName,
+                'error' => $e->getMessage(),
+            ]);
         }
     }
 
     /**
-     * Decrement pending count (e.g., when a job finishes).
+     * ------------------------------------------------------------------------
+     *  Decrement pending count (e.g., when a job finishes)
+     * ------------------------------------------------------------------------
+     *  Manually decrements the `pending_jobs` counter and increments
+     *  `processed_jobs`, ensuring real-time batch progress visibility.
+     *
+     * @param  JobBatch  $jobBatch
+     * @return void
      */
     public static function decrementPending(JobBatch $jobBatch): void
     {
@@ -643,12 +3431,23 @@ class BatchMonitorService
             $jobBatch->increment('processed_jobs');
             $jobBatch->touch();
         } catch (Throwable $e) {
-            Log::channel('ingest')->warning("⚠️ decrementPending failed: {$e->getMessage()}");
+            Log::channel('ingest')->warning("⚠️ decrementPending failed", [
+                'batch' => $jobBatch->name ?? 'unknown',
+                'error' => $e->getMessage(),
+            ]);
         }
     }
 
     /**
-     * Mark a batch job as failed.
+     * ------------------------------------------------------------------------
+     *  Mark a batch job as failed
+     * ------------------------------------------------------------------------
+     *  Records a failed job within the batch, increments `failed_jobs`,
+     *  decrements pending, and logs diagnostic details.
+     *
+     * @param  JobBatch  $jobBatch  The batch model instance
+     * @param  string    $jobId     The job UUID or identifier
+     * @return void
      */
     public static function markFailed(JobBatch $jobBatch, string $jobId): void
     {
@@ -657,9 +3456,15 @@ class BatchMonitorService
             $jobBatch->decrement('pending_jobs');
             $jobBatch->touch();
 
-            Log::channel('ingest')->error("❌ Job failed in batch [{$jobBatch->name}] - Job ID: {$jobId}");
+            Log::channel('ingest')->error("❌ Job failed in batch", [
+                'batch' => $jobBatch->name,
+                'job_id' => $jobId,
+            ]);
         } catch (Throwable $e) {
-            Log::channel('ingest')->warning("⚠️ markFailed failed: {$e->getMessage()}");
+            Log::channel('ingest')->warning("⚠️ markFailed failed", [
+                'batch' => $jobBatch->name ?? 'unknown',
+                'error' => $e->getMessage(),
+            ]);
         }
     }
 }app/Services/PolygonIndicatorsService.php
@@ -676,6 +3481,8 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use App\Models\Ticker;
 use Throwable;
+use Carbon\Carbon;
+use Carbon\CarbonPeriod;
 
 class PolygonIndicatorsService
 {
@@ -684,67 +3491,143 @@ class PolygonIndicatorsService
     protected int $timeout;
     protected int $maxRetries;
     protected string $logChannel;
+    protected int $pageLimit;
+    protected int $yearChunkSize; // years per request window
 
     public function __construct()
     {
-        $this->baseUrl = rtrim(config('services.polygon.base') ?? env('POLYGON_API_BASE', 'https://api.polygon.io'), '/');
-        $this->apiKey = config('services.polygon.key') ?? env('POLYGON_API_KEY');
-        $this->timeout = (int)(env('POLYGON_API_TIMEOUT', 30));
-        $this->maxRetries = (int)(env('POLYGON_API_RETRIES', 3));
-        $this->logChannel = 'polygon';
+        $this->baseUrl       = rtrim(config('services.polygon.base') ?? env('POLYGON_API_BASE', 'https://api.polygon.io'), '/');
+        $this->apiKey        = (string) (config('services.polygon.key') ?? env('POLYGON_API_KEY'));
+        $this->timeout       = (int) (env('POLYGON_API_TIMEOUT', 30));
+        $this->maxRetries    = (int) (env('POLYGON_API_RETRIES', 3));
+        $this->logChannel    = 'ingest';
+        $this->pageLimit     = 5000;
+        $this->yearChunkSize = .5; // request per .5-year slice
     }
 
     /**
-     * Fetch and store multiple indicators for a single ticker.
-     *
-     * @param string $symbol
-     * @param array $indicators  e.g. ['sma_20', 'ema_50', 'rsi_14', 'macd']
+     * Ingest multiple indicators for a single ticker across a date range.
      */
-    public function fetchIndicators(string $symbol, array $indicators = ['sma_20', 'ema_50', 'rsi_14', 'macd']): void
+    public function fetchIndicators(string $ticker, array $indicators, array $range = []): void
     {
-        $symbol = strtoupper(trim($symbol));
-        $ticker = Ticker::where('ticker', $symbol)->first();
+        $ticker = strtoupper(trim($ticker));
+        $tickerModel = Ticker::where('ticker', $ticker)->first();
 
-        if (! $ticker) {
-            Log::warning("Skipping unknown ticker: {$symbol}");
+        if (! $tickerModel) {
+            Log::channel($this->logChannel)->warning("⚠️ Indicators: unknown ticker, skipping", [
+                'ticker' => $ticker,
+            ]);
             return;
         }
 
         foreach ($indicators as $ind) {
             try {
                 [$type, $period] = $this->parseIndicator($ind);
-                $results = $this->fetchIndicatorData($symbol, $type, $period);
+                Log::channel($this->logChannel)->info("▶️ Fetching indicator", [
+                    'ticker' => $ticker,
+                    'indicator' => $ind,
+                    'type' => $type,
+                    'period' => $period,
+                    'range' => $range,
+                ]);
 
-                if (! empty($results)) {
-                    $count = $this->storeIndicators($ticker->id, $symbol, $ind, $results);
-                    Log::channel($this->logChannel)->info("Stored {$count} {$ind} records for {$symbol}");
+                $values = $this->fetchIndicatorDataChunked($ticker, $type, $period, $range);
+
+                if (! empty($values)) {
+                    $count = $this->storeIndicators($tickerModel->id, '1d', $ind, $values, $type);
+                    Log::channel($this->logChannel)->info("✅ Stored indicator data", [
+                        'ticker' => $ticker,
+                        'indicator' => $ind,
+                        'records_inserted_or_updated' => $count,
+                    ]);
                 } else {
-                    Log::channel($this->logChannel)->warning("No data returned for {$symbol} {$ind}");
+                    Log::channel($this->logChannel)->warning("⚠️ No indicator data returned", [
+                        'ticker' => $ticker,
+                        'indicator' => $ind,
+                    ]);
                 }
             } catch (Throwable $e) {
-                Log::channel($this->logChannel)->error("Error fetching indicator {$ind} for {$symbol}: {$e->getMessage()}");
+                Log::channel($this->logChannel)->error("❌ Indicator ingestion failed", [
+                    'ticker' => $ticker,
+                    'indicator' => $ind,
+                    'message' => $e->getMessage(),
+                    'trace' => substr($e->getTraceAsString(), 0, 1000),
+                ]);
             }
-            sleep(1); // gentle API pacing
+
+            usleep(150_000); // pacing between API calls
         }
     }
 
+    /** Parse "sma_20" → ['sma', 20]; "macd" → ['macd', null] */
     protected function parseIndicator(string $name): array
     {
         if (preg_match('/^(sma|ema|rsi)_(\d+)$/i', $name, $m)) {
-            return [strtolower($m[1]), (int)$m[2]];
+            return [strtolower($m[1]), (int) $m[2]];
         }
-        return [$name, null];
+        return [strtolower($name), null]; // e.g. macd
     }
 
-    protected function fetchIndicatorData(string $symbol, string $type, ?int $window): array
+    /**
+     * Fetch an indicator from Polygon with date chunking (e.g., 1-year slices).
+     */
+    protected function fetchIndicatorDataChunked(string $ticker, string $type, ?int $window, array $range = []): array
     {
-        $endpoint = "/v1/indicators/{$type}/{$symbol}";
+        $from = ! empty($range['from']) ? Carbon::parse($range['from']) : now()->subYears(10);
+        $to   = ! empty($range['to'])   ? Carbon::parse($range['to'])   : now();
+        $allValues = [];
+
+        // build year-based chunks
+        $periods = CarbonPeriod::create($from, "{$this->yearChunkSize} year", $to);
+        $chunks = [];
+
+        foreach ($periods as $p) {
+            $start = $p->copy();
+            $end   = $p->copy()->addYears($this->yearChunkSize)->subDay();
+            if ($end->gt($to)) $end = $to;
+            $chunks[] = ['from' => $start->toDateString(), 'to' => $end->toDateString()];
+        }
+
+        foreach ($chunks as $i => $chunk) {
+            $values = $this->fetchIndicatorData($ticker, $type, $window, $chunk);
+
+            Log::channel($this->logChannel)->info("📆 Chunk fetched", [
+                'ticker' => $ticker,
+                'indicator_type' => $type,
+                'chunk_index' => $i + 1,
+                'from' => $chunk['from'],
+                'to' => $chunk['to'],
+                'records' => count($values),
+            ]);
+
+            if (! empty($values)) {
+                $allValues = array_merge($allValues, $values);
+            }
+
+            usleep(250_000); // small pause between chunks
+        }
+
+        return $allValues;
+    }
+
+    /**
+     * Fetch indicator data for a single chunk.
+     */
+    protected function fetchIndicatorData(string $ticker, string $type, ?int $window, array $range = []): array
+    {
+        $endpoint = "/v1/indicators/{$type}/{$ticker}";
+        $url = $this->baseUrl . $endpoint;
+
         $params = [
-            'timespan' => 'day',
-            'window' => $window ?? 14,
-            'limit' => 120,
-            'apiKey' => $this->apiKey,
+            'apiKey'      => $this->apiKey,
+            'timespan'    => 'day',
+            'series_type' => 'close',
+            'limit'       => $this->pageLimit,
         ];
+
+        if ($window) $params['window'] = $window;
+        if (! empty($range['from'])) $params['from'] = $range['from'];
+        if (! empty($range['to']))   $params['to']   = $range['to'];
 
         $attempt = 0;
         $wait = 2;
@@ -752,48 +3635,82 @@ class PolygonIndicatorsService
         while ($attempt < $this->maxRetries) {
             $attempt++;
             try {
-                $response = Http::timeout($this->timeout)->get($this->baseUrl . $endpoint, $params);
+                $resp = Http::timeout($this->timeout)->get($url, $params);
 
-                if ($response->successful()) {
-                    $data = $response->json();
-                    return $data['results']['values'] ?? [];
+                if ($resp->successful()) {
+                    $json = $resp->json();
+                    return $json['results']['values'] ?? [];
                 }
 
-                if ($response->status() === 429) {
-                    $retryAfter = (int)($response->header('Retry-After') ?? $wait);
-                    Log::warning("Rate limited on {$type} for {$symbol}, retrying in {$retryAfter}s...");
+                if ($resp->status() === 429) {
+                    $retryAfter = (int) ($resp->header('Retry-After') ?? $wait);
+                    Log::channel($this->logChannel)->warning("⚠️ 429 rate limited", [
+                        'ticker' => $ticker,
+                        'indicator_type' => $type,
+                        'retry_after' => $retryAfter,
+                    ]);
                     sleep($retryAfter);
                     continue;
                 }
 
-                Log::error("Indicator fetch failed [{$response->status()}] for {$symbol} {$type}");
+                Log::channel($this->logChannel)->error("❌ HTTP failure", [
+                    'ticker' => $ticker,
+                    'indicator_type' => $type,
+                    'status' => $resp->status(),
+                    'body' => substr($resp->body(), 0, 300),
+                ]);
                 break;
             } catch (Throwable $e) {
-                Log::error("Exception fetching {$type} for {$symbol}: {$e->getMessage()}");
+                Log::channel($this->logChannel)->error("❌ Request exception", [
+                    'ticker' => $ticker,
+                    'indicator_type' => $type,
+                    'message' => $e->getMessage(),
+                ]);
                 sleep($wait);
-                $wait *= 2;
+                $wait = min($wait * 2, 30);
             }
         }
 
         return [];
     }
 
-    protected function storeIndicators(int $tickerId, string $symbol, string $indicator, array $values): int
+    /**
+     * Store indicator rows into ticker_indicators.
+     */
+    protected function storeIndicators(int $tickerId, string $resolution, string $indicator, array $values, string $type): int
     {
         $now = now()->toDateTimeString();
         $rows = [];
 
         foreach ($values as $v) {
-            $ts = isset($v['timestamp']) ? now()->createFromTimestampMs((int)$v['timestamp'])->toDateTimeString() : null;
+            $ts = isset($v['timestamp'])
+                ? now()->createFromTimestampMs((int) $v['timestamp'])->toDateTimeString()
+                : null;
+
             if (! $ts) continue;
 
+            $value = $v['value'] ?? null;
+            $meta  = null;
+
+            if ($type === 'macd') {
+                $macd      = $v['macd']      ?? null;
+                $signal    = $v['signal']    ?? null;
+                $histogram = $v['histogram'] ?? null;
+
+                $value = $macd;
+                $meta  = json_encode(array_filter([
+                    'signal' => $signal,
+                    'histogram' => $histogram,
+                ], fn($x) => $x !== null));
+            }
+
             $rows[] = [
-                'ticker_id' => $tickerId,
-                'resolution' => '1d',
-                't' => $ts,
-                'indicator' => $indicator,
-                'value' => $v['value'] ?? null,
-                'meta' => isset($v['meta']) ? json_encode($v['meta']) : null,
+                'ticker_id'  => $tickerId,
+                'resolution' => $resolution,
+                't'          => $ts,
+                'indicator'  => $indicator,
+                'value'      => $value,
+                'meta'       => $meta,
                 'created_at' => $now,
                 'updated_at' => $now,
             ];
@@ -803,22 +3720,17 @@ class PolygonIndicatorsService
 
         DB::table('ticker_indicators')->upsert(
             $rows,
-            ['ticker_id', 'indicator', 't'],
+            ['ticker_id', 'resolution', 't', 'indicator'],
             ['value', 'meta', 'updated_at']
         );
 
         return count($rows);
     }
 
-    /**
-     * Bulk-ingest indicators for all active tickers.
-     */
-    public function ingestAllTickers(array $indicators = ['sma_20', 'ema_50', 'rsi_14', 'macd']): void
+    public function ingestMany(array $tickers, array $indicators, array $range = []): void
     {
-        $tickers = Ticker::where('active', true)->limit(50)->get();
-
         foreach ($tickers as $ticker) {
-            $this->fetchIndicators($ticker->ticker, $indicators);
+            $this->fetchIndicators($ticker, $indicators, $range);
         }
     }
 }app/Services/PolygonTickerOverviewService.php
@@ -1599,6 +4511,1280 @@ class PolygonTickerService
         }
 
         return [count($rows)];
+    }
+}app/Services/Validation/Probes/PolygonProbe.php
+
+
+===== FILE: app/Services/Validation/Probes/PolygonProbe.php =====
+
+<?php
+
+namespace App\Services\Validation\Probes;
+
+use App\Services\PolygonApiClient;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * ============================================================================
+ *  PolygonProbe
+ * ============================================================================
+ *
+ * 🔧 Purpose:
+ *   Lightweight utility that checks whether Polygon.io
+ *   currently has any valid upstream data for a given ticker.
+ *
+ * 🧠 Behavior:
+ * ----------------------------------------------------------------------------
+ *   • Calls PolygonApiClient (aggregate or reference endpoint)
+ *   • Distinguishes "no data" vs "upstream error"
+ *   • Returns structured probe results used by validators
+ *
+ * 📦 Typical Response:
+ *   [
+ *     'status'   => 200,
+ *     'latency'  => 83,
+ *     'found'    => true,
+ *     'message'  => 'OK',
+ *     'raw_size' => 4201
+ *   ]
+ * ============================================================================
+ */
+class PolygonProbe
+{
+    public function __construct(protected PolygonApiClient $client) {}
+
+    /**
+     * Test whether Polygon.io has recent data for a ticker.
+     *
+     * @param  string  $symbol
+     * @return array<string,mixed>
+     */
+    public function checkTickerData(string $symbol): array
+    {
+        $start = microtime(true);
+
+        try {
+            // Query the most recent daily aggregate (lightweight)
+            $response = $this->client->get("/v2/aggs/ticker/{$symbol}/prev");
+            $elapsed  = round((microtime(true) - $start) * 1000, 2);
+
+            if (empty($response) || !isset($response['results']) || count($response['results']) === 0) {
+                return [
+                    'status'  => $response['status'] ?? 200,
+                    'latency' => $elapsed,
+                    'found'   => false,
+                    'message' => 'Upstream empty response',
+                    'raw_size'=> 0,
+                ];
+            }
+
+            return [
+                'status'   => 200,
+                'latency'  => $elapsed,
+                'found'    => true,
+                'message'  => 'OK',
+                'raw_size' => strlen(json_encode($response)),
+            ];
+        } catch (\Throwable $e) {
+            $elapsed = round((microtime(true) - $start) * 1000, 2);
+            Log::channel('ingest')->warning('⚠️ Polygon probe failed', [
+                'symbol'  => $symbol,
+                'message' => $e->getMessage(),
+            ]);
+
+            return [
+                'status'  => 500,
+                'latency' => $elapsed,
+                'found'   => false,
+                'message' => $e->getMessage(),
+                'raw_size'=> 0,
+            ];
+        }
+    }
+}app/Services/Validation/DataIntegrityService.php
+
+
+===== FILE: app/Services/Validation/DataIntegrityService.php =====
+
+<?php
+
+namespace App\Services\Validation;
+
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Config;
+use App\Services\Validation\Validators\PolygonDataValidator;
+
+/**
+ * ============================================================================
+ *  DataIntegrityService  (v2 — Config-Driven + Severity Scoring)
+ * ============================================================================
+ *
+ * 🔧 Purpose:
+ *   Performs configurable structural validation of ticker price histories
+ *   (duplicates, gaps, flatlines, spikes) and coordinates with
+ *   PolygonDataValidator to confirm upstream data availability.
+ *
+ * 🧠 Behavior:
+ * ----------------------------------------------------------------------------
+ *   • Loads configurable thresholds and weights from config/data_validation.php.
+ *   • Detects anomalies and computes severity scores (0–1).
+ *   • Aggregates an overall ticker “health score” (1 = perfect, 0 = bad).
+ *   • Delegates missing or empty datasets to PolygonDataValidator.
+ *   • Returns unified structured results for commands/loggers.
+ *
+ * 📦 Example Output:
+ *   [
+ *     'ticker_id'   => 8255,
+ *     'health'      => 0.93,
+ *     'severity'    => ['gaps'=>0.02,'flat'=>0.03,'spikes'=>0.01],
+ *     'issues'      => ['gaps'=>[...],'flat'=>[...]],
+ *     'root_causes' => ['missing_price_data'=>'upstream_empty_response'],
+ *     'upstream'    => ['status'=>200,'found'=>false],
+ *   ]
+ * ============================================================================
+ */
+class DataIntegrityService
+{
+    public function __construct(
+        protected ?PolygonDataValidator $polygonValidator = null
+    ) {
+        $this->polygonValidator = $this->polygonValidator ?? app(PolygonDataValidator::class);
+    }
+
+    /**
+     * Scan ticker data for local anomalies + upstream validation.
+     *
+     * @param  int  $tickerId
+     * @return array<string,mixed>
+     */
+    public function scanTicker(int $tickerId): array
+    {
+        /*
+        |--------------------------------------------------------------------------
+        | 1️⃣ Load bars
+        |--------------------------------------------------------------------------
+        */
+        $bars = DB::table('ticker_price_histories')
+            ->where('ticker_id', $tickerId)
+            ->where('resolution', '1d')
+            ->orderBy('t', 'asc')
+            ->get(['t', 'c'])
+            ->map(fn($r) => ['t' => $r->t, 'c' => (float) $r->c])
+            ->toArray();
+
+        $cfg = Config::get('data_validation', [
+            'gap_days_tolerance'    => 10,
+            'flat_streak_tolerance' => 5,
+            'spike_threshold'       => 0.5,
+            'weights'               => ['gaps'=>0.4,'flat'=>0.3,'spikes'=>0.3],
+            'min_bars'              => 10,
+        ]);
+
+        $result = [
+            'ticker_id'   => $tickerId,
+            'issues'      => [],
+            'root_causes' => [],
+            'upstream'    => null,
+            'health'      => 1.0,
+            'severity'    => [],
+        ];
+
+        /*
+        |--------------------------------------------------------------------------
+        | 2️⃣ Handle insufficient local data
+        |--------------------------------------------------------------------------
+        */
+        if (count($bars) < $cfg['min_bars']) {
+            Log::channel('ingest')->warning('⚠️ Insufficient local bars', ['ticker_id' => $tickerId]);
+
+            $symbol = DB::table('tickers')->where('id', $tickerId)->value('ticker');
+            if ($symbol) {
+                $validation = $this->polygonValidator->validateTicker($tickerId, $symbol);
+                $result = array_merge($result, $validation);
+            }
+
+            $result['status'] = 'insufficient';
+            $result['health'] = 0.0;
+            return $result;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 3️⃣ Local anomaly detection
+        |--------------------------------------------------------------------------
+        */
+        $issues = ['duplicates'=>[], 'gaps'=>[], 'flat'=>[], 'spikes'=>[]];
+        $dates  = array_column($bars, 't');
+        $closes = array_column($bars, 'c');
+        $total  = count($closes);
+
+        // Duplicates
+        $dupes = collect($bars)->groupBy('t')->filter(fn($g) => $g->count() > 1)->keys()->all();
+        if ($dupes) $issues['duplicates'] = $dupes;
+
+        // Gaps
+        for ($i = 1; $i < $total; $i++) {
+            $diff = (strtotime($dates[$i]) - strtotime($dates[$i - 1])) / 86400;
+            if ($diff > $cfg['gap_days_tolerance']) {
+                $issues['gaps'][] = ['from'=>$dates[$i - 1],'to'=>$dates[$i],'days'=>$diff];
+            }
+        }
+
+        // Flatlines + Spikes
+        for ($i = 1; $i < $total; $i++) {
+            $prev = $closes[$i - 1];
+            $curr = $closes[$i];
+            $ret  = $prev > 0 ? ($curr - $prev) / $prev : 0.0;
+
+            if ($curr == $prev) {
+                $issues['flat'][] = $dates[$i];
+            } elseif (abs($ret) > $cfg['spike_threshold']) {
+                $issues['spikes'][] = ['date'=>$dates[$i],'return'=>round($ret,2)];
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 4️⃣ Severity scoring & health aggregation
+        |--------------------------------------------------------------------------
+        */
+        $weights  = $cfg['weights'];
+        $severity = [];
+
+        foreach (['gaps','flat','spikes'] as $key) {
+            $count = count($issues[$key]);
+            $severity[$key] = min(1.0, $count / max(1, $total)) * ($weights[$key] ?? 0);
+        }
+
+        $totalSeverity = array_sum($severity);
+        $health = max(0.0, round(1 - $totalSeverity, 4));
+
+        $result['issues']   = array_filter($issues, fn($v)=>!empty($v));
+        $result['severity'] = $severity;
+        $result['health']   = $health;
+        $result['status']   = $health < 0.9 ? 'warning' : 'success';
+
+        /*
+        |--------------------------------------------------------------------------
+        | 5️⃣ Integrate Polygon upstream verification if data missing entirely
+        |--------------------------------------------------------------------------
+        */
+        if (empty($bars)) {
+            $symbol = DB::table('tickers')->where('id', $tickerId)->value('ticker');
+            if ($symbol) {
+                $validation = $this->polygonValidator->validateTicker($tickerId, $symbol);
+                $result = array_merge($result, $validation);
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 6️⃣ Logging + Return
+        |--------------------------------------------------------------------------
+        */
+        if ($health < 0.9) {
+            Log::channel('ingest')->warning('⚠️ Data integrity warning', [
+                'ticker_id' => $tickerId,
+                'health'    => $health,
+                'severity'  => $severity,
+                'issues'    => array_keys($result['issues']),
+            ]);
+        }
+
+        return $result;
+    }
+}app/Services/Validation/Validators/PolygonDataValidator.php
+
+
+===== FILE: app/Services/Validation/Validators/PolygonDataValidator.php =====
+
+<?php
+
+namespace App\Services\Validation\Validators;
+
+use App\Services\Validation\Probes\PolygonProbe;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Http;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * ============================================================================
+ *  PolygonDataValidator (v2.2 — adds live verifyTickerUpstream)
+ * ============================================================================
+ *
+ * 🔧 Purpose:
+ *   Bridges local Polygon.io–sourced data validation with live upstream
+ *   verification. Performs both local completeness checks and on-the-fly
+ *   Polygon API probes.
+ *
+ * 🧠 Behavior:
+ * ----------------------------------------------------------------------------
+ *   • validateTicker() → existing local+upstream completeness logic.
+ *   • verifyTickerUpstream() → NEW: direct live API check for recent bars.
+ * ============================================================================
+ *   This validator acts as the “bridge” between **local data health** and
+ *   **Polygon upstream truth**. It performs a two-phase analysis:
+ *
+ *   1️⃣ **Local Completeness Check**
+ *       - Confirms the ticker has sufficient rows in `ticker_price_histories`
+ *         for the expected date range (e.g. several hundred trading days).
+ *       - Flags any tickers with *zero* records or extremely small counts
+ *         (`< 5` bars total) as “missing_price_data”.
+ *       - Optionally could later expand to detect *partial ranges* (e.g.,
+ *         a symbol with data only from 2024 but missing 2023).
+ *
+ *   2️⃣ **Upstream Root-Cause Probe**
+ *       - When local data is missing or empty, the validator calls
+ *         `PolygonProbe::checkTickerData()` to determine whether Polygon.io
+ *         also reports no data.
+ *       - This distinguishes:
+ *           🟢 Upstream Empty (Polygon has no data) → “upstream_empty_response”
+ *           🟠 Local Failure  (Polygon has data, but we failed to ingest it)
+ *           🔴 Upstream Error (Polygon API returned 4xx/5xx or rate-limit)
+ *
+ *   3️⃣ **Gap and Coverage Analysis**
+ *       - The validator can be extended to check for time gaps between
+ *         local bars (e.g. ≥5 consecutive missing weekdays) to identify
+ *         *partial data availability* cases.
+ *       - These “coverage anomalies” will be surfaced as
+ *         `'partial_price_history' => ['missing_days' => N]` in results.
+ *
+ * 🧮 Decision Logic:
+ * ----------------------------------------------------------------------------
+ *   • If 0 bars locally → mark `missing_price_data` and call PolygonProbe.
+ *   • If 1–4 bars → mark as “insufficient sample”.
+ *   • If Polygon returns HTTP 200 but empty → `upstream_empty_response`.
+ *   • If Polygon returns non-200 → `upstream_error`.
+ *   • If Polygon returns valid bars but none locally → `local_ingestion_failure`.
+ *
+ * 📦 Example Result:
+ * ----------------------------------------------------------------------------
+ *   [
+ *     'issues'       => ['missing_price_data'],
+ *     'root_causes'  => ['missing_price_data' => 'upstream_empty_response'],
+ *     'upstream'     => ['status' => 200, 'found' => false],
+ *     'valid'        => false,
+ *   ]
+ *
+ * ============================================================================
+ */
+class PolygonDataValidator
+{
+    public function __construct(protected PolygonProbe $probe) {}
+
+    /**
+     * Validate Polygon-sourced data for one ticker (local + probe).
+     */
+    public function validateTicker(int $tickerId, string $symbol): array
+    {
+        $result = [
+            'issues'      => [],
+            'root_causes' => [],
+            'upstream'    => null,
+            'valid'       => true,
+        ];
+
+        // 1️⃣ Local completeness check
+        $count = DB::table('ticker_price_histories')
+            ->where('ticker_id', $tickerId)
+            ->count();
+
+        if ($count === 0) {
+            $result['issues'][] = 'missing_price_data';
+            $result['valid']    = false;
+
+            // 2️⃣ Probe Polygon upstream (cached probe class)
+            $probeResult = $this->probe->checkTickerData($symbol);
+            $result['upstream'] = $probeResult;
+
+            if ($probeResult['found'] === false) {
+                $result['root_causes']['missing_price_data'] = 'upstream_empty_response';
+            } elseif ($probeResult['status'] !== 200) {
+                $result['root_causes']['missing_price_data'] = 'upstream_error';
+            } else {
+                $result['root_causes']['missing_price_data'] = 'local_ingestion_failure';
+            }
+        } elseif ($count < 5) {
+            $result['issues'][] = 'insufficient_price_data';
+            $result['valid']    = false;
+        }
+
+        return $result;
+    }
+
+    /**
+     * 🔍 Live Polygon.io verification for a ticker (read-only).
+     *
+     * @param  string  $symbol
+     * @param  int     $daysBack  Defaults to 30
+     * @return array<string,mixed>
+     */
+    public function verifyTickerUpstream(string $symbol, int $daysBack = 30): array
+    {
+        $apiKey = config('services.polygon.key');
+        $now  = now()->format('Y-m-d');
+        $past = now()->subDays($daysBack)->format('Y-m-d');
+        $url  = "https://api.polygon.io/v2/aggs/ticker/{$symbol}/range/1/day/{$past}/{$now}";
+
+        try {
+            $resp = Http::timeout(8)->get($url, ['apiKey' => $apiKey, 'limit' => 5]);
+            $status = $resp->status();
+
+            if ($status === 429) {
+                Log::warning("⚠️ Polygon rate-limit hit during verifyTickerUpstream", ['symbol' => $symbol]);
+                return [
+                    'symbol'     => $symbol,
+                    'status'     => 429,
+                    'found'      => false,
+                    'count'      => 0,
+                    'message'    => 'rate_limited',
+                    'checked_at' => now()->toIso8601String(),
+                ];
+            }
+
+            if (!$resp->ok()) {
+                return [
+                    'symbol'     => $symbol,
+                    'status'     => $status,
+                    'found'      => false,
+                    'count'      => 0,
+                    'message'    => "HTTP {$status}",
+                    'checked_at' => now()->toIso8601String(),
+                ];
+            }
+
+            $json  = $resp->json();
+            $count = $json['resultsCount'] ?? 0;
+            $found = $count > 0;
+
+            return [
+                'symbol'     => $symbol,
+                'status'     => $status,
+                'found'      => $found,
+                'count'      => $count,
+                'message'    => $found ? 'ok' : 'empty',
+                'checked_at' => now()->toIso8601String(),
+            ];
+        } catch (\Throwable $e) {
+            Log::error("❌ verifyTickerUpstream failed", [
+                'symbol' => $symbol,
+                'error'  => $e->getMessage(),
+            ]);
+            return [
+                'symbol'     => $symbol,
+                'status'     => 0,
+                'found'      => false,
+                'count'      => 0,
+                'message'    => $e->getMessage(),
+                'checked_at' => now()->toIso8601String(),
+            ];
+        }
+    }
+}app/Services/Analytics/BaseAnalytics.php
+
+
+===== FILE: app/Services/Analytics/BaseAnalytics.php =====
+
+<?php
+
+namespace App\Services\Analytics;
+
+use App\Services\Compute\BaseIndicator;
+
+/**
+ * BaseAnalytics
+ *
+ * Provides access to BaseIndicator math utilities (returns, variance, etc.)
+ * without requiring `compute()` to be implemented.
+ */
+abstract class BaseAnalytics extends BaseIndicator
+{
+    public function compute(array $bars, array $params = []): array
+    {
+        // No-op, since analytics services use custom entry points.
+        return [];
+    }
+}
+app/Services/Analytics/FeatureSnapshotBuilder.php
+
+
+===== FILE: app/Services/Analytics/FeatureSnapshotBuilder.php =====
+
+<?php
+
+namespace App\Services\Analytics;
+
+use App\Models\Ticker;
+use App\Models\TickerIndicator;
+use App\Models\TickerPriceHistory;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\DB;
+use Carbon\Carbon;
+use App\Services\Compute\Registry;
+
+/**
+ * ============================================================================
+ *  FeatureSnapshotBuilder
+ * ============================================================================
+ *
+ * 🔧 Purpose:
+ *   Builds **aggregated, JSON-based feature snapshots** representing the full
+ *   analytic "state" of a ticker for each trading day. These snapshots power
+ *   TickerWolf’s machine-learning feature pipelines and AI inference models.
+ *
+ * 🧠 Design Overview:
+ * ----------------------------------------------------------------------------
+ *   A. Inputs:
+ *      • Core indicators precomputed & stored in `ticker_indicators` (MACD, ATR, ADX, VWAP, …)
+ *      • Snapshot-only indicators computed on-the-fly (e.g., Momentum) — not persisted to core
+ *      • Advanced derived analytics via AnalyticsCalculator (Sharpe, Beta, Volatility, Drawdown)
+ *
+ *   B. Build Flow:
+ *      1️⃣ Fetch precomputed indicator rows from `ticker_indicators`
+ *      2️⃣ Compute “snapshot-only” indicators locally (e.g., Momentum) from OHLCV bars
+ *      3️⃣ Compute derived analytics via `AnalyticsCalculator`
+ *      4️⃣ Merge all per-day metrics → complete feature vector
+ *      5️⃣ Persist to:
+ *          - `ticker_feature_snapshots` (rich JSON blobs)
+ *          - `ticker_feature_metrics`   (flat numeric summary table)
+ *
+ * 💡 Why compute some indicators locally here?
+ * ----------------------------------------------------------------------------
+ *   • By design, certain indicators (like Momentum) are **not stored** in
+ *     `ticker_indicators` (core layer). They belong to the **snapshot layer**.
+ *   • Previously this made fields like `momentum_10` appear as `null` in snapshots.
+ *   • This class now computes those snapshot-only metrics before merging, so the
+ *     JSON and flat metrics are complete.
+ *
+ * ✅ Logging:
+ * ----------------------------------------------------------------------------
+ *   • Start/finish logs
+ *   • Per-module compute summaries for snapshot-only indicators
+ *   • Metrics summary write counts
+ *
+ * ============================================================================
+ */
+class FeatureSnapshotBuilder
+{
+    public function __construct(
+        protected AnalyticsCalculator $calc
+    ) {}
+
+    /**
+     * Build and persist (or preview) feature snapshots for a single ticker.
+     *
+     * @param  int   $tickerId   The ID of the ticker being processed
+     * @param  array $range      Date range in ['from' => 'YYYY-MM-DD', 'to' => 'YYYY-MM-DD'] format
+     * @param  array $params     Optional runtime parameters (per-indicator overrides)
+     * @param  bool  $preview    If true, performs a dry-run (no DB writes)
+     * @return array{snapshots:int} Summary of total snapshots written or simulated
+     */
+    public function buildForTicker(int $tickerId, array $range = [], array $params = [], bool $preview = false): array
+    {
+        /*
+        |--------------------------------------------------------------------------
+        | 0️⃣ Resolve policy/config and load ticker
+        |--------------------------------------------------------------------------
+        */
+        $storage  = config('indicators.storage');
+        $defaults = config('indicators.defaults');
+
+        /** @var Ticker|null $ticker */
+        $ticker = Ticker::find($tickerId);
+        if (!$ticker) {
+            Log::channel('ingest')->warning("⚠️ FeatureSnapshotBuilder aborted: ticker not found", [
+                'ticker_id' => $tickerId,
+            ]);
+            return ['snapshots' => 0];
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 1️⃣ Define range and initialization
+        |--------------------------------------------------------------------------
+        */
+        $from = $range['from'] ?? null;
+        $to   = $range['to'] ?? null;
+
+        Log::channel('ingest')->info("🚀 Starting FeatureSnapshotBuilder", [
+            'ticker_id' => $tickerId,
+            'range'     => $range,
+            'preview'   => $preview,
+        ]);
+
+        /*
+        |--------------------------------------------------------------------------
+        | 2️⃣ Fetch precomputed core indicator rows (from ticker_indicators)
+        |--------------------------------------------------------------------------
+        | These are the high-value, stored-daily indicators (MACD, ATR, ADX, VWAP).
+        */
+        $coreQ = TickerIndicator::query()
+            ->where('ticker_id', $tickerId)
+            ->where('resolution', '1d');
+
+        if ($from) $coreQ->where('t', '>=', $from);
+        if ($to)   $coreQ->where('t', '<=', $to);
+
+        $coreRows = $coreQ->orderBy('t', 'asc')
+            ->get(['t', 'indicator', 'value', 'meta']);
+
+        if ($coreRows->isEmpty()) {
+            Log::channel('ingest')->warning("⚠️ No core indicator data found for ticker", [
+                'ticker_id' => $tickerId,
+                'range'     => $range,
+            ]);
+            return ['snapshots' => 0];
+        }
+
+        // Group core rows by date with safe meta decoding
+        $grouped = [];
+        foreach ($coreRows as $row) {
+            $key = Carbon::parse($row->t)->toDateString();
+
+            // Normalize meta field
+            $metaValue = $row->meta;
+            if (is_array($metaValue)) {
+                $meta = $metaValue;
+            } elseif (is_string($metaValue) && $metaValue !== '') {
+                $meta = json_decode($metaValue, true);
+            } else {
+                $meta = null;
+            }
+
+            $grouped[$key][$row->indicator] = [
+                'value' => is_null($row->value) ? null : (float) $row->value,
+                'meta'  => $meta,
+            ];
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 3️⃣ Compute snapshot-only indicators locally (e.g., Momentum)
+        |--------------------------------------------------------------------------
+        | We load OHLCV bars once and run only the indicators that are configured
+        | to live in the snapshot layer but are *not* part of the core layer.
+        |
+        | • snapshotSet = storage['ticker_feature_snapshots']
+        | • coreSet     = storage['ticker_indicators']
+        | • derivedSet  = computed by AnalyticsCalculator: beta, sharpe, volatility, drawdown
+        | • computeSet  = snapshotSet - coreSet - derivedSet  (e.g., 'momentum')
+        */
+        $snapshotSet = (array)($storage['ticker_feature_snapshots'] ?? []);
+        $coreSet     = (array)($storage['ticker_indicators']        ?? []);
+        $derivedSet  = ['beta', 'sharpe', 'volatility', 'drawdown']; // handled by AnalyticsCalculator
+
+        $computeSet  = array_values(array_diff($snapshotSet, $coreSet, $derivedSet));
+        if (!empty($computeSet)) {
+            // 3a. Load bars (only once)
+            $barsQ = TickerPriceHistory::query()
+                ->where('ticker_id', $tickerId)
+                ->where('resolution', '1d');
+
+            // Extend the "from" window back by a buffer to satisfy lookbacks (e.g., momentum_10)
+            // We'll subtract ~90 days as a safe buffer; DB will clamp if not available.
+            if ($from) {
+                $fromBuf = Carbon::parse($from)->subDays(90)->toDateString();
+                $barsQ->where('t', '>=', $fromBuf);
+            }
+            if ($to) {
+                $barsQ->where('t', '<=', $to);
+            }
+
+            $bars = $barsQ->orderBy('t', 'asc')
+                ->get(['t','o','h','l','c','v','vw'])
+                ->map(fn($row) => [
+                    't'  => Carbon::parse($row->t)->toDateTimeString(),
+                    'o'  => (float) $row->o,
+                    'h'  => (float) $row->h,
+                    'l'  => (float) $row->l,
+                    'c'  => (float) $row->c,
+                    'v'  => (float) $row->v,
+                    'vw' => (float) $row->vw,
+                ])
+                ->values()
+                ->all();
+
+            if (empty($bars)) {
+                Log::channel('ingest')->warning("⚠️ No OHLCV bars found for snapshot-only compute", [
+                    'ticker' => $ticker->ticker,
+                    'range'  => $range,
+                    'set'    => $computeSet,
+                ]);
+            } else {
+                // 3b. Resolve and run the snapshot-only modules
+                $modules = Registry::select($computeSet);
+
+                if (empty($modules)) {
+                    Log::channel('ingest')->warning("⚠️ No snapshot-only indicator modules resolved", [
+                        'ticker' => $ticker->ticker,
+                        'set'    => $computeSet,
+                    ]);
+                } else {
+                    foreach ($modules as $module) {
+                        // Merge config defaults + runtime overrides
+                        $modParams = array_replace_recursive(
+                            $defaults[$module->name] ?? [],
+                            $params[$module->name]   ?? []
+                        );
+
+                        // Normalize 'period' → 'window' and 'windows' when appropriate
+                        if (isset($modParams['period']) && !isset($modParams['window'])) {
+                            $modParams['window'] = $modParams['period'];
+                        }
+                        if (isset($modParams['window']) && !isset($modParams['windows'])) {
+                            $modParams['windows'] = [$modParams['window']];
+                        }
+
+                        $rows = $module->compute($bars, $modParams);
+
+                        Log::channel('ingest')->info("🧮 Snapshot-only module computed", [
+                            'ticker' => $ticker->ticker,
+                            'module' => $module->name,
+                            'rows'   => is_array($rows) ? count($rows) : 0,
+                            'params' => $modParams,
+                        ]);
+
+                        // Route into the grouped-per-day structure, respecting the user date range
+                        foreach ($rows as $r) {
+                            $t = isset($r['t']) ? Carbon::parse($r['t'])->toDateString() : null;
+                            if (!$t) continue;
+
+                            // Clamp final day to requested window
+                            if ($from && $t < $from) continue;
+                            if ($to   && $t > $to)   continue;
+
+                            if (!isset($grouped[$t])) {
+                                $grouped[$t] = [];
+                            }
+
+                            $grouped[$t][$r['indicator']] = [
+                                'value' => $r['value'],
+                                'meta'  => $r['meta'],
+                            ];
+                        }
+                    }
+                }
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 4️⃣ Compute derived analytics (Sharpe, Beta, Volatility, Drawdown, etc.)
+        |--------------------------------------------------------------------------
+        | The AnalyticsCalculator handles heavier computations. It returns a map:
+        |   [ 'YYYY-MM-DD' => ['sharpe_60' => ['value'=>...], 'drawdown' => ...], ... ]
+        */
+        $derived = $this->calc->computeDerivedAnalytics($tickerId, $from, $to);
+
+        /*
+        |--------------------------------------------------------------------------
+        | 5️⃣ Merge base + snapshot-only + derived into final snapshots
+        |--------------------------------------------------------------------------
+        | For each date in the union, merge all metric maps into one.
+        */
+        $allDates = array_unique(array_merge(array_keys($grouped), array_keys($derived)));
+        sort($allDates);
+
+        $rows = [];
+        foreach ($allDates as $date) {
+            // Only produce snapshots within requested [from, to]
+            if ($from && $date < $from) continue;
+            if ($to   && $date > $to)   continue;
+
+            $base    = $grouped[$date] ?? [];
+            $derivedForDay = $derived[$date] ?? [];
+
+            // Derived entries are already in indicator-keyed form
+            $snapshot = $base;
+            foreach ($derivedForDay as $k => $payload) {
+                $snapshot[$k] = $payload; // ['value'=>..., 'meta'=>...]
+            }
+
+            $rows[] = [
+                'ticker_id'  => $tickerId,
+                't'          => $date,
+                'indicators' => json_encode($snapshot, JSON_UNESCAPED_SLASHES),
+                'created_at' => now(),
+                'updated_at' => now(),
+            ];
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 6️⃣ Persist results to the database (or simulate in preview mode)
+        |--------------------------------------------------------------------------
+        | Writes both JSON snapshots and flattened numeric metrics for fast querying.
+        */
+        $count = 0;
+
+        if (! $preview) {
+            // ✅ Write serialized feature snapshots
+            foreach (array_chunk($rows, 1000) as $chunk) {
+                DB::table('ticker_feature_snapshots')->upsert(
+                    $chunk,
+                    ['ticker_id', 't'],
+                    ['indicators', 'updated_at']
+                );
+                $count += count($chunk);
+            }
+
+            // ✅ Extract key flat metrics for summary analytics
+            // NOTE: We keep parity with your prior schema fields.
+            $flatRows = [];
+            foreach ($rows as $r) {
+                $data = json_decode($r['indicators'], true);
+
+                $flatRows[] = [
+                    'ticker_id'     => $tickerId,
+                    't'             => $r['t'],
+                    'sharpe_60'     => $data['sharpe_60']['value']     ?? null,
+                    'volatility_30' => $data['volatility_30']['value'] ?? null,
+                    'drawdown'      => $data['drawdown']['value']      ?? null,
+                    'beta_60'       => $data['beta_60']['value']       ?? null,
+                    'momentum_10'   => $data['momentum_10']['value']   ?? null, // ← now filled
+                    'created_at'    => now(),
+                    'updated_at'    => now(),
+                ];
+            }
+
+            foreach (array_chunk($flatRows, 1000) as $chunk) {
+                DB::table('ticker_feature_metrics')->upsert(
+                    $chunk,
+                    ['ticker_id', 't'],
+                    ['sharpe_60', 'volatility_30', 'drawdown', 'beta_60', 'momentum_10', 'updated_at']
+                );
+            }
+
+            Log::channel('ingest')->info("📊 Metrics summary upserted", [
+                'ticker_id' => $tickerId,
+                'rows'      => count($flatRows),
+            ]);
+        } else {
+            // 💡 Dry-run (preview mode)
+            $count = count($rows);
+            Log::channel('ingest')->info("💡 Preview mode — computed {$count} snapshot(s) for ticker {$tickerId}");
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 7️⃣ Logging summary
+        |--------------------------------------------------------------------------
+        */
+        Log::channel('ingest')->info("✅ Feature snapshots built successfully", [
+            'ticker_id' => $tickerId,
+            'snapshots' => $count,
+            'preview'   => $preview,
+        ]);
+
+        return ['snapshots' => $count];
+    }
+}app/Services/Analytics/CorrelationMatrixService.php
+
+
+===== FILE: app/Services/Analytics/CorrelationMatrixService.php =====
+
+<?php
+
+namespace App\Services\Analytics;
+
+use App\Models\Ticker;
+use App\Models\TickerCorrelation;
+use App\Services\Compute\BaseIndicator;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * CorrelationMatrixService
+ *
+ * Generates inter-ticker rolling correlations across all tickers
+ * (or within a specified sector/universe).
+ *
+ * Usage:
+ *   (new CorrelationMatrixService())->computeMatrix(lookbackDays: 90);
+ */
+class CorrelationMatrixService extends BaseAnalytics
+{
+    /**
+     * Compute pairwise correlations between tickers' daily closes.
+     *
+     * @param int $lookbackDays How many days of data to use.
+     * @param int $window Rolling window for correlation (e.g., 20 days).
+     */
+    public function computeMatrix(int $lookbackDays = 90, int $window = 20): void
+    {
+        $tickers = Ticker::where('active', true)->get(['id', 'ticker']);
+        $priceData = $this->fetchRecentCloses($tickers->pluck('id')->toArray(), $lookbackDays);
+
+        $asOf = now()->toDateString();
+        $totalPairs = 0;
+
+        foreach ($tickers as $i => $a) {
+            for ($j = $i + 1; $j < count($tickers); $j++) {
+                $b = $tickers[$j];
+                $totalPairs++;
+
+                $seriesA = $priceData[$a->id] ?? [];
+                $seriesB = $priceData[$b->id] ?? [];
+
+                if (count($seriesA) < $window || count($seriesB) < $window) continue;
+
+                // Compute returns
+                $retA = $this->returns($seriesA);
+                $retB = $this->returns($seriesB);
+
+                // Align and compute rolling correlation
+                $corrSeries = $this->rollingCorrelation($retA, $retB, $window);
+                $betaSeries = $this->rollingBeta($retA, $retB, $window);
+
+                $lastIdx = count($corrSeries) - 1;
+                $corr = $corrSeries[$lastIdx];
+                $beta = $betaSeries[$lastIdx];
+                $r2   = $corr !== null ? pow($corr, 2) : null;
+
+                if ($corr === null) continue;
+
+                TickerCorrelation::updateOrCreate(
+                    [
+                        'ticker_id_a' => $a->id,
+                        'ticker_id_b' => $b->id,
+                        'as_of_date'  => $asOf,
+                    ],
+                    [
+                        'corr' => $corr,
+                        'beta' => $beta,
+                        'r2'   => $r2,
+                    ]
+                );
+            }
+        }
+
+        Log::channel('ingest')->info("✅ Correlation matrix computed", [
+            'as_of' => $asOf,
+            'pairs' => $totalPairs,
+        ]);
+    }
+
+    /**
+     * Fetch recent closing prices (simple version for now).
+     *
+     * @return array<int, array<float>> keyed by ticker_id
+     */
+    protected function fetchRecentCloses(array $tickerIds, int $lookbackDays): array
+    {
+        $rows = DB::table('ticker_bars')
+            ->whereIn('ticker_id', $tickerIds)
+            ->where('t', '>=', now()->subDays($lookbackDays))
+            ->orderBy('t')
+            ->get(['ticker_id', 'c']);
+
+        $data = [];
+        foreach ($rows as $r) {
+            $data[$r->ticker_id][] = (float)$r->c;
+        }
+        return $data;
+    }
+}
+app/Services/Analytics/AnalyticsCalculator.php
+
+
+===== FILE: app/Services/Analytics/AnalyticsCalculator.php =====
+
+<?php
+
+namespace App\Services\Analytics;
+
+use App\Models\Ticker;
+use App\Models\TickerIndicator;
+use App\Models\TickerPriceHistory;
+use Illuminate\Support\Facades\Log;
+use Carbon\Carbon;
+
+/**
+ * ============================================================================
+ *  AnalyticsCalculator
+ * ============================================================================
+ *
+ * 🔧 Purpose:
+ *   Provides **derived analytics** for each ticker based on historical price data.
+ *   These secondary metrics feed long-horizon feature snapshots and ML pipelines.
+ *
+ * 🧠 Core Responsibilities:
+ * ----------------------------------------------------------------------------
+ *   • Compute rolling Sharpe ratios
+ *   • Compute annualized volatility
+ *   • Compute drawdowns (relative to prior peaks)
+ *   • Compute beta (vs. benchmark, e.g., SPY)
+ *
+ * 💡 Notes:
+ * ----------------------------------------------------------------------------
+ *   • All computations are performed on daily close prices (`resolution = 1d`)
+ *   • Outputs are keyed by date for direct merging into feature snapshots
+ *   • Returns are log-based (ln(Pt / Pt-1)) for stability with small values
+ *   • Nulls are inserted for periods before the rolling window length
+ *
+ * ============================================================================
+ */
+class AnalyticsCalculator
+{
+    /**
+     * Default benchmark symbol (used for beta computation).
+     * You can override this in config/analytics.php or per-call if needed.
+     */
+    protected string $benchmarkTicker = 'SPY';
+
+    /**
+     * Compute derived analytics for a ticker across the specified range.
+     *
+     * @param  int         $tickerId   Target ticker ID
+     * @param  string|null $from       Range start date (YYYY-MM-DD)
+     * @param  string|null $to         Range end date (YYYY-MM-DD)
+     * @return array<string,array<string,mixed>>  Keyed by date → metric → {value, meta}
+     */
+    public function computeDerivedAnalytics(int $tickerId, ?string $from, ?string $to): array
+    {
+        /*
+        |--------------------------------------------------------------------------
+        | 1️⃣ Load ticker price history
+        |--------------------------------------------------------------------------
+        */
+        $bars = TickerPriceHistory::query()
+            ->where('ticker_id', $tickerId)
+            ->where('resolution', '1d')
+            ->when($from, fn($q) => $q->where('t', '>=', $from))
+            ->when($to, fn($q) => $q->where('t', '<=', $to))
+            ->orderBy('t', 'asc')
+            ->get(['t', 'c'])
+            ->map(fn($r) => ['t' => Carbon::parse($r->t)->toDateString(), 'c' => (float) $r->c])
+            ->all();
+
+        if (count($bars) < 2) {
+            Log::channel('ingest')->warning('⚠️ Insufficient bars for derived analytics', [
+                'ticker_id' => $tickerId,
+                'bars'      => count($bars),
+            ]);
+            return [];
+        }
+
+        $closes  = array_column($bars, 'c');
+        $dates   = array_column($bars, 't');
+        $returns = $this->returns($closes);
+
+        /*
+        |--------------------------------------------------------------------------
+        | 2️⃣ Compute primary derived metrics
+        |--------------------------------------------------------------------------
+        */
+        $sharpe     = $this->rollingSharpe($returns, $dates, 60);
+        $volatility = $this->rollingVolatility($returns, $dates, 30);
+        $drawdown   = $this->rollingDrawdown($closes, $dates);
+
+        /*
+        |--------------------------------------------------------------------------
+        | 3️⃣ Compute Beta (vs. benchmark)
+        |--------------------------------------------------------------------------
+        | Loads the benchmark (SPY) returns and aligns date ranges before computing
+        | rolling 60-day beta as Cov(ticker, benchmark) / Var(benchmark).
+        */
+        $beta = $this->rollingBeta($returns, $dates, $this->benchmarkTicker, 60);
+
+        /*
+        |--------------------------------------------------------------------------
+        | 4️⃣ Merge all metrics by date
+        |--------------------------------------------------------------------------
+        */
+        $derived = [];
+        foreach ($dates as $i => $date) {
+            $derived[$date] = [
+                'sharpe_60'     => ['value' => $sharpe[$i]     ?? null, 'meta' => null],
+                'volatility_30' => ['value' => $volatility[$i] ?? null, 'meta' => null],
+                'drawdown'      => ['value' => $drawdown[$i]   ?? null, 'meta' => null],
+                'beta_60'       => ['value' => $beta[$i]       ?? null, 'meta' => ['benchmark' => $this->benchmarkTicker]],
+            ];
+        }
+
+        return $derived;
+    }
+
+    // =========================================================================
+    // 🧮 Helper Calculations
+    // =========================================================================
+
+    /**
+     * Compute simple daily log returns.
+     */
+    protected function returns(array $closes): array
+    {
+        $r = [];
+        for ($i = 1; $i < count($closes); $i++) {
+            $prev = $closes[$i - 1];
+            $curr = $closes[$i];
+            $r[] = $prev > 0 ? log($curr / $prev) : 0;
+        }
+        return $r;
+    }
+
+    /**
+     * Rolling Sharpe ratio (annualized).
+     */
+    protected function rollingSharpe(array $returns, array $dates, int $period): array
+    {
+        $out = [];
+        for ($i = 0; $i < count($returns); $i++) {
+            if ($i < $period) { $out[] = null; continue; }
+            $slice = array_slice($returns, $i - $period, $period);
+            $mean  = array_sum($slice) / $period;
+            $std   = $this->stddev($slice);
+            $out[] = $std > 0 ? ($mean / $std) * sqrt(252) : null;
+        }
+        array_unshift($out, null);
+        return $out;
+    }
+
+    /**
+     * Rolling volatility (annualized standard deviation).
+     */
+    protected function rollingVolatility(array $returns, array $dates, int $period): array
+    {
+        $out = [];
+        for ($i = 0; $i < count($returns); $i++) {
+            if ($i < $period) { $out[] = null; continue; }
+            $slice = array_slice($returns, $i - $period, $period);
+            $out[] = $this->stddev($slice) * sqrt(252);
+        }
+        array_unshift($out, null);
+        return $out;
+    }
+
+    /**
+     * Rolling drawdown percentage relative to prior peak.
+     */
+    protected function rollingDrawdown(array $closes, array $dates): array
+    {
+        $peak = -INF;
+        $out = [];
+        foreach ($closes as $c) {
+            $peak = max($peak, $c);
+            $out[] = $peak > 0 ? ($c - $peak) / $peak : 0;
+        }
+        return $out;
+    }
+
+    /**
+     * Rolling Beta vs benchmark (default SPY).
+     */
+    protected function rollingBeta(array $returns, array $dates, string $benchmarkTicker, int $period): array
+    {
+        /*
+        |--------------------------------------------------------------------------
+        | 🔍 1️⃣ Resolve benchmark ticker_id
+        |--------------------------------------------------------------------------
+        */
+        $benchmarkId = Ticker::where('ticker', $benchmarkTicker)->value('id');
+        if (!$benchmarkId) {
+            Log::channel('ingest')->warning("⚠️ Benchmark ticker not found for beta computation", [
+                'benchmark' => $benchmarkTicker,
+            ]);
+            return array_fill(0, count($returns), null);
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 🔢 2️⃣ Load benchmark closes over same range
+        |--------------------------------------------------------------------------
+        */
+        $benchmarkBars = TickerPriceHistory::query()
+            ->where('ticker_id', $benchmarkId)
+            ->where('resolution', '1d')
+            ->whereBetween('t', [min($dates), max($dates)])
+            ->orderBy('t', 'asc')
+            ->get(['t', 'c'])
+            ->mapWithKeys(fn($r) => [Carbon::parse($r->t)->toDateString() => (float) $r->c])
+            ->all();
+
+        if (empty($benchmarkBars)) {
+            Log::channel('ingest')->warning("⚠️ No benchmark price data available for {$benchmarkTicker}", [
+                'benchmark_id' => $benchmarkId,
+            ]);
+            return array_fill(0, count($returns), null);
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 🧭 3️⃣ Align benchmark closes to ticker dates (forward-fill missing)
+        |--------------------------------------------------------------------------
+        */
+        $bmCloses = [];
+        foreach ($dates as $d) {
+            if (isset($benchmarkBars[$d])) {
+                $bmCloses[] = $benchmarkBars[$d];
+            } else {
+                // forward-fill with last known value
+                $bmCloses[] = end($bmCloses) ?: reset($benchmarkBars);
+            }
+        }
+
+        $bmReturns = $this->returns($bmCloses);
+        if (count($bmReturns) < 2) {
+            Log::channel('ingest')->warning("⚠️ Insufficient benchmark returns for beta computation", [
+                'benchmark' => $benchmarkTicker,
+            ]);
+            return array_fill(0, count($returns), null);
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 📊 4️⃣ Compute rolling beta
+        |--------------------------------------------------------------------------
+        */
+        $out = [];
+        for ($i = 0; $i < count($returns); $i++) {
+            if ($i < $period || $i >= count($bmReturns)) {
+                $out[] = null;
+                continue;
+            }
+            $sliceA = array_slice($returns, $i - $period, $period);
+            $sliceB = array_slice($bmReturns, $i - $period, $period);
+            $cov = $this->covariance($sliceA, $sliceB);
+            $var = $this->variance($sliceB);
+            $out[] = ($var > 0) ? $cov / $var : null;
+        }
+
+        array_unshift($out, null);
+        return $out;
+    }
+
+    // =========================================================================
+    // 📊 Statistical Helpers
+    // =========================================================================
+
+    protected function stddev(array $values): float
+    {
+        $n = count($values);
+        if ($n < 2) return 0.0;
+        $mean = array_sum($values) / $n;
+        $sumSq = 0.0;
+        foreach ($values as $v) $sumSq += pow($v - $mean, 2);
+        return sqrt($sumSq / ($n - 1));
+    }
+
+    protected function variance(array $values): float
+    {
+        $std = $this->stddev($values);
+        return $std ** 2;
+    }
+
+    protected function covariance(array $x, array $y): float
+    {
+        $n = min(count($x), count($y));
+        if ($n < 2) return 0.0;
+        $meanX = array_sum($x) / $n;
+        $meanY = array_sum($y) / $n;
+        $cov = 0.0;
+        for ($i = 0; $i < $n; $i++) {
+            $cov += ($x[$i] - $meanX) * ($y[$i] - $meanY);
+        }
+        return $cov / ($n - 1);
     }
 }
 [EOF: app/Services]

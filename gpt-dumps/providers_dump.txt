@@ -1,4 +1,4 @@
-===== GPT DUMP GENERATED: 2025-10-30T00:32:43Z =====
+===== GPT DUMP GENERATED: 2025-11-03T10:24:19Z =====
 ===== DIRECTORY: app/Providers =====
 
 app/Providers/AppServiceProvider.php
@@ -12,7 +12,6 @@ namespace App\Providers;
 
 use Illuminate\Support\ServiceProvider;
 use Illuminate\Bus\BatchRepository;
-use App\Bus\DatabaseBatchRepository;
 use Illuminate\Bus\BatchFactory;
 use Illuminate\Support\Facades\DB;
 
@@ -20,19 +19,7 @@ class AppServiceProvider extends ServiceProvider
 {
     public function register(): void
     {
-        // Explicit binding for DatabaseBatchRepository
-        $this->app->bind(DatabaseBatchRepository::class, function ($app) {
-            return new DatabaseBatchRepository(
-                $app->make(BatchFactory::class),
-                DB::connection(),
-                config('queue.batching.table', 'job_batches')
-            );
-        });
-
-        // Override Laravel's default batch repository
-        $this->app->extend(BatchRepository::class, function ($service, $app) {
-            return $app->make(DatabaseBatchRepository::class);
-        });
+        //
     }
 
     public function boot(): void
@@ -254,6 +241,11 @@ class ArtisanServiceProvider extends ServiceProvider
             \App\Console\Commands\PolygonFundamentalsIngest::class,
             \App\Console\Commands\PolygonIndicatorsIngest::class,
             \App\Console\Commands\PolygonTickerNewsIngest::class,
+            \App\Console\Commands\TickersComputeIndicators::class,
+            \App\Console\Commands\TickersBuildSnapshots::class,
+            \App\Console\Commands\TickersValidateDataCommand::class,
+            \App\Console\Commands\TickersBackfillIndicatorsCommand::class,
+            \App\Console\Commands\TickersIntegrityScanCommand::class,
         ]);
     }
 }

@@ -1,7 +1,247 @@
-===== GPT DUMP GENERATED: 2025-10-30T00:32:43Z =====
+===== GPT DUMP GENERATED: 2025-11-03T10:24:19Z =====
 ===== DIRECTORY: app/Console/Commands =====
 
-app/Console/Commands/PolygonBatchStatus.php
+app/Console/Commands/TickersBuildSnapshots.php
+
+
+===== FILE: app/Console/Commands/TickersBuildSnapshots.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Log;
+use App\Models\Ticker;
+use App\Jobs\BuildTickerSnapshotJob;
+use Throwable;
+
+/**
+ * Class TickersBuildSnapshots
+ *
+ * High-level orchestration command for generating daily or weekly
+ * JSON feature snapshots across all or selected tickers.
+ *
+ * Snapshots combine:
+ *  - Core indicators from ticker_indicators
+ *  - Derived analytics (Sharpe Ratio, Beta, Volatility, etc.)
+ *  - Aggregated feature vectors for AI and analytics pipelines
+ *
+ * Supports dry-run preview mode for verification before actual database writes.
+ *
+ * Example usage:
+ *   php artisan tickers:build-snapshots --tickers=AAPL,MSFT --from=2022-01-01 --to=2024-12-31
+ *   php artisan tickers:build-snapshots --batch=250 --sleep=2 --include-inactive
+ *   php artisan tickers:build-snapshots --tickers=AAPL --from=2024-01-01 --to=2024-12-31 --preview
+ */
+class TickersBuildSnapshots extends Command
+{
+    protected $signature = 'tickers:build-snapshots
+        {--tickers= : Comma-separated list (default: all active tickers)}
+        {--from= : Start date (YYYY-MM-DD)}
+        {--to= : End date (YYYY-MM-DD)}
+        {--batch=100 : Number of tickers per batch job}
+        {--sleep=0 : Seconds to sleep between batch dispatches}
+        {--include-inactive : Include inactive tickers in selection}
+        {--preview : Dry-run mode (logs output, skips database writes)}
+    ';
+
+    protected $description = 'Aggregate daily feature snapshots into JSON analytics vectors for AI and data pipelines.';
+
+    public function handle(): int
+    {
+        $tickersOpt       = trim((string) $this->option('tickers'));
+        $from             = $this->option('from');
+        $to               = $this->option('to');
+        $batchSize        = max(1, (int) $this->option('batch'));
+        $sleepSeconds     = (int) $this->option('sleep');
+        $includeInactive  = (bool) $this->option('include-inactive');
+        $preview          = (bool) $this->option('preview');
+
+        Log::channel('ingest')->info('▶️ tickers:build-snapshots starting', [
+            'tickers_option' => $tickersOpt,
+            'from'           => $from,
+            'to'             => $to,
+            'batch'          => $batchSize,
+            'preview'        => $preview,
+        ]);
+
+        try {
+            // ---------------------------------------------------------------------
+            // 1️⃣ Resolve tickers to process
+            // ---------------------------------------------------------------------
+            if (!empty($tickersOpt)) {
+                $symbols = array_values(array_filter(array_map('trim', explode(',', $tickersOpt))));
+
+                $tickerIds = Ticker::query()
+                    ->whereIn('ticker', $symbols)
+                    ->pluck('id')
+                    ->all();
+
+                $this->info("🧩 Selected " . count($tickerIds) . " ticker(s) by symbol: " . implode(', ', $symbols));
+            } else {
+                $q = Ticker::query();
+                if (!$includeInactive) {
+                    $q->where('active', true);
+                }
+
+                $tickerIds = $q->pluck('id')->all();
+                $this->info("🌎 Selected " . count($tickerIds) . " active ticker(s) from database.");
+            }
+
+            if (empty($tickerIds)) {
+                $this->warn('⚠️ No tickers found to process.');
+                Log::channel('ingest')->warning('⚠️ tickers:build-snapshots — no tickers matched selection criteria', [
+                    'tickers_option' => $tickersOpt,
+                    'include_inactive' => $includeInactive,
+                ]);
+                return self::SUCCESS;
+            }
+
+            Log::channel('ingest')->info('🎯 Snapshot build target tickers resolved', [
+                'count'   => count($tickerIds),
+                'symbols' => $tickersOpt ?: '[all active]',
+            ]);
+
+            // ---------------------------------------------------------------------
+            // 2️⃣ Define processing range
+            // ---------------------------------------------------------------------
+            $range = [];
+            if ($from) $range['from'] = $from;
+            if ($to)   $range['to']   = $to;
+
+            // ---------------------------------------------------------------------
+            // 3️⃣ Create batched snapshot jobs
+            // ---------------------------------------------------------------------
+            $chunks = array_chunk($tickerIds, $batchSize);
+            $jobs = [];
+
+            foreach ($chunks as $i => $chunk) {
+                $jobs[] = new BuildTickerSnapshotJob($chunk, $range, [], $preview);
+                $this->info("📦 Queued batch " . ($i + 1) . "/" . count($chunks) . " (" . count($chunk) . " tickers)");
+
+                if ($sleepSeconds > 0 && $i < count($chunks) - 1) {
+                    $this->line("⏸ Sleeping {$sleepSeconds}s before next batch...");
+                    sleep($sleepSeconds);
+                }
+            }
+
+            // ---------------------------------------------------------------------
+            // 4️⃣ Dispatch batched jobs
+            // ---------------------------------------------------------------------
+            $batch = Bus::batch($jobs)
+                ->name('TickersBuildSnapshots [' . now()->toDateTimeString() . ']')
+                ->allowFailures()
+                ->dispatch();
+
+            $this->info("🚀 Dispatched snapshot batch id={$batch->id} ({$batch->totalJobs} jobs)");
+            Log::channel('ingest')->info('✅ tickers:build-snapshots batch dispatched', [
+                'batch_id'    => $batch->id,
+                'total_jobs'  => $batch->totalJobs,
+                'tickers'     => count($tickerIds),
+                'preview'     => $preview,
+            ]);
+
+            // ---------------------------------------------------------------------
+            // 5️⃣ Final confirmation
+            // ---------------------------------------------------------------------
+            if ($preview) {
+                $this->comment("💡 Preview mode enabled — no database writes performed.");
+            } else {
+                $this->info("✅ Snapshot jobs running asynchronously in background (batch ID: {$batch->id})");
+            }
+
+            return self::SUCCESS;
+        } catch (Throwable $e) {
+            Log::channel('ingest')->error('❌ tickers:build-snapshots failed', [
+                'message' => $e->getMessage(),
+                'trace'   => substr($e->getTraceAsString(), 0, 1000),
+            ]);
+
+            $this->error("❌ Command failed: " . $e->getMessage());
+            return self::FAILURE;
+        }
+    }
+}app/Console/Commands/TickersBackfillIndicatorsCommand.php
+
+
+===== FILE: app/Console/Commands/TickersBackfillIndicatorsCommand.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Config;
+use App\Jobs\ComputeTickerIndicatorsJob;
+
+/**
+ * ============================================================================
+ *  tickers:backfill-indicators
+ * ============================================================================
+ * Finds tickers missing any of the core DB-stored indicators (macd, atr, adx, vwap)
+ * and optionally queues ComputeTickerIndicatorsJob for backfilling.
+ * ============================================================================
+ */
+class TickersBackfillIndicatorsCommand extends Command
+{
+    protected $signature = 'tickers:backfill-indicators {--dry-run : Only show missing tickers without dispatching}';
+    protected $description = 'Detect and optionally backfill missing core indicators';
+
+    public function handle(): int
+    {
+        $coreIndicators = Config::get('indicators.storage.ticker_indicators', []);
+        $this->info("🧭 Checking indicator coverage for: " . implode(', ', $coreIndicators));
+
+        $tickers = DB::table('tickers')->pluck('id')->toArray();
+        $missingMap = [];
+
+        foreach ($coreIndicators as $indicator) {
+            $have = DB::table('ticker_indicators')
+                ->where('indicator', $indicator)
+                ->distinct()
+                ->pluck('ticker_id')
+                ->toArray();
+
+            $missing = array_diff($tickers, $have);
+            $missingMap[$indicator] = $missing;
+
+            $this->line(sprintf("%-8s missing for %d tickers", $indicator, count($missing)));
+        }
+
+        if ($this->option('dry-run')) {
+            $this->info("✅ Dry run only. No jobs dispatched.");
+            return Command::SUCCESS;
+        }
+
+        // Flatten missing ticker IDs across all indicators
+        $toBackfill = collect($missingMap)->flatten()->unique()->values()->all();
+
+        if (empty($toBackfill)) {
+            $this->info("🎉 All indicators are up to date — no backfill required.");
+            return Command::SUCCESS;
+        }
+
+        $this->info("🚀 Dispatching backfill jobs for " . count($toBackfill) . " tickers…");
+
+        foreach (array_chunk($toBackfill, 50) as $chunk) {
+            // ✅ FIXED: Pass both tickers and indicator list
+            dispatch(new ComputeTickerIndicatorsJob($chunk, $coreIndicators))
+                ->onQueue('default');
+        }
+
+        Log::channel('ingest')->info("🧮 Backfill jobs dispatched", [
+            'tickers' => count($toBackfill),
+            'indicators' => $coreIndicators,
+        ]);
+
+        $this->info("✅ Dispatched backfill jobs for " . count($toBackfill) . " tickers.");
+        return Command::SUCCESS;
+    }
+}app/Console/Commands/PolygonBatchStatus.php
 
 
 ===== FILE: app/Console/Commands/PolygonBatchStatus.php =====
@@ -601,6 +841,540 @@ class PolygonTickerOverviewsIngest extends Command
 
         return Command::SUCCESS;
     }
+}app/Console/Commands/TickersIntegrityScanCommand.php
+
+
+===== FILE: app/Console/Commands/TickersIntegrityScanCommand.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Schema;
+use App\Services\Validation\DataIntegrityService;
+use App\Services\Validation\Validators\PolygonDataValidator;
+use App\Models\DataValidationLog;
+use Carbon\Carbon;
+
+/**
+ * ============================================================================
+ *  tickers:integrity-scan  (v3.0.0 — Diagnostic Expansion + Deep Health Metrics)
+ * ============================================================================
+ *
+ * 🔧 Purpose:
+ *   Performs configurable, severity-weighted integrity scans across ticker data,
+ *   combining local anomaly scoring with optional live Polygon.io verification.
+ *   Now includes detailed per-ticker diagnostics (bar count, coverage ratio,
+ *   flatness, average volume, first/last bar dates) and aggregate issue summaries.
+ *
+ * 🚀 New in v3.0.0:
+ * ----------------------------------------------------------------------------
+ *   • Extended diagnostic table (Bars, Expected, Coverage%, AvgVol, Issues)
+ *   • Inline classification of "empty", "sparse", "flat", "partial", "illiquid"
+ *   • Aggregate diagnostic summary (counts by issue type)
+ *   • Retains bulk re-ingestion and live verification (v2.6.4 feature set)
+ *   • Structured logging of all scan + verification actions
+ *
+ * ============================================================================
+ */
+class TickersIntegrityScanCommand extends Command
+{
+    protected $signature = 'tickers:integrity-scan
+                            {--limit=100 : Number of tickers to scan}
+                            {--from-id=0 : Start scanning from this ticker ID}
+                            {--verify-live : Recheck all critical tickers directly against Polygon.io}';
+
+    protected $description = 'Perform configurable, severity-scored integrity checks for ticker data, with config-driven re-ingest parameters and optional live verification.';
+
+    public function handle(): int
+    {
+        $limit      = (int) $this->option('limit');
+        $fromId     = (int) $this->option('from-id');
+        $verifyLive = (bool) $this->option('verify-live');
+
+        $this->info("🧩 Starting integrity scan for {$limit} tickers (from ID {$fromId})…");
+        if ($verifyLive) {
+            $this->warn('🌐 Live verification mode enabled — Polygon API will be queried for critical tickers.');
+        }
+
+        Log::channel('ingest')->info('🧩 tickers:integrity-scan started', [
+            'limit'       => $limit,
+            'fromId'      => $fromId,
+            'verify_live' => $verifyLive,
+        ]);
+
+        $startedAt = now();
+
+        /*
+        |--------------------------------------------------------------------------
+        | 1️⃣ Create persistent log entry
+        |--------------------------------------------------------------------------
+        */
+        $log = DataValidationLog::create([
+            'entity_type'  => 'ticker_integrity',
+            'command_name' => 'tickers:integrity-scan',
+            'status'       => 'running',
+            'started_at'   => $startedAt,
+            'initiated_by' => get_current_user() ?: 'system',
+        ]);
+
+        /*
+        |--------------------------------------------------------------------------
+        | 2️⃣ Initialize service + ticker selection
+        |--------------------------------------------------------------------------
+        */
+        $service = new DataIntegrityService();
+        $tickers = DB::table('tickers')
+            ->where('id', '>=', $fromId)
+            ->orderBy('id')
+            ->limit($limit)
+            ->get(['id', 'ticker', 'type']);
+
+        $results = [];
+        $healths = [];
+        $sourceHealth = [];
+
+        /*
+        |--------------------------------------------------------------------------
+        | 3️⃣ Per-ticker scans (local + upstream) + diagnostics
+        |--------------------------------------------------------------------------
+        */
+        foreach ($tickers as $ticker) {
+            $id     = $ticker->id;
+            $symbol = $ticker->ticker;
+            $type   = $ticker->type ?? 'CS';
+
+            try {
+                $r = $service->scanTicker($id);
+                $health = $r['health'] ?? 0;
+                $results[$id] = $r;
+                $healths[] = $health;
+
+                // Diagnostics
+                $bars = DB::table('ticker_price_histories')
+                    ->where('ticker_id', $id)
+                    ->count();
+
+                $minDate = DB::table('ticker_price_histories')
+                    ->where('ticker_id', $id)
+                    ->min('t');
+
+                $maxDate = DB::table('ticker_price_histories')
+                    ->where('ticker_id', $id)
+                    ->max('t');
+
+                $expected = 0;
+                if ($minDate && $maxDate) {
+                    $expected = Carbon::parse($minDate)->diffInDays(Carbon::parse($maxDate));
+                }
+
+                $coverage = $expected > 0 ? round(($bars / $expected) * 100, 2) : 0;
+                $avgVol = DB::table('ticker_price_histories')
+                    ->where('ticker_id', $id)
+                    ->avg('v');
+
+                $flatBars = DB::table('ticker_price_histories')
+                    ->where('ticker_id', $id)
+                    ->whereColumn('o', '=', 'c')
+                    ->whereColumn('h', '=', 'l')
+                    ->count();
+
+                $flags = [];
+                if ($bars == 0) $flags[] = 'empty';
+                elseif ($bars < 10) $flags[] = 'sparse';
+                elseif ($coverage < 25) $flags[] = 'partial';
+                if ($avgVol !== null && $avgVol < 100) $flags[] = 'illiquid';
+                if ($flatBars > 0 && $bars > 0 && ($flatBars / $bars) > 0.5) $flags[] = 'flat';
+
+                $results[$id]['diagnostics'] = [
+                    'bars'      => $bars,
+                    'expected'  => $expected,
+                    'coverage'  => $coverage,
+                    'avg_vol'   => $avgVol,
+                    'first'     => $minDate ? Carbon::parse($minDate)->format('Y-m-d') : '—',
+                    'last'      => $maxDate ? Carbon::parse($maxDate)->format('Y-m-d') : '—',
+                    'issues'    => implode(', ', $flags) ?: 'none',
+                ];
+
+                if (!empty($r['upstream'])) {
+                    $sourceHealth[$id] = $r['upstream'];
+                }
+
+                if (isset($r['root_causes']['missing_price_data'])
+                    && $r['root_causes']['missing_price_data'] === 'upstream_empty_response') {
+                    DB::table('tickers')->where('id', $id)->update([
+                        'is_active_polygon'   => false,
+                        'deactivation_reason' => 'no_data_from_polygon',
+                        'updated_at'          => now(),
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                $results[$id] = ['error' => $e->getMessage()];
+                $healths[] = 0;
+                Log::channel('ingest')->error("❌ Integrity scan failed for ticker {$id}", [
+                    'message' => $e->getMessage(),
+                    'trace'   => substr($e->getTraceAsString(), 0, 400),
+                ]);
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 4️⃣ Aggregate overall health stats
+        |--------------------------------------------------------------------------
+        */
+        $total  = count($tickers);
+        $avg    = round(array_sum($healths) / max(1, $total), 4);
+        sort($healths);
+        $median = $healths[intdiv($total, 2)] ?? 0;
+
+        $bands = [
+            'healthy'  => count(array_filter($healths, fn($h) => $h >= 0.9)),
+            'moderate' => count(array_filter($healths, fn($h) => $h >= 0.6 && $h < 0.9)),
+            'critical' => count(array_filter($healths, fn($h) => $h < 0.6)),
+        ];
+
+        $status = $bands['critical'] > 0 ? 'warning' : 'success';
+
+        $payload = [
+            'total_entities'     => $total,
+            'validated_count'    => $bands['healthy'],
+            'missing_count'      => $bands['critical'],
+            'status'             => $status,
+            'completed_at'       => now(),
+            'data_source_health' => json_encode($sourceHealth, JSON_UNESCAPED_SLASHES),
+            'details'            => json_encode($results, JSON_UNESCAPED_SLASHES),
+        ];
+        if (Schema::hasColumn('data_validation_logs', 'validation_ratio')) {
+            $payload['validation_ratio'] = round($bands['healthy'] / max(1, $total), 4);
+        }
+        $log->update($payload);
+
+        /*
+        |--------------------------------------------------------------------------
+        | 5️⃣ Summary display (high-level bands)
+        |--------------------------------------------------------------------------
+        */
+        $this->line('');
+        $this->info('📊 Health Distribution:');
+        $this->line("   ✅ Healthy  : {$bands['healthy']}");
+        $this->line("   ⚠️  Moderate : {$bands['moderate']}");
+        $this->line("   🔴 Critical : {$bands['critical']}");
+        $this->line("   ———————————————————————————————");
+        $this->line("   Avg Health : {$avg}");
+        $this->line("   Median     : {$median}");
+        $this->line('');
+
+        /*
+        |--------------------------------------------------------------------------
+        | 6️⃣ Detailed diagnostics table (Moderate + Critical)
+        |--------------------------------------------------------------------------
+        */
+        $flagged = [];
+        foreach ($results as $id => $r) {
+            $h = $r['health'] ?? 1;
+            if ($h >= 0.9) continue;
+
+            $d = $r['diagnostics'] ?? [];
+            $flagged[] = [
+                'id'        => $id,
+                'symbol'    => DB::table('tickers')->where('id', $id)->value('ticker'),
+                'type'      => DB::table('tickers')->where('id', $id)->value('type'),
+                'health'    => $h,
+                'severity'  => $h < 0.6 ? 'Critical' : 'Moderate',
+                'bars'      => $d['bars'] ?? 0,
+                'expected'  => $d['expected'] ?? 0,
+                'coverage'  => $d['coverage'] ?? 0,
+                'first'     => $d['first'] ?? '—',
+                'last'      => $d['last'] ?? '—',
+                'avg_vol'   => $d['avg_vol'] ?? 0,
+                'issues'    => $d['issues'] ?? 'none',
+            ];
+        }
+
+        if ($flagged) {
+            usort($flagged, fn($a, $b) =>
+                ($a['severity'] === $b['severity'])
+                    ? ($a['id'] <=> $b['id'])
+                    : (($a['severity'] === 'Critical') ? -1 : 1)
+            );
+
+            $this->warn("⚠️ Detailed Report (Moderate & Critical):");
+            $this->line(str_pad('ID', 8)
+                . str_pad('Symbol', 10)
+                . str_pad('Type', 10)
+                . str_pad('Health', 10)
+                . str_pad('Severity', 12)
+                . str_pad('Bars', 8)
+                . str_pad('Expect', 10)
+                . str_pad('Cover%', 10)
+                . str_pad('First', 12)
+                . str_pad('Last', 12)
+                . str_pad('AvgVol', 10)
+                . "Issues");
+            $this->line(str_repeat('-', 128));
+
+            foreach ($flagged as $f) {
+                $sevLabel = $f['severity'] === 'Critical'
+                    ? $this->formatRed('Critical')
+                    : $this->formatYellow('Moderate');
+
+                $this->line(
+                    str_pad($f['id'], 8)
+                    . str_pad($f['symbol'], 10)
+                    . str_pad($f['type'], 10)
+                    . str_pad(number_format($f['health'], 3), 10)
+                    . str_pad($sevLabel, 14)
+                    . str_pad($f['bars'], 8)
+                    . str_pad($f['expected'], 10)
+                    . str_pad($f['coverage'] . '%', 10)
+                    . str_pad($f['first'], 12)
+                    . str_pad($f['last'], 12)
+                    . str_pad(number_format((float)$f['avg_vol'], 0), 10)
+                    . $f['issues']
+                );
+            }
+
+            $this->newLine();
+            // Aggregate issue summary
+            $this->info('📈 Diagnostic Summary:');
+            $this->line('   - Empty tickers     : ' . collect($flagged)->filter(fn($x) => str_contains($x['issues'], 'empty'))->count());
+            $this->line('   - Sparse tickers    : ' . collect($flagged)->filter(fn($x) => str_contains($x['issues'], 'sparse'))->count());
+            $this->line('   - Partial coverage  : ' . collect($flagged)->filter(fn($x) => str_contains($x['issues'], 'partial'))->count());
+            $this->line('   - Flat tickers      : ' . collect($flagged)->filter(fn($x) => str_contains($x['issues'], 'flat'))->count());
+            $this->line('   - Illiquid tickers  : ' . collect($flagged)->filter(fn($x) => str_contains($x['issues'], 'illiquid'))->count());
+            $this->newLine();
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 7️⃣ Live verification + bulk re-ingest (unchanged core logic)
+        |--------------------------------------------------------------------------
+        */
+        $actions = [];
+
+        if ($verifyLive && $flagged) {
+            $critical = array_filter($flagged, fn($x) => $x['severity'] === 'Critical');
+            $this->warn('🔍 Performing live Polygon verification for critical tickers...');
+
+            $validator = new PolygonDataValidator(app('App\Services\Validation\Probes\PolygonProbe'));
+            $live = [];
+
+            foreach ($critical as $ct) {
+                $symbol = $ct['symbol'];
+                $type   = $ct['type'];
+                $check  = $validator->verifyTickerUpstream($symbol);
+                $live[$symbol] = $check;
+                $statusMark = $check['found'] ? '✅' : '❌';
+                $this->line("   {$statusMark} {$symbol} ({$type}) → {$check['message']} ({$check['status']})");
+                usleep(250_000);
+            }
+
+            $log->update(['data_source_health' => json_encode($live, JSON_UNESCAPED_SLASHES)]);
+            $this->newLine();
+
+            $minDate = config('polygon.price_history_min_date', '2020-01-01');
+            $maxDate = now()->toDateString();
+            $resolution = config('polygon.default_timespan', 'day');
+            $multiplier = config('polygon.default_multiplier', 1);
+
+            $verified = array_keys(array_filter($live, fn($res) => $res['found'] && $res['status'] == 200));
+            $notFound = array_keys(array_filter($live, fn($res) => !$res['found']));
+
+            if ($verified) {
+                $this->info("✅ " . (is_array($verified) ? count($verified) : 0) . " tickers verified with Polygon (200 OK).");
+                if ($this->confirm('Re-ingest all verified (200) critical tickers at once?', true)) {
+                    foreach ($verified as $symbol) {
+                        $this->callSilent('polygon:ticker-price-histories:ingest', [
+                            '--symbol'     => $symbol,
+                            '--resolution' => "{$multiplier}{$resolution[0]}",
+                            '--from'       => $minDate,
+                            '--to'         => $maxDate,
+                            '--limit'      => 1,
+                        ]);
+                        $actions[$symbol] = [
+                            'action'      => 're-ingest',
+                            'status'      => 'queued',
+                            'from'        => $minDate,
+                            'to'          => $maxDate,
+                            'resolution'  => $resolution,
+                            'checked_at'  => now()->toIso8601String(),
+                        ];
+                    }
+                    $this->info("🚀 Queued re-ingestion for " . count($verified) . " tickers.");
+                }
+            }
+
+            foreach ($notFound as $symbol) {
+                if ($this->confirm("Deactivate {$symbol}? Polygon has no upstream data.", true)) {
+                    DB::table('tickers')
+                        ->where('ticker', $symbol)
+                        ->update([
+                            'is_active_polygon'   => false,
+                            'deactivation_reason' => 'no_data_from_polygon',
+                            'updated_at'          => now(),
+                        ]);
+                    $actions[$symbol] = [
+                        'action'     => 'deactivated',
+                        'status'     => 'complete',
+                        'checked_at' => now()->toIso8601String(),
+                    ];
+                }
+            }
+
+            if ($actions) {
+                $log->update(['actions' => json_encode($actions, JSON_UNESCAPED_SLASHES)]);
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 🔚 Final summary + structured log
+        |--------------------------------------------------------------------------
+        */
+        Log::channel('ingest')->info('✅ tickers:integrity-scan complete', [
+            'bands'       => $bands,
+            'avg_health'  => $avg,
+            'median'      => $median,
+            'status'      => $status,
+            'verify_live' => $verifyLive,
+            'actions'     => $actions,
+        ]);
+
+        return Command::SUCCESS;
+    }
+
+    /** 🎨 Console color helpers */
+    private function formatRed(string $text): string
+    {
+        return "\033[1;31m{$text}\033[0m";
+    }
+
+    private function formatYellow(string $text): string
+    {
+        return "\033[1;33m{$text}\033[0m";
+    }
+}app/Console/Commands/ComputeCorrelationMatrix.php
+
+
+===== FILE: app/Console/Commands/ComputeCorrelationMatrix.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use App\Services\Analytics\CorrelationMatrixService;
+
+class ComputeCorrelationMatrix extends Command
+{
+    protected $signature = 'compute:correlation-matrix {--window=20} {--lookback=90}';
+    protected $description = 'Compute inter-ticker correlation matrix and persist results.';
+
+    public function handle(CorrelationMatrixService $service): int
+    {
+        $window = (int)$this->option('window');
+        $lookback = (int)$this->option('lookback');
+
+        $this->info("Computing correlation matrix (window={$window}, lookback={$lookback})...");
+        $service->computeMatrix($lookback, $window);
+        $this->info('✅ Correlation matrix computation complete.');
+
+        return self::SUCCESS;
+    }
+}
+app/Console/Commands/TickersValidateDataCommand.php
+
+
+===== FILE: app/Console/Commands/TickersValidateDataCommand.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use App\Models\DataValidationLog;
+
+/**
+ * ============================================================================
+ *  tickers:validate-data
+ * ============================================================================
+ * Performs a full data integrity audit of all ticker-dependent tables
+ * and logs the run summary to `data_validation_logs`.
+ * ============================================================================
+ */
+class TickersValidateDataCommand extends Command
+{
+    protected $signature = 'tickers:validate-data {--summary-only : Show summary counts only}';
+    protected $description = 'Validate data completeness and indicator coverage across all tables';
+
+    public function handle(): int
+    {
+        $startedAt = now();
+
+        $log = DataValidationLog::create([
+            'entity_type' => 'ticker',
+            'command_name' => 'tickers:validate-data',
+            'status' => 'success',
+            'started_at' => $startedAt,
+            'initiated_by' => get_current_user() ?: 'system',
+        ]);
+
+        $this->info("🔍 Running full data validation…");
+        Log::channel('ingest')->info("🔍 tickers:validate-data started");
+
+        $totalTickers = DB::table('tickers')->count();
+        $summary = [];
+
+        $check = function (string $table, string $col = 'ticker_id') use (&$summary, $totalTickers) {
+            $count = DB::table($table)->distinct($col)->count($col);
+            $missing = $totalTickers - $count;
+            $summary[$table] = ['count' => $count, 'missing' => $missing];
+            return $summary[$table];
+        };
+
+        $check('ticker_price_histories');
+        $check('ticker_fundamentals');
+        $check('ticker_overviews');
+        $check('ticker_feature_metrics');
+        $check('ticker_feature_snapshots');
+        $check('ticker_indicators');
+
+        $missingTotal = array_sum(array_column($summary, 'missing'));
+
+        $this->table(
+            ['Table', 'Present', 'Total', 'Missing'],
+            collect($summary)->map(fn($s, $tbl) => [$tbl, $s['count'], $totalTickers, $s['missing']])->toArray()
+        );
+
+        if ($missingTotal > 0) {
+            $this->warn("⚠️ Missing data detected in one or more tables.");
+            $log->status = 'warning';
+        } else {
+            $this->info("✅ All tables validated successfully.");
+        }
+
+        // Persist JSON summary in the log record
+        $log->update([
+            'total_entities' => $totalTickers,
+            'validated_count' => $totalTickers - $missingTotal,
+            'missing_count' => $missingTotal,
+            'details' => $summary,
+            'completed_at' => now(),
+        ]);
+
+        Log::channel('ingest')->info("✅ tickers:validate-data complete", [
+            'summary' => $summary,
+            'missing_total' => $missingTotal,
+        ]);
+
+        return Command::SUCCESS;
+    }
 }app/Console/Commands/PolygonTickerOverviewsRetry.php
 
 
@@ -713,79 +1487,170 @@ use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Log;
 use App\Models\Ticker;
 use App\Services\PolygonTickerPriceHistoryService;
-use Illuminate\Support\Carbon;
+use Carbon\Carbon;
 
+/**
+ * ============================================================================
+ *  polygon:ticker-price-histories:ingest-legacy  (v2.6.4 — Symbol Case Fix)
+ * ============================================================================
+ *
+ * 🔧 Purpose:
+ *   Performs direct (non-queued) ingestion of Polygon ticker price histories.
+ *   Useful for small debug runs or isolated re-ingestion without the queue system.
+ *
+ * 🧠 Behavior:
+ * ----------------------------------------------------------------------------
+ *   • Fetches Polygon aggregates directly for each ticker in sequence.
+ *   • Supports both full-range and single-symbol operation (--symbol=XYZ).
+ *   • Pulls defaults (min_date, resolution, multiplier) from config/polygon.php.
+ *   • Writes detailed progress and timing logs to the 'ingest' log channel.
+ *
+ * 🧩 Key Parameters:
+ * ----------------------------------------------------------------------------
+ *   --symbol=XYZ      → Optional: ingest only a specific ticker.
+ *   --resolution=1d   → Aggregation resolution (1d, 1m, etc.).
+ *   --from / --to     → Custom start/end date, defaults from config.
+ *   --batch / --sleep → Control throughput when processing many tickers.
+ *
+ * 💾 Logging:
+ * ----------------------------------------------------------------------------
+ *   Logs are written to storage/logs/ingest.log and include per-ticker status,
+ *   error details, retry counts, and completion summaries.
+ *
+ * 🚀 New in v2.6.4:
+ * ----------------------------------------------------------------------------
+ *   • Removed forced uppercase normalization for ticker symbols.
+ *   • Polygon’s API is case-sensitive for preferreds, SPACs, and units.
+ *     (e.g., ABRpD ≠ ABRPD)
+ *   • Preserves exact case as stored in the database or supplied via CLI.
+ *   • Clarified symbol handling comments for maintainability.
+ * ============================================================================
+ */
 class PolygonTickerPriceHistoriesIngestLegacy extends Command
 {
-    /**
-     * The name and signature of the console command.
-     *
-     * Example:
-     * php artisan polygon:ticker-price-histories:ingest-legacy --resolution=1d --from=2019-01-01 --limit=0 --batch=1000 --sleep=15
-     */
     protected $signature = 'polygon:ticker-price-histories:ingest-legacy
+                            {--symbol= : Single ticker symbol to ingest (case-sensitive, e.g. ABRpD)}
                             {--resolution=1d : Resolution (1d, 1m, 5m, etc.)}
-                            {--from=2019-01-01 : Start date (YYYY-MM-DD)}
+                            {--from=2020-01-01 : Start date (YYYY-MM-DD)}
                             {--to=null : End date (YYYY-MM-DD) or null for today}
                             {--multiplier=1 : Multiplier for Polygon aggregates endpoint}
-                            {--limit=0 : Limit total tickers processed (0 = all)}
-                            {--batch=1000 : Tickers per chunk}
+                            {--limit=0 : Limit total tickers processed}
+                            {--batch=1000 : Number of tickers per chunk}
                             {--sleep=15 : Seconds to sleep between batches}';
 
     protected $description = 'LEGACY — Direct (non-queued) ingestion of Polygon ticker price histories.';
 
     public function handle(): int
     {
-        $resolution = $this->option('resolution') ?? '1d';
-        $multiplier = (int) $this->option('multiplier');
-        $from = $this->option('from') ?? '2019-01-01';
-        $toOption = $this->option('to');
-        $to = ($toOption === 'null' || $toOption === null)
+        /*
+        |--------------------------------------------------------------------------
+        | 1️⃣ Load Options & Config Defaults
+        |--------------------------------------------------------------------------
+        |
+        | ⚠️  Case Sensitivity Note:
+        | Polygon.io requires exact-case ticker symbols for many instruments.
+        | Prior builds converted all tickers to uppercase, which caused data
+        | fetch failures for tickers such as ABRpD, ATHpA, etc.
+        |
+        | ✅ Fix: Preserve the provided case (do not call strtoupper()).
+        */
+        $symbol     = trim($this->option('symbol') ?? '');  // ✅ Case preserved
+        $resolution = $this->option('resolution') ?? config('polygon.default_timespan', '1d');
+        $multiplier = (int) ($this->option('multiplier') ?? config('polygon.default_multiplier', 1));
+        $from       = $this->option('from') ?? config('polygon.price_history_min_date', '2020-01-01');
+
+        $toOption   = $this->option('to');
+        $to         = ($toOption === 'null' || $toOption === null)
             ? now()->toDateString()
             : $toOption;
-        $limit = (int) $this->option('limit');
-        $batchSize = (int) $this->option('batch');
-        $sleep = (int) $this->option('sleep');
 
+        $limit      = (int) $this->option('limit');
+        $batchSize  = (int) $this->option('batch');
+        $sleep      = (int) $this->option('sleep');
+
+        /*
+        |--------------------------------------------------------------------------
+        | 2️⃣ Initialize Logging & Diagnostics
+        |--------------------------------------------------------------------------
+        */
         $logger = Log::channel('ingest');
-        $logger->info("🚀 [LEGACY] Starting Polygon price history ingestion", compact('resolution', 'from', 'to', 'limit', 'batchSize', 'sleep'));
+        $logger->info("🚀 [LEGACY] Starting Polygon ingestion", [
+            'symbol'     => $symbol ?: 'ALL',
+            'resolution' => $resolution,
+            'multiplier' => $multiplier,
+            'from'       => $from,
+            'to'         => $to,
+            'limit'      => $limit,
+            'batch'      => $batchSize,
+            'sleep'      => $sleep,
+        ]);
 
-        $this->info("📈 [LEGACY] Starting Polygon ticker price history ingestion...");
-        $tickersQuery = Ticker::orderBy('id')->select('id', 'ticker');
+        $this->info("📈 [LEGACY] Polygon price history ingestion (direct mode)...");
+        $this->line("   Symbol     : " . ($symbol ?: 'ALL TICKERS'));
+        $this->line("   Range      : {$from} → {$to}");
+        $this->line("   Resolution : {$resolution}");
+        $this->line("   Multiplier : {$multiplier}");
+        $this->newLine();
 
+        /*
+        |--------------------------------------------------------------------------
+        | 3️⃣ Build Ticker Query
+        |--------------------------------------------------------------------------
+        |
+        |  Preserve case sensitivity in the WHERE clause.
+        |  Many tickers (esp. preferred shares) have mixed-case symbols.
+        */
+        $query = Ticker::orderBy('id')->select('id', 'ticker');
+
+        if ($symbol) {
+            $query->where('ticker', $symbol);  // ✅ exact match (case-sensitive)
+        }
         if ($limit > 0) {
-            $tickersQuery->limit($limit);
+            $query->limit($limit);
         }
 
-        $totalTickers = $tickersQuery->count();
-        if ($totalTickers === 0) {
-            $this->warn("⚠️ No tickers found.");
-            return 0;
+        $total = $query->count();
+        if ($total === 0) {
+            $this->warn('⚠️ No tickers found to ingest.');
+            return Command::SUCCESS;
         }
 
-        $this->info("Processing {$totalTickers} tickers in chunks of {$batchSize}...");
-
-        $bar = $this->output->createProgressBar($totalTickers);
-        $bar->start();
-
+        /*
+        |--------------------------------------------------------------------------
+        | 4️⃣ Initialize Service & Progress Bar
+        |--------------------------------------------------------------------------
+        */
+        $this->info("Processing {$total} ticker(s) in chunks of {$batchSize}...");
         $service = app(PolygonTickerPriceHistoryService::class);
-        $chunkCount = 0;
 
-        $tickersQuery->chunk($batchSize, function ($tickers) use (
-            $service, $resolution, $multiplier, $from, $to, $sleep, &$chunkCount, $bar, $logger
+        $bar = $this->output->createProgressBar($total);
+        $bar->setFormat("   🟢 Progress: %current%/%max% [%bar%] %percent:3s%%");
+        $bar->start();
+        $chunkIndex = 0;
+
+        /*
+        |--------------------------------------------------------------------------
+        | 5️⃣ Process Ticketers in Batches (Direct, No Queue)
+        |--------------------------------------------------------------------------
+        */
+        $query->chunk($batchSize, function ($tickers) use (
+            $service, $resolution, $multiplier, $from, $to, $sleep, &$chunkIndex, $bar, $logger
         ) {
-            $chunkCount++;
-            $logger->info("Processing chunk #{$chunkCount} (".count($tickers)." tickers)");
+            $chunkIndex++;
+            $logger->info("🔹 Processing chunk #{$chunkIndex} (" . count($tickers) . " tickers)");
 
             foreach ($tickers as $ticker) {
                 try {
+                    // Directly invoke the PolygonTickerPriceHistoryService
                     $service->fetchAndStore($ticker, $from, $to, $resolution, $multiplier);
                     $bar->advance();
+                    $this->line("   ✅ {$ticker->ticker} complete.");
                 } catch (\Throwable $e) {
-                    $logger->error("❌ Error ingesting {$ticker->ticker}: ".$e->getMessage(), [
+                    $logger->error("❌ Error ingesting {$ticker->ticker}: {$e->getMessage()}", [
                         'ticker_id' => $ticker->id,
-                        'trace' => $e->getTraceAsString(),
+                        'trace' => substr($e->getTraceAsString(), 0, 500),
                     ]);
+                    $this->error("   ❌ Failed {$ticker->ticker}: {$e->getMessage()}");
                 }
             }
 
@@ -796,12 +1661,17 @@ class PolygonTickerPriceHistoriesIngestLegacy extends Command
             }
         });
 
+        /*
+        |--------------------------------------------------------------------------
+        | 6️⃣ Finalization & Summary
+        |--------------------------------------------------------------------------
+        */
         $bar->finish();
         $this->newLine(2);
-        $this->info("🎯 [LEGACY] All batches completed ({$chunkCount} total).");
-        $logger->info("[LEGACY] Polygon ticker price history ingestion completed.", ['total_batches' => $chunkCount]);
+        $this->info("🎯 [LEGACY] Completed all {$chunkIndex} batches.");
+        $logger->info('[LEGACY] Polygon ingestion complete', ['batches' => $chunkIndex]);
 
-        return 0;
+        return Command::SUCCESS;
     }
 }app/Console/Commands/TickersGenerateSlugs.php
 
@@ -878,7 +1748,174 @@ class TickersGenerateSlugs extends Command
     }
     
 }
-app/Console/Commands/PolygonTickerNewsIngest.php
+app/Console/Commands/TickersComputeIndicators.php
+
+
+===== FILE: app/Console/Commands/TickersComputeIndicators.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Bus;
+use Illuminate\Support\Facades\Log;
+use App\Models\Ticker;
+use App\Jobs\ComputeTickerIndicatorsJob;
+use Throwable;
+
+/**
+ * Class TickersComputeIndicators
+ *
+ * Laravel Artisan command to compute and persist configured technical indicators
+ * for one or more tickers using locally stored OHLCV data.
+ *
+ * This command forms the backbone of the hybrid computation system — populating
+ * the `ticker_indicators` table and optionally triggering JSON-based feature
+ * snapshots (in `ticker_feature_snapshots`).
+ *
+ * Responsibilities:
+ *  - Select tickers to process (by list or all active).
+ *  - Determine which indicator modules to run (from config or CLI flag).
+ *  - Create and dispatch `ComputeTickerIndicatorsJob` jobs in batches.
+ *  - Orchestrate parallel computation safely via Laravel’s Bus::batch().
+ *
+ * Example Usage:
+ *   php artisan tickers:compute-indicators --from=2019-01-01 --to=2025-01-01 --batch=500 --sleep=1
+ *
+ *   # Only recompute for specific tickers
+ *   php artisan tickers:compute-indicators --tickers=AAPL,MSFT,NVDA --indicators=ema,rsi,macd
+ *
+ * Flags:
+ *   --tickers          Comma-separated list (default: all active)
+ *   --indicators       Comma-separated list (default: config('indicators.storage.ticker_indicators'))
+ *   --from,--to        Optional date filters
+ *   --batch            Number of tickers per job batch (default: 100)
+ *   --sleep            Seconds to sleep between batch dispatches (default: 0)
+ *   --include-inactive Include inactive tickers
+ *   --no-snapshots     Disable writing to ticker_feature_snapshots
+ */
+class TickersComputeIndicators extends Command
+{
+    protected $signature = 'tickers:compute-indicators
+        {--tickers= : Comma-separated ticker list (default all active tickers)}
+        {--indicators= : Comma-separated indicator list}
+        {--from= : Start date (YYYY-MM-DD)}
+        {--to= : End date (YYYY-MM-DD)}
+        {--batch=100 : Tickers per job batch}
+        {--sleep=0 : Seconds to sleep between batches}
+        {--include-inactive : Include inactive tickers}
+        {--no-snapshots : Skip writing JSON snapshots (ticker_feature_snapshots)}
+    ';
+
+    protected $description = 'Compute and persist configured technical indicators for selected tickers.';
+
+    public function handle(): int
+    {
+        $tickersOpt       = $this->option('tickers');
+        $indicatorsOpt    = $this->option('indicators');
+        $from             = $this->option('from');
+        $to               = $this->option('to');
+        $batchSize        = (int)$this->option('batch');
+        $sleepSeconds     = (int)$this->option('sleep');
+        $includeInactive  = (bool)$this->option('include-inactive');
+        $writeSnapshots   = ! $this->option('no-snapshots');
+
+        Log::channel('ingest')->info("▶️ tickers:compute-indicators starting", [
+            'tickers' => $tickersOpt,
+            'indicators' => $indicatorsOpt,
+            'from' => $from,
+            'to' => $to,
+            'snapshots' => $writeSnapshots ? 'enabled' : 'disabled',
+        ]);
+
+        try {
+            // ---------------------------------------------------------------------
+            // (1) Resolve ticker universe
+            // ---------------------------------------------------------------------
+            if ($tickersOpt) {
+                $symbols = array_values(array_filter(array_map('trim', explode(',', $tickersOpt))));
+                $tickerIds = Ticker::whereIn('ticker', $symbols)->pluck('id')->all();
+                $this->info("Selected " . count($tickerIds) . " tickers from CLI argument.");
+            } else {
+                $query = Ticker::query();
+                if (! $includeInactive) {
+                    $query->where('active', true);
+                }
+                $tickerIds = $query->pluck('id')->all();
+                $this->info("Selected " . count($tickerIds) . " tickers from active universe.");
+            }
+
+            if (empty($tickerIds)) {
+                $this->warn('No tickers found to process.');
+                return self::SUCCESS;
+            }
+
+            // ---------------------------------------------------------------------
+            // (2) Resolve which indicators to compute
+            // ---------------------------------------------------------------------
+            $configured = config('indicators.storage.ticker_indicators', []);
+            $indicators = $indicatorsOpt
+                ? array_values(array_filter(array_map('trim', explode(',', $indicatorsOpt))))
+                : $configured;
+
+            if (empty($indicators)) {
+                $this->warn('No indicators configured or provided. Aborting.');
+                return self::SUCCESS;
+            }
+
+            // ---------------------------------------------------------------------
+            // (3) Prepare date range and job batching
+            // ---------------------------------------------------------------------
+            $range = [];
+            if ($from) $range['from'] = $from;
+            if ($to)   $range['to']   = $to;
+
+            $chunks = array_chunk($tickerIds, max(1, $batchSize));
+            $batchJobs = [];
+
+            foreach ($chunks as $i => $chunk) {
+                $batchJobs[] = new ComputeTickerIndicatorsJob(
+                    tickerIds: $chunk,
+                    indicators: $indicators,
+                    range: $range,
+                    params: [],
+                    writeSnapshots: $writeSnapshots
+                );
+
+                $this->info("Queued chunk " . ($i + 1) . "/" . count($chunks) . " (" . count($chunk) . " tickers)");
+
+                if ($sleepSeconds > 0 && $i < count($chunks) - 1) {
+                    $this->line("Sleeping {$sleepSeconds}s before next batch...");
+                    sleep($sleepSeconds);
+                }
+            }
+
+            // ---------------------------------------------------------------------
+            // (4) Dispatch job batch to queue
+            // ---------------------------------------------------------------------
+            $batch = Bus::batch($batchJobs)
+                ->name('TickersComputeIndicators [' . now()->toDateTimeString() . ']')
+                ->allowFailures()
+                ->dispatch();
+
+            $this->info("🚀 Dispatched compute batch id={$batch->id} ({$batch->totalJobs} jobs)");
+            Log::channel('ingest')->info("✅ tickers:compute-indicators batch dispatched", [
+                'batch_id' => $batch->id,
+                'total_jobs' => $batch->totalJobs,
+                'snapshots' => $writeSnapshots,
+            ]);
+
+            return self::SUCCESS;
+        } catch (Throwable $e) {
+            Log::channel('ingest')->error("❌ tickers:compute-indicators failed", [
+                'message' => $e->getMessage(),
+                'trace' => substr($e->getTraceAsString(), 0, 1000),
+            ]);
+            throw $e;
+        }
+    }
+}app/Console/Commands/PolygonTickerNewsIngest.php
 
 
 ===== FILE: app/Console/Commands/PolygonTickerNewsIngest.php =====
@@ -1005,69 +2042,173 @@ use Illuminate\Support\Facades\Log;
 use App\Models\Ticker;
 use App\Jobs\IngestTickerPriceHistoryJob;
 use App\Services\BatchMonitorService;
+use Illuminate\Support\Facades\Schema;
 use Throwable;
 
+/**
+ * ============================================================================
+ *  polygon:ticker-price-histories:ingest  (v2.6.4 — Symbol-Aware Queued Ingest)
+ * ============================================================================
+ *
+ * 🔧 Purpose:
+ *   Dispatches asynchronous (queued) Polygon.io price-history ingestion jobs
+ *   for all tickers or a single ticker specified via --symbol.
+ *   Provides resilient batch orchestration with progress tracking,
+ *   error logging, and configurable time-range controls.
+ *
+ * 🧠 Behavior:
+ * ----------------------------------------------------------------------------
+ *   • Fetches all tickers (or one via --symbol).
+ *   • Divides them into job batches and dispatches to the database queue.
+ *   • Uses configuration defaults for date range and resolution.
+ *   • Optionally throttles between batches to respect rate limits.
+ *   • Integrates with BatchMonitorService for centralized tracking.
+ *
+ * ⚙️ Config Integration:
+ * ----------------------------------------------------------------------------
+ *   Reads from config/polygon.php:
+ *     - price_history_min_date → default historical floor
+ *     - default_timespan       → “day”, “minute”, etc.
+ *     - default_multiplier     → Polygon aggregates multiplier
+ *
+ * 📦 Command Signature:
+ * ----------------------------------------------------------------------------
+ *   php artisan polygon:ticker-price-histories:ingest
+ *       --symbol=AAPL
+ *       --resolution=1d
+ *       --from=2020-01-01
+ *       --to=2025-10-31
+ *       --limit=1000
+ *       --batch=500
+ *       --sleep=5
+ *
+ * 💾 Logging & Diagnostics:
+ * ----------------------------------------------------------------------------
+ *   • Logs per-batch dispatch events to storage/logs/ingest.log.
+ *   • Prints console progress bar + total summary.
+ *   • Reports batch count, tickers processed, and error traces if any.
+ *
+ * 🚀 New in v2.6.4:
+ * ----------------------------------------------------------------------------
+ *   • Removes forced uppercasing of ticker symbols (case-sensitive API fix).
+ *   • Ensures compatibility with Polygon tickers containing mixed case
+ *     (e.g., ABRpD, ATHpA, etc.).
+ *   • Adds inline comments explaining symbol casing rationale.
+ *   • Retains all existing queue orchestration, logging, and schema advisory.
+ *
+ * 🧩 Related Components:
+ * ----------------------------------------------------------------------------
+ *   • App\Jobs\IngestTickerPriceHistoryJob
+ *   • App\Services\BatchMonitorService
+ *   • config/polygon.php
+ * ============================================================================
+ */
 class PolygonTickerPriceHistoryIngest extends Command
 {
     protected $signature = 'polygon:ticker-price-histories:ingest
+                            {--symbol= : Optional single ticker symbol to ingest (e.g. AAPL or ABRpD)}
                             {--resolution=1d : Resolution (1d, 1m, 5m, etc.)}
-                            {--from=2019-01-01 : Start date (YYYY-MM-DD)}
-                            {--to=null : End date (YYYY-MM-DD) or null for today}
+                            {--from= : Start date (YYYY-MM-DD), defaults to polygon.price_history_min_date}
+                            {--to= : End date (YYYY-MM-DD), defaults to today}
                             {--limit=0 : Limit total tickers processed (0 = all)}
                             {--batch=500 : Number of tickers per job batch}
-                            {--sleep=5 : Seconds to sleep before dispatch (rate limiting)}';
+                            {--sleep=5 : Seconds to sleep before dispatching next batch}';
 
-    protected $description = 'Queue Polygon price history ingestion jobs for all tickers and track via batch monitoring';
+    protected $description = 'Queue Polygon.io price-history ingestion jobs for all or specific tickers with configurable range and batching.';
 
     public function handle(): int
     {
-        $resolution = $this->option('resolution') ?? '1d';
-        $from = $this->option('from') ?? '2019-01-01';
-        $toOption = $this->option('to');
-        $to = ($toOption === 'null' || $toOption === null)
-            ? now()->toDateString()
-            : $toOption;
+        /*
+        |--------------------------------------------------------------------------
+        | 1️⃣ Load Options & Config Defaults
+        |--------------------------------------------------------------------------
+        |
+        |  🔎 IMPORTANT CHANGE:
+        |  Polygon’s aggregates API is *case-sensitive* for some tickers
+        |  (especially preferred shares, units, and SPACs).
+        |
+        |  Previously, we used strtoupper() to normalize all symbols,
+        |  which caused valid tickers like "ABRpD" or "ATHpA" to fail.
+        |
+        |  Fix: We now preserve the symbol’s exact case from the DB
+        |  or from the --symbol argument as provided.
+        */
+        $symbol     = trim($this->option('symbol') ?? '');  // ✅ Case preserved — do NOT uppercase.
+        $resolution = $this->option('resolution') ?? config('polygon.default_timespan', '1d');
+        $from       = $this->option('from') ?? config('polygon.price_history_min_date', '2020-01-01');
 
-        $limit = (int) $this->option('limit');
-        $batchSize = (int) $this->option('batch');
-        $sleep = (int) $this->option('sleep');
+        $toOption   = $this->option('to');
+        $to         = $toOption ?: now()->toDateString();
+
+        $limit      = (int) $this->option('limit', 0);
+        $batchSize  = (int) $this->option('batch', 500);
+        $sleep      = (int) $this->option('sleep', 5);
 
         $logger = Log::channel('ingest');
-        $this->info("📈 Preparing to dispatch Polygon ticker price history ingestion...");
-        $logger->info('Starting Polygon price histories ingestion', compact('resolution', 'from', 'to', 'limit', 'batchSize', 'sleep'));
 
-        $tickersQuery = Ticker::orderBy('id')->select('id', 'ticker');
-        $totalTickers = $tickersQuery->count();
+        $logger->info('📥 Polygon ingestion command started', [
+            'symbol'     => $symbol ?: 'ALL',
+            'resolution' => $resolution,
+            'from'       => $from,
+            'to'         => $to,
+            'limit'      => $limit,
+            'batchSize'  => $batchSize,
+            'sleep'      => $sleep,
+        ]);
 
-        if ($limit > 0 && $limit < $totalTickers) {
-            $tickersQuery->limit($limit);
-            $totalTickers = $limit;
+        $this->info("📈 Preparing Polygon ticker price ingestion...");
+        $this->line("   Symbol     : " . ($symbol ?: 'ALL TICKERS'));
+        $this->line("   Range      : {$from} → {$to}");
+        $this->line("   Resolution : {$resolution}");
+        $this->line("   Batch Size : {$batchSize}");
+        $this->newLine();
+
+        /*
+        |--------------------------------------------------------------------------
+        | 2️⃣ Build Ticker Query
+        |--------------------------------------------------------------------------
+        |
+        |  If a --symbol was passed, match it *exactly* (case-sensitive)
+        |  because Polygon tickers like ABRpD ≠ ABRPD.
+        */
+        $query = Ticker::orderBy('id')->select('id', 'ticker');
+        if ($symbol) {
+            $query->where('ticker', $symbol);  // case-sensitive match
+        }
+        if ($limit > 0) {
+            $query->limit($limit);
         }
 
-        $this->info("Total tickers to process: {$totalTickers}");
-        $logger->info("Preparing batch for {$totalTickers} tickers");
-
-        if ($totalTickers === 0) {
-            $this->warn("⚠️ No tickers found to ingest.");
-            return 0;
+        $total = $query->count();
+        if ($total === 0) {
+            $this->warn("⚠️ No tickers found for ingestion (symbol={$symbol}).");
+            return Command::SUCCESS;
         }
 
-        $bar = $this->output->createProgressBar($totalTickers);
+        /*
+        |--------------------------------------------------------------------------
+        | 3️⃣ Initialize Batch Monitor & Progress Bar
+        |--------------------------------------------------------------------------
+        */
+        BatchMonitorService::createBatch('PolygonTickerPriceHistories', $total);
+
+        $bar = $this->output->createProgressBar($total);
+        $bar->setFormat("   🟢 Progress: %current%/%max% [%bar%] %percent:3s%%");
         $bar->start();
 
-        // Optional custom batch monitor
-        BatchMonitorService::createBatch('PolygonTickerPriceHistories', $totalTickers);
+        $batchIndex = 1;
 
-        $batchCount = 1;
-
-        $tickersQuery->chunk($batchSize, function ($tickers) use (
-            $resolution, $from, $to, $sleep, $bar, $logger, &$batchCount
+        /*
+        |--------------------------------------------------------------------------
+        | 4️⃣ Chunk & Dispatch Jobs
+        |--------------------------------------------------------------------------
+        */
+        $query->chunk($batchSize, function ($tickers) use (
+            $resolution, $from, $to, $sleep, $bar, $logger, &$batchIndex
         ) {
             $jobs = [];
-
             foreach ($tickers as $ticker) {
-                // Pass the full Ticker model to the job
-                $jobs[] = new IngestTickerPriceHistoryJob($ticker, $from, $to);
+                $jobs[] = new IngestTickerPriceHistoryJob($ticker, $from, $to, $resolution);
                 $bar->advance();
             }
 
@@ -1077,44 +2218,156 @@ class PolygonTickerPriceHistoryIngest extends Command
 
             try {
                 $batch = Bus::batch($jobs)
-                    ->name("PolygonTickerPriceHistoriesIngest (chunk #{$batchCount})")
+                    ->name("PolygonTickerPriceHistoriesIngest (Batch #{$batchIndex})")
                     ->onConnection('database')
                     ->onQueue('default')
                     ->dispatch();
 
                 $jobCount = count($jobs);
-                $this->newLine();
-                $this->info("✅ Dispatched chunk #{$batchCount} ({$jobCount} jobs): {$batch->id}");
-
-                $logger->info('✅ Dispatched chunk batch', [
-                    'batch_number' => $batchCount,
-                    'batch_id' => $batch->id,
-                    'job_count' => $jobCount,
+                $logger->info('✅ Dispatched ingestion batch', [
+                    'batch_index' => $batchIndex,
+                    'batch_id'    => $batch->id ?? null,
+                    'job_count'   => $jobCount,
+                    'from'        => $from,
+                    'to'          => $to,
+                    'resolution'  => $resolution,
                 ]);
 
-                $batchCount++;
+                $this->newLine();
+                $this->info("✅ Dispatched batch #{$batchIndex} ({$jobCount} jobs)");
+                $batchIndex++;
 
                 if ($sleep > 0) {
-                    $this->info("⏳ Sleeping {$sleep}s before next dispatch...");
+                    $this->info("⏳ Sleeping {$sleep}s before next batch...");
                     sleep($sleep);
                 }
             } catch (Throwable $e) {
-                $this->error("❌ Failed to dispatch chunk batch #{$batchCount}: {$e->getMessage()}");
-                $logger->error('Error dispatching chunk batch', [
-                    'batch_number' => $batchCount,
-                    'error' => $e->getMessage(),
-                    'trace' => $e->getTraceAsString(),
+                $logger->error('❌ Failed to dispatch ingestion batch', [
+                    'batch_index' => $batchIndex,
+                    'error'       => $e->getMessage(),
+                    'trace'       => substr($e->getTraceAsString(), 0, 400),
                 ]);
+
+                $this->error("❌ Batch #{$batchIndex} failed: {$e->getMessage()}");
             }
         });
 
+        /*
+        |--------------------------------------------------------------------------
+        | 5️⃣ Finalize & Report
+        |--------------------------------------------------------------------------
+        */
         $bar->finish();
         $this->newLine(2);
 
-        $this->info("🎯 All batches dispatched successfully ({$batchCount} total).");
-        $logger->info("All ticker ingestion batches dispatched successfully", ['total_batches' => $batchCount]);
+        $this->info("🎯 All batches dispatched successfully.");
+        $logger->info('🏁 Polygon ingestion complete', [
+            'symbol'    => $symbol ?: 'ALL',
+            'total'     => $total,
+            'batches'   => $batchIndex - 1,
+            'completed' => now()->toIso8601String(),
+        ]);
 
-        return 0;
+        /*
+        |--------------------------------------------------------------------------
+        | ℹ️ Schema Advisory (job_batches)
+        |--------------------------------------------------------------------------
+        */
+        if (! Schema::hasColumn('job_batches', 'processed_jobs')) {
+            $this->warn("⚠️ Note: The 'job_batches' table appears outdated. Run:");
+            $this->line("   php artisan queue:batches-table && php artisan migrate");
+            $this->line("   (This adds 'processed_jobs' for accurate queue metrics.)");
+            $this->newLine();
+        }
+
+        return Command::SUCCESS;
+    }
+}app/Console/Commands/TickersReviewMissingDataCommand.php
+
+
+===== FILE: app/Console/Commands/TickersReviewMissingDataCommand.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\DB;
+
+/**
+ * ============================================================================
+ *  tickers:review-missing-data
+ * ============================================================================
+ *
+ * 🔧 Purpose:
+ *   Provides a quick overview of tickers that were deactivated or flagged
+ *   due to missing Polygon data or other data-source issues.
+ *
+ * 🧠 Behavior:
+ * ----------------------------------------------------------------------------
+ *   • Lists all tickers where `is_active_polygon = false`
+ *   • Displays their deactivation reason and metadata
+ *   • Can optionally re-probe Polygon for verification (coming soon)
+ *
+ * 💾 Output Columns:
+ * ----------------------------------------------------------------------------
+ *   | ID | Ticker | Active | Reason | Last Updated |
+ *
+ * ============================================================================
+ */
+class TickersReviewMissingDataCommand extends Command
+{
+    protected $signature = 'tickers:review-missing-data
+                            {--limit=100 : Number of inactive tickers to display}
+                            {--reason= : Filter by deactivation reason (e.g. no_data_from_polygon)}';
+
+    protected $description = 'List all tickers missing Polygon data or marked inactive for validation review.';
+
+    public function handle(): int
+    {
+        $limit  = (int) $this->option('limit');
+        $reason = $this->option('reason');
+
+        $query = DB::table('tickers')
+            ->select('id', 'ticker', 'name', 'is_active_polygon', 'deactivation_reason', 'updated_at')
+            ->where('is_active_polygon', '=', false)
+            ->orderBy('updated_at', 'desc')
+            ->limit($limit);
+
+        if ($reason) {
+            $query->where('deactivation_reason', $reason);
+        }
+
+        $records = $query->get();
+
+        if ($records->isEmpty()) {
+            $this->info("✅ No tickers currently marked as inactive (is_active_polygon = false).");
+            return Command::SUCCESS;
+        }
+
+        $this->info("📉 Found {$records->count()} inactive tickers:");
+        $this->newLine();
+
+        $headers = ['ID', 'Ticker', 'Name', 'Active', 'Reason', 'Updated'];
+        $rows = [];
+
+        foreach ($records as $r) {
+            $rows[] = [
+                $r->id,
+                $r->ticker,
+                str($r->name)->limit(24),
+                $r->is_active_polygon ? '✅' : '❌',
+                $r->deactivation_reason ?: '—',
+                $r->updated_at,
+            ];
+        }
+
+        $this->table($headers, $rows);
+
+        $this->newLine();
+        $this->comment("💡 Tip: You can filter by reason — e.g. `php artisan tickers:review-missing-data --reason=no_data_from_polygon`");
+
+        return Command::SUCCESS;
     }
 }app/Console/Commands/PolygonDataReset.php
 
@@ -1319,80 +2572,133 @@ use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Log;
 use App\Models\Ticker;
 use App\Jobs\IngestTickerIndicatorsJob;
-use App\Services\BatchMonitorService;
 use Throwable;
 
 class PolygonIndicatorsIngest extends Command
 {
-    protected $signature = 'polygon:indicators:ingest-batch
-                            {--batch=200 : Number of tickers per batch}
-                            {--indicators=sma_20,ema_50,rsi_14,macd : Comma-separated indicator list}
-                            {--sleep=5 : Seconds to pause between dispatches}';
+    protected $signature = 'polygon:indicators:ingest
+        {--tickers= : Comma-separated list of tickers (defaults to active universe)}
+        {--indicators=sma_20,ema_50,ema_200,rsi_14,macd : Comma-separated indicator list}
+        {--from= : Start date (YYYY-MM-DD)}
+        {--to= : End date (YYYY-MM-DD)}
+        {--batch=200 : Tickers per job}
+        {--sleep=0 : Seconds to sleep between batches}
+        {--only-active : Only active tickers (default)}
+        {--include-inactive : Include inactive tickers}
+    ';
 
-    protected $description = 'Queue technical indicator ingestion jobs for all tickers in batches.';
+    protected $description = 'Ingest Polygon indicators (SMA/EMA/RSI/MACD) for tickers over a date range.';
 
     public function handle(): int
     {
-        $batchSize = (int) $this->option('batch');
-        $sleep = (int) $this->option('sleep');
-        $indicators = explode(',', $this->option('indicators'));
+        $tickersArg   = $this->option('tickers');
+        $indicators   = array_values(array_filter(array_map('trim', explode(',', (string)$this->option('indicators')))));
+        $from         = $this->option('from');
+        $to           = $this->option('to');
+        $batchSize    = (int) $this->option('batch');
+        $sleepSeconds = (int) $this->option('sleep');
 
-        $tickers = Ticker::select('id', 'ticker')->where('active', true)->orderBy('id')->cursor();
+        Log::channel('ingest')->info("▶️ PolygonIndicatorsIngest command starting", [
+            'indicators' => $indicators,
+            'from' => $from,
+            'to' => $to,
+            'batch_size' => $batchSize,
+            'sleep_seconds' => $sleepSeconds,
+        ]);
 
-        if ($tickers->count() === 0) {
-            $this->warn('No active tickers found.');
-            return self::SUCCESS;
-        }
-
-        $this->info("Dispatching indicator ingestion batches (batch size: {$batchSize})...");
-        $logger = Log::channel('ingest');
-
-        $jobs = [];
-        $chunk = [];
-        $totalTickers = 0;
-        $batchCount = 0;
-
-        foreach ($tickers as $ticker) {
-            $chunk[] = new IngestTickerIndicatorsJob($ticker->id, $indicators);
-            $totalTickers++;
-
-            if (count($chunk) >= $batchSize) {
-                $batchCount++;
-                $this->dispatchChunk($chunk, $batchCount, $sleep, $logger);
-                $chunk = [];
-            }
-        }
-
-        if (!empty($chunk)) {
-            $batchCount++;
-            $this->dispatchChunk($chunk, $batchCount, $sleep, $logger);
-        }
-
-        $this->newLine(2);
-        $this->info("✅ Dispatched {$totalTickers} tickers across {$batchCount} batches.");
-        $logger->info("Indicator batch ingestion complete.", ['batches' => $batchCount, 'tickers' => $totalTickers]);
-
-        return self::SUCCESS;
-    }
-
-    protected function dispatchChunk(array $jobs, int $batchNumber, int $sleep, $logger): void
-    {
         try {
-            $batch = Bus::batch($jobs)
-                ->name("PolygonIndicators Batch #{$batchNumber}")
-                ->onConnection('database')
-                ->onQueue('default')
-                ->then(fn() => Log::info("✅ Batch #{$batchNumber} complete"))
-                ->catch(fn(Throwable $e) => Log::error("❌ Batch #{$batchNumber} failed: {$e->getMessage()}"))
+            // --- Phase 1: Validate indicators
+            if (empty($indicators)) {
+                Log::channel('ingest')->warning("⚠️ No indicators specified. Aborting.");
+                $this->error('No indicators specified.');
+                return self::FAILURE;
+            }
+
+            // --- Phase 2: Select tickers
+            if ($tickersArg) {
+                $tickersList = array_values(array_filter(array_map('trim', explode(',', $tickersArg))));
+                $tickerIds = Ticker::whereIn('ticker', $tickersList)->pluck('id')->all();
+
+                Log::channel('ingest')->info("📈 Ticker subset provided", [
+                    'tickers' => $tickersList,
+                    'count' => count($tickerIds),
+                ]);
+            } else {
+                $q = Ticker::query();
+                if (!$this->option('include-inactive')) {
+                    $q->where('active', true);
+                }
+                $tickerIds = $q->pluck('id')->all();
+
+                Log::channel('ingest')->info("📊 Auto-selected active tickers", [
+                    'count' => count($tickerIds),
+                ]);
+            }
+
+            if (empty($tickerIds)) {
+                Log::channel('ingest')->warning("⚠️ No tickers found to process");
+                $this->warn('No tickers found to process.');
+                return self::SUCCESS;
+            }
+
+            $range = [];
+            if ($from) $range['from'] = $from;
+            if ($to)   $range['to']   = $to;
+
+            // --- Phase 3: Chunk tickers
+            $chunks     = array_chunk($tickerIds, max(1, $batchSize));
+            $batchJobs  = [];
+            $chunkCount = count($chunks);
+
+            Log::channel('ingest')->info("🧩 Preparing indicator ingestion jobs", [
+                'chunks' => $chunkCount,
+                'total_tickers' => count($tickerIds),
+                'indicators' => $indicators,
+            ]);
+
+            foreach ($chunks as $i => $chunk) {
+                $batchJobs[] = new IngestTickerIndicatorsJob($chunk, $indicators, $range);
+
+                Log::channel('ingest')->info("🧱 Queued chunk", [
+                    'chunk_number' => $i + 1,
+                    'tickers_in_chunk' => count($chunk),
+                    'range' => $range,
+                ]);
+
+                if ($sleepSeconds > 0 && $i < ($chunkCount - 1)) {
+                    Log::channel('ingest')->info("💤 Sleeping before next batch", [
+                        'sleep_seconds' => $sleepSeconds,
+                    ]);
+                    sleep($sleepSeconds);
+                }
+            }
+
+            // --- Phase 4: Dispatch batch
+            $batch = Bus::batch($batchJobs)
+                ->name('polygon:indicators:ingest [' . now()->toDateTimeString() . ']')
+                ->allowFailures()
                 ->dispatch();
 
-            BatchMonitorService::createBatch("PolygonIndicators Batch #{$batchNumber}", count($jobs));
+            Log::channel('ingest')->info("🚀 Indicators ingestion batch dispatched", [
+                'batch_id' => $batch->id,
+                'total_jobs' => $batch->totalJobs,
+                'timestamp' => now()->toDateTimeString(),
+            ]);
 
-            $this->info("✅ Dispatched batch #{$batchNumber} ({$batch->totalJobs} jobs)");
-            sleep($sleep);
+            Log::channel('ingest')->info("🏁 PolygonIndicatorsIngest command complete", [
+                'batch_id' => $batch->id,
+            ]);
+
+            $this->info("Dispatched indicators batch id={$batch->id} ({$batch->totalJobs} jobs)");
+
+            return self::SUCCESS;
+
         } catch (Throwable $e) {
-            $logger->error("Error dispatching batch #{$batchNumber}: {$e->getMessage()}");
-            $this->error("❌ Failed to dispatch batch #{$batchNumber}: {$e->getMessage()}");
+            Log::channel('ingest')->error("❌ PolygonIndicatorsIngest command failed", [
+                'message' => $e->getMessage(),
+                'trace' => substr($e->getTraceAsString(), 0, 1000),
+            ]);
+            throw $e;
         }
     }
 }app/Console/Commands/MonitorBatches.php
@@ -1559,13 +2865,52 @@ use App\Models\Ticker;
 use App\Services\PolygonPriceHistoryService;
 use Carbon\Carbon;
 
+/**
+ * ============================================================================
+ *  polygon:ingest-ticker-prices  (v2.6.4 — Case-Sensitive Incremental Fix)
+ * ============================================================================
+ *
+ * 🔧 Purpose:
+ *   Incrementally ingests recent Polygon price data for tickers that are missing
+ *   bars beyond the most recent locally stored date, avoiding full re-fetches.
+ *
+ * 🧠 Behavior:
+ * ----------------------------------------------------------------------------
+ *   • Determines last available date per ticker from `ticker_price_histories`.
+ *   • If `--force` is set, re-fetches full 5-year history from config baseline.
+ *   • Uses small daily/yearly chunks to safely stay within Polygon rate limits.
+ *   • Implements exponential backoff retry on API errors.
+ *
+ * ⚙️ Options:
+ * ----------------------------------------------------------------------------
+ *   --ticker=XYZ  → Optional: only process this ticker (case-sensitive).
+ *   --force       → Ignore local data and fetch full 5-year history.
+ *
+ * 🧩 Dependencies:
+ * ----------------------------------------------------------------------------
+ *   • App\Services\PolygonPriceHistoryService
+ *   • DB::table('ticker_price_histories')
+ *   • Config keys: polygon.price_history_min_date, polygon.default_timespan
+ *
+ * 💾 Logging:
+ * ----------------------------------------------------------------------------
+ *   Logs to channel('polygon'), includes retries, durations, and data counts.
+ *
+ * 🚀 New in v2.6.4:
+ * ----------------------------------------------------------------------------
+ *   • Removed forced uppercasing of symbols (`strtoupper()` → preserved case).
+ *   • Polygon.io requires exact-case tickers for preferreds, units, and SPACs
+ *     (e.g., ABRpD ≠ ABRPD).
+ *   • Added detailed inline documentation for case sensitivity handling.
+ * ============================================================================
+ */
 class PolygonTickerPricesIngestIncremental extends Command
 {
     protected $signature = 'polygon:ingest-ticker-prices
-                            {--ticker= : Specific ticker symbol to ingest}
+                            {--ticker= : Specific ticker symbol to ingest (case-sensitive, e.g. ABRpD)}
                             {--force : Reingest full history (default 5 years)}';
 
-    protected $description = 'Incrementally ingest daily ticker prices from Polygon.io into ticker_price_histories with retry and backoff.';
+    protected $description = 'Incrementally ingest daily ticker prices from Polygon.io with retry and backoff.';
 
     protected PolygonPriceHistoryService $priceHistoryService;
 
@@ -1577,30 +2922,50 @@ class PolygonTickerPricesIngestIncremental extends Command
 
     public function handle(): int
     {
-        $tickerArg = $this->option('ticker');
-        $force = $this->option('force');
+        /*
+        |--------------------------------------------------------------------------
+        | 1️⃣ Load Options
+        |--------------------------------------------------------------------------
+        |
+        | ⚠️ Case Sensitivity Note:
+        | Polygon’s aggregates endpoint is case-sensitive. Mixed-case tickers like
+        | ABRpD or ATHpA must be preserved exactly as stored in the database or
+        | supplied by the user.
+        |
+        | ✅ Fix: Removed strtoupper() normalization.
+        */
+        $symbol = trim($this->option('ticker') ?? '');  // Case preserved
+        $force  = $this->option('force');
 
+        /*
+        |--------------------------------------------------------------------------
+        | 2️⃣ Prepare Ticker Query
+        |--------------------------------------------------------------------------
+        */
         $query = Ticker::query();
-        if ($tickerArg) {
-            $query->where('ticker', strtoupper($tickerArg));
+        if ($symbol) {
+            $query->where('ticker', $symbol);  // exact match, case-sensitive
         }
 
         $tickers = $query->get();
         if ($tickers->isEmpty()) {
-            $this->warn('No tickers found matching criteria.');
+            $this->warn('⚠️ No tickers found matching criteria.');
             return Command::SUCCESS;
         }
 
-        $this->info("Starting incremental ingestion for {$tickers->count()} ticker(s)...");
-
+        /*
+        |--------------------------------------------------------------------------
+        | 3️⃣ Begin Ingestion Loop
+        |--------------------------------------------------------------------------
+        */
+        $this->info("🚀 Starting incremental ingestion for {$tickers->count()} ticker(s)...");
         foreach ($tickers as $ticker) {
             try {
                 $this->ingestTicker($ticker, $force);
             } catch (\Throwable $e) {
-                Log::channel('polygon')->error("Error ingesting {$ticker->ticker}: {$e->getMessage()}", [
-                    'trace' => $e->getTraceAsString(),
+                Log::channel('polygon')->error("❌ Error ingesting {$ticker->ticker}: {$e->getMessage()}", [
+                    'trace' => substr($e->getTraceAsString(), 0, 500),
                 ]);
-                $this->error("❌ Error ingesting {$ticker->ticker}: {$e->getMessage()}");
             }
         }
 
@@ -1608,11 +2973,21 @@ class PolygonTickerPricesIngestIncremental extends Command
         return Command::SUCCESS;
     }
 
+    /**
+     * Ingest (or re-ingest) price history for a specific ticker.
+     */
     protected function ingestTicker(Ticker $ticker, bool $force = false): void
     {
-        $symbol = $ticker->ticker;
+        $symbol = $ticker->ticker;  // Use exact DB-stored case
         $this->line("→ Processing {$symbol}...");
 
+        /*
+        |--------------------------------------------------------------------------
+        | 1️⃣ Determine Start Date
+        |--------------------------------------------------------------------------
+        | If not forced, resume from the most recent local date (t + 1 day).
+        | Otherwise, fetch the full range starting from configured min_date.
+        */
         $latest = null;
         if (! $force) {
             $latest = DB::table('ticker_price_histories')
@@ -1621,74 +2996,88 @@ class PolygonTickerPricesIngestIncremental extends Command
                 ->max('t');
         }
 
-        $startDate = $force || !$latest
-            ? Carbon::now()->subYears(5)->format('Y-m-d')
-            : Carbon::parse($latest)->addDay()->format('Y-m-d');
+        $minDate = config('polygon.price_history_min_date', '2020-01-01');
+        $start = $force || ! $latest
+            ? Carbon::parse($minDate)
+            : Carbon::parse($latest)->addDay();
+        $end = Carbon::now();
 
-        $endDate = Carbon::now()->format('Y-m-d');
-
-        if (Carbon::parse($startDate)->greaterThan($endDate)) {
-            $this->line("   Already up to date.");
+        if ($start->gt($end)) {
+            $this->line("   ✅ Already up to date.");
             return;
         }
 
-        $this->line("   Fetching bars from {$startDate} → {$endDate} in chunks...");
-
-        $chunkStart = Carbon::parse($startDate);
-        $chunkSize = 365;
+        /*
+        |--------------------------------------------------------------------------
+        | 2️⃣ Fetch Data in Yearly Chunks
+        |--------------------------------------------------------------------------
+        */
+        $this->line("   Fetching bars from {$start->toDateString()} → {$end->toDateString()} in yearly chunks...");
+        $chunkStart = clone $start;
+        $chunkDays = 365;
         $totalBars = 0;
 
-        while ($chunkStart->lessThanOrEqualTo(Carbon::parse($endDate))) {
-            $chunkEnd = (clone $chunkStart)->addDays($chunkSize - 1);
-            if ($chunkEnd->greaterThan(Carbon::parse($endDate))) {
-                $chunkEnd = Carbon::parse($endDate);
-            }
-
+        while ($chunkStart->lte($end)) {
+            $chunkEnd = (clone $chunkStart)->addDays($chunkDays - 1)->min($end);
             $this->line("     → {$chunkStart->toDateString()} to {$chunkEnd->toDateString()}");
 
             $attempt = 0;
-            $maxAttempts = 3;
+            $max = 3;
             $bars = null;
 
-            while ($attempt < $maxAttempts) {
+            /*
+            |--------------------------------------------------------------------------
+            | 3️⃣ Fetch Aggregates with Exponential Backoff
+            |--------------------------------------------------------------------------
+            */
+            while ($attempt < $max) {
                 try {
                     $bars = $this->priceHistoryService->fetchAggregates(
-                        $symbol,
-                        1,
-                        'day',
+                        $symbol,            // case-preserved symbol
+                        1,                  // multiplier
+                        'day',              // timespan
                         $chunkStart->toDateString(),
                         $chunkEnd->toDateString()
                     );
-
-                    // Success: exit retry loop
                     break;
                 } catch (\Throwable $e) {
                     $attempt++;
                     $wait = pow(2, $attempt + 1);
-                    Log::channel('polygon')->warning("Retry {$attempt}/{$maxAttempts} for {$symbol} ({$chunkStart->toDateString()} → {$chunkEnd->toDateString()}): {$e->getMessage()}");
-                    $this->warn("       ⚠️ Attempt {$attempt} failed: {$e->getMessage()} — retrying in {$wait}s...");
+                    Log::channel('polygon')->warning("Retry {$attempt}/{$max} for {$symbol}: {$e->getMessage()}");
+                    $this->warn("       ⚠️ Retry {$attempt} failed — waiting {$wait}s...");
                     sleep($wait);
                 }
             }
 
-            if (!empty($bars)) {
+            /*
+            |--------------------------------------------------------------------------
+            | 4️⃣ Upsert Retrieved Bars
+            |--------------------------------------------------------------------------
+            */
+            if ($bars) {
                 $inserted = $this->priceHistoryService->upsertBars($ticker->id, $symbol, '1d', $bars);
                 $totalBars += $inserted;
                 $this->line("       ✅ Upserted {$inserted} bars.");
             } else {
-                $this->line("       ❌ Failed all retries or no data returned.");
+                $this->line("       ❌ No data returned for chunk.");
             }
 
-            // Normal pacing delay to respect rate limits
+            // Modest sleep between chunk fetches to ease rate limits
             sleep(2);
+
+            // Advance chunk window
             $chunkStart = $chunkEnd->addDay();
         }
 
-        $this->info("   ✅ Completed {$symbol}: total {$totalBars} bars inserted/updated.");
-        Log::channel('polygon')->info("Ingested {$totalBars} bars for {$symbol}", [
-            'symbol' => $symbol,
-            'start' => $startDate,
-            'end' => $endDate,
+        /*
+        |--------------------------------------------------------------------------
+        | 5️⃣ Completion Summary
+        |--------------------------------------------------------------------------
+        */
+        $this->info("   ✅ Completed {$symbol}: {$totalBars} bars inserted/updated.");
+        Log::channel('polygon')->info("Incremental ingestion complete", [
+            'symbol'   => $symbol,
+            'inserted' => $totalBars,
         ]);
     }
 }

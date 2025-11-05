@@ -1,4 +1,4 @@
-===== GPT DUMP GENERATED: 2025-10-30T00:32:43Z =====
+===== GPT DUMP GENERATED: 2025-11-03T10:24:19Z =====
 ===== DATABASE MIGRATIONS (Part 2 - Remaining Files) =====
 
 
@@ -1246,6 +1246,671 @@ return new class extends Migration {
                 $table->dropUnique('uq_tfundamentals_unique_period');
             }
         });
+    }
+};
+
+===== FILE: database/migrations/2025_10_30_014834_add_composite_index_to_ticker_indicators.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        if (Schema::hasTable('ticker_indicators')) {
+            Schema::table('ticker_indicators', function (Blueprint $table) {
+                // Speeds: WHERE ticker_id=? AND indicator=? AND t BETWEEN ?
+                $table->index(['ticker_id', 'indicator', 't'], 'idx_ticker_indicator_t');
+            });
+        }
+    }
+
+    
+    public function down(): void
+    {
+        if (Schema::hasTable('ticker_indicators')) {
+            Schema::table('ticker_indicators', function (Blueprint $table) {
+                $table->dropIndex('idx_ticker_indicator_t');
+            });
+        }
+    }
+};
+
+===== FILE: database/migrations/2025_10_30_185854_create_ticker_correlations_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('ticker_correlations', function (Blueprint $table) {
+            $table->id();
+            $table->unsignedBigInteger('ticker_id_a'); // e.g., AAPL
+            $table->unsignedBigInteger('ticker_id_b'); // e.g., NVDA
+            $table->date('as_of_date');                 // end of rolling window
+            $table->float('corr', 8, 5)->nullable();    // correlation coefficient
+            $table->float('beta', 8, 5)->nullable();    // optional regression slope
+            $table->float('r2', 8, 5)->nullable();      // optional R²
+            $table->timestamps();
+
+            $table->unique(['ticker_id_a', 'ticker_id_b', 'as_of_date']);
+            $table->index(['ticker_id_a', 'as_of_date']);
+        });
+    }
+
+    
+    public function down(): void
+    {
+        Schema::dropIfExists('ticker_correlations');
+    }
+};
+
+
+===== FILE: database/migrations/2025_10_30_232901_create_ticker_feature_snapshots_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     *
+     * Creates the `ticker_feature_snapshots` table, which stores a per-ticker,
+     * per-date JSON blob of all computed indicators and derived analytics.
+     *
+     * This structure serves as a compact, AI-ready "feature vector" format
+     * — one record per ticker per day — optimized for machine learning and
+     * market modeling pipelines.
+     */
+    public function up(): void
+    {
+        Schema::create('ticker_feature_snapshots', function (Blueprint $table) {
+            $table->id();
+
+            // The ticker symbol reference
+            $table->foreignId('ticker_id')->constrained()->cascadeOnDelete();
+
+            // Timestamp (typically 1D resolution)
+            $table->date('t')->index();
+
+            // All computed indicators and analytics as JSON
+            $table->json('indicators');
+
+            // Optional embedding vector or summary fields for LLM ingestion
+            $table->json('embedding')->nullable();
+
+            $table->timestamps();
+
+            // Each ticker_id + date combination must be unique
+            $table->unique(['ticker_id', 't']);
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('ticker_feature_snapshots');
+    }
+};
+
+===== FILE: database/migrations/2025_10_31_050715_alter_ticker_feature_snapshots_add_indicators_column.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\DB;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        if (!Schema::hasTable('ticker_feature_snapshots')) {
+            return;
+        }
+
+        Schema::table('ticker_feature_snapshots', function (Blueprint $table) {
+            if (!Schema::hasColumn('ticker_feature_snapshots', 'indicators')) {
+                $table->longText('indicators')
+                    ->nullable()
+                    ->collation('utf8mb4_bin')
+                    ->after('t');
+            }
+        });
+
+        // Add JSON validity check (safe fallback for MariaDB/MySQL)
+        try {
+            DB::statement("ALTER TABLE `ticker_feature_snapshots`
+                ADD CONSTRAINT `chk_tfs_indicators_json`
+                CHECK (JSON_VALID(`indicators`))");
+        } catch (\Throwable $e) {
+            // MariaDB <10.4 or MySQL <5.7 may skip this silently
+        }
+
+        // Add composite index if it doesn't already exist
+        if (!$this->indexExists('ticker_feature_snapshots', 'idx_tfs_ticker_t')) {
+            Schema::table('ticker_feature_snapshots', function (Blueprint $table) {
+                $table->index(['ticker_id', 't'], 'idx_tfs_ticker_t');
+            });
+        }
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        if (!Schema::hasTable('ticker_feature_snapshots')) {
+            return;
+        }
+
+        Schema::table('ticker_feature_snapshots', function (Blueprint $table) {
+            if (Schema::hasColumn('ticker_feature_snapshots', 'indicators')) {
+                $table->dropColumn('indicators');
+            }
+            if ($this->indexExists('ticker_feature_snapshots', 'idx_tfs_ticker_t')) {
+                $table->dropIndex('idx_tfs_ticker_t');
+            }
+        });
+
+        try {
+            DB::statement("ALTER TABLE `ticker_feature_snapshots`
+                DROP CONSTRAINT `chk_tfs_indicators_json`");
+        } catch (\Throwable $e) {
+            // Safe to ignore
+        }
+    }
+
+    /**
+     * Cross-DB safe index existence check using SHOW INDEX.
+     */
+    private function indexExists(string $table, string $index): bool
+    {
+        try {
+            $dbName = DB::getDatabaseName();
+            $res = DB::select("
+                SELECT COUNT(1) AS found
+                FROM information_schema.statistics
+                WHERE table_schema = ? AND table_name = ? AND index_name = ?
+                LIMIT 1
+            ", [$dbName, $table, $index]);
+
+            return isset($res[0]) && (int)$res[0]->found > 0;
+        } catch (\Throwable $e) {
+            return false;
+        }
+    }
+};
+
+===== FILE: database/migrations/2025_10_31_140525_create_ticker_feature_metrics_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('ticker_feature_metrics', function (Blueprint $table) {
+            $table->id();
+            $table->foreignId('ticker_id')->constrained('tickers')->onDelete('cascade');
+            $table->date('t')->index();
+
+            $table->double('sharpe_60')->nullable();
+            $table->double('volatility_30')->nullable();
+            $table->double('drawdown')->nullable();
+            $table->double('beta_60')->nullable();
+            $table->double('momentum_10')->nullable();
+
+            $table->timestamps();
+
+            $table->unique(['ticker_id', 't']);
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('ticker_feature_metrics');
+    }
+};
+
+
+===== FILE: database/migrations/2025_11_01_085959_create_data_validation_logs_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+/**
+ * ============================================================================
+ *  CreateDataValidationLogsTable
+ * ============================================================================
+ *
+ * Purpose:
+ *   Persistent audit log for data validation runs across TickerWolf.ai subsystems.
+ *   Records metadata, counts, and anomaly summaries for each validation event.
+ *
+ *   This table is intentionally generic — the "entity_type" column distinguishes
+ *   between ticker-level, sentiment-level, or other data validations.
+ *
+ * ============================================================================
+ */
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::create('data_validation_logs', function (Blueprint $table) {
+            $table->id();
+
+            // Generic categorization fields
+            $table->string('entity_type', 50)->default('ticker')
+                  ->comment('The logical entity being validated (e.g. ticker, sentiment, fundamentals)');
+            $table->string('command_name', 100)
+                  ->comment('The artisan command or script that triggered this validation');
+
+            // Counts and summary metrics
+            $table->unsignedInteger('total_entities')->nullable()
+                  ->comment('Total count of expected records');
+            $table->unsignedInteger('validated_count')->nullable()
+                  ->comment('Number of entities successfully validated');
+            $table->unsignedInteger('missing_count')->nullable()
+                  ->comment('Number of missing or invalid entities');
+
+            // JSON summary blob for flexible anomaly detail storage
+            $table->json('details')->nullable()
+                  ->comment('JSON-encoded summary of anomalies, missing tables, etc.');
+
+            // Status & timing
+            $table->enum('status', ['success', 'warning', 'error'])
+                  ->default('success')
+                  ->comment('Overall validation outcome');
+            $table->timestamp('started_at')->nullable();
+            $table->timestamp('completed_at')->nullable();
+
+            // Traceability
+            $table->string('initiated_by', 100)->nullable()
+                  ->comment('User or system actor initiating validation');
+            $table->timestamps();
+        });
+    }
+
+    
+    public function down(): void
+    {
+        Schema::dropIfExists('data_validation_logs');
+    }
+};
+
+===== FILE: database/migrations/2025_11_01_092337_widen_columns_in_data_validation_logs.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('data_validation_logs', function (Blueprint $table) {
+            $table->unsignedBigInteger('total_entities')->nullable()->change();
+            $table->unsignedBigInteger('validated_count')->nullable()->change();
+            $table->unsignedBigInteger('missing_count')->nullable()->change();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('data_validation_logs', function (Blueprint $table) {
+            $table->unsignedInteger('total_entities')->nullable()->change();
+            $table->unsignedInteger('validated_count')->nullable()->change();
+            $table->unsignedInteger('missing_count')->nullable()->change();
+        });
+    }
+};
+
+===== FILE: database/migrations/2025_11_02_021816_add_data_source_health_and_polygon_flags.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+/**
+ * ============================================================================
+ *  Migration: add_data_source_health_and_polygon_flags
+ * ============================================================================
+ *
+ * 🔧 Purpose:
+ *   • Adds upstream health tracking + Polygon status flags.
+ *   • Enables root-cause analysis for missing data (local vs. upstream).
+ *
+ * 📦 Tables affected:
+ *   • tickers
+ *   • data_validation_logs
+ *
+ * ============================================================================
+ */
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        /*
+        |--------------------------------------------------------------------------
+        | Extend tickers table
+        |--------------------------------------------------------------------------
+        */
+        Schema::table('tickers', function (Blueprint $table) {
+            // Pick the best reference column dynamically (some schemas use "active")
+            $afterColumn = Schema::hasColumn('tickers', 'is_active')
+                ? 'is_active'
+                : (Schema::hasColumn('tickers', 'active') ? 'active' : 'status');
+
+            if (!Schema::hasColumn('tickers', 'is_active_polygon')) {
+                $table->boolean('is_active_polygon')
+                    ->default(true)
+                    ->after($afterColumn)
+                    ->comment('Indicates if Polygon.io has valid upstream data for this ticker');
+            }
+
+            if (!Schema::hasColumn('tickers', 'deactivation_reason')) {
+                $table->string('deactivation_reason', 255)
+                    ->nullable()
+                    ->after('is_active_polygon')
+                    ->comment('Human-readable reason for deactivation (e.g. delisted, no_data_from_polygon)');
+            }
+        });
+
+        /*
+        |--------------------------------------------------------------------------
+        | Extend data_validation_logs table
+        |--------------------------------------------------------------------------
+        */
+        Schema::table('data_validation_logs', function (Blueprint $table) {
+            if (!Schema::hasColumn('data_validation_logs', 'data_source_health')) {
+                $table->json('data_source_health')
+                    ->nullable()
+                    ->after('details')
+                    ->comment('JSON blob describing upstream API health or probe results');
+            }
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('tickers', function (Blueprint $table) {
+            if (Schema::hasColumn('tickers', 'is_active_polygon')) {
+                $table->dropColumn('is_active_polygon');
+            }
+            if (Schema::hasColumn('tickers', 'deactivation_reason')) {
+                $table->dropColumn('deactivation_reason');
+            }
+        });
+
+        Schema::table('data_validation_logs', function (Blueprint $table) {
+            if (Schema::hasColumn('data_validation_logs', 'data_source_health')) {
+                $table->dropColumn('data_source_health');
+            }
+        });
+    }
+};
+
+===== FILE: database/migrations/2025_11_02_183454_add_processed_jobs_to_job_batches_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Add the processed_jobs column to the job_batches table.
+     *
+     * This column was introduced in Laravel 10.8+ for more precise
+     * batch progress tracking and to allow real-time % complete reporting.
+     */
+    public function up(): void
+    {
+        Schema::table('job_batches', function (Blueprint $table) {
+            if (! Schema::hasColumn('job_batches', 'processed_jobs')) {
+                $table->unsignedInteger('processed_jobs')->default(0)->after('failed_jobs');
+            }
+        });
+    }
+
+    /**
+     * Reverse the migration changes.
+     */
+    public function down(): void
+    {
+        Schema::table('job_batches', function (Blueprint $table) {
+            if (Schema::hasColumn('job_batches', 'processed_jobs')) {
+                $table->dropColumn('processed_jobs');
+            }
+        });
+    }
+};
+
+===== FILE: database/migrations/2025_11_02_184627_alter_data_validation_logs_status_enum.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('data_validation_logs', function (Blueprint $table) {
+            $table->enum('status', ['running', 'success', 'warning', 'error'])
+                ->default('running')
+                ->change();
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('data_validation_logs', function (Blueprint $table) {
+            $table->enum('status', ['success', 'warning', 'error'])
+                ->default('success')
+                ->change();
+        });
+    }
+};
+
+===== FILE: database/migrations/2025_11_02_192801_add_status_to_job_batches_table.php =====
+
+<?php
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration {
+
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::table('job_batches', function (Blueprint $table) {
+            // Add new status column with sensible default
+            if (! Schema::hasColumn('job_batches', 'status')) {
+                $table->string('status', 20)->default('running')->after('processed_jobs');
+            }
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::table('job_batches', function (Blueprint $table) {
+            if (Schema::hasColumn('job_batches', 'status')) {
+                $table->dropColumn('status');
+            }
+        });
+    }
+};
+
+
+===== FILE: database/migrations/2025_11_02_195538_fix_job_batches_schema_for_batches.php =====
+
+<?php
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Facades\DB;
+
+return new class extends Migration {
+    public function up(): void
+    {
+        Schema::table('job_batches', function (Blueprint $table) {
+            // Change `id` to UUID primary key (if not already)
+            if (Schema::hasColumn('job_batches', 'id')) {
+                DB::statement('ALTER TABLE job_batches MODIFY id CHAR(36) NOT NULL');
+            } else {
+                $table->uuid('id')->primary();
+            }
+
+            // Add processed_jobs if missing
+            if (! Schema::hasColumn('job_batches', 'processed_jobs')) {
+                $table->unsignedInteger('processed_jobs')->default(0)->after('failed_jobs');
+            }
+
+            // Add status column if missing
+            if (! Schema::hasColumn('job_batches', 'status')) {
+                $table->string('status', 20)->default('running')->after('processed_jobs');
+            }
+        });
+    }
+
+    public function down(): void
+    {
+        // revert optional
+    }
+};
+
+===== FILE: database/migrations/2025_11_02_200228_rebuild_job_batches_table.php =====
+
+<?php
+
+use Illuminate\Database\Migrations\Migration;
+use Illuminate\Database\Schema\Blueprint;
+use Illuminate\Support\Facades\Schema;
+
+return new class extends Migration
+{
+    /**
+     * Run the migrations.
+     */
+    public function up(): void
+    {
+        Schema::dropIfExists('job_batches');
+
+        Schema::create('job_batches', function (Blueprint $table) {
+            // Core identifiers
+            $table->string('id')->primary();
+            $table->string('name');
+
+            // Job tracking
+            $table->integer('total_jobs');
+            $table->integer('pending_jobs');
+            $table->integer('failed_jobs');
+            $table->integer('processed_jobs')->default(0);
+
+            // Failure + options metadata
+            $table->longText('failed_job_ids')->nullable()->default('[]');
+            $table->mediumText('options')->nullable();
+
+            // Batch lifecycle status
+            $table->string('status')->default('running');
+
+            // 🚀 Laravel Bus uses 32-bit UNIX timestamps for these columns.
+            // Using plain integer avoids truncation / invalid datetime warnings.
+            $table->integer('cancelled_at')->nullable();
+            $table->integer('created_at');
+            $table->integer('finished_at')->nullable();
+
+            // Optional high-resolution tracking for your app (Eloquent safe)
+            $table->timestamp('updated_at')->nullable();
+
+            // Helpful indexes
+            $table->index('created_at');
+            $table->index('finished_at');
+            $table->index('status');
+        });
+    }
+
+    /**
+     * Reverse the migrations.
+     */
+    public function down(): void
+    {
+        Schema::dropIfExists('job_batches');
     }
 };
 [EOF: database/migrations (Part 2)]
