@@ -7,6 +7,9 @@ use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Config;
 use App\Services\Validation\Validators\PolygonDataValidator;
 use App\Services\Validation\Validators\PriceHistoryValidator;
+use App\Services\Validation\Validators\IndicatorsValidator;
+use App\Services\Validation\Validators\SnapshotsValidator;
+use App\Services\Validation\Validators\MetricsValidator;
 
 /**
  * ============================================================================
@@ -54,8 +57,8 @@ class DataIntegrityService
      */
     protected array $validators = [
         'price_history' => PriceHistoryValidator::class,
-        // 'indicator'    => \App\Services\Validation\Validators\IndicatorValidator::class,
-        // 'snapshot'     => \App\Services\Validation\Validators\SnapshotValidator::class,
+        'indicators'    => IndicatorsValidator::class,
+        'snapshots'     => SnapshotsValidator::class,
         // 'metrics'      => \App\Services\Validation\Validators\MetricsValidator::class,
     ];
 
