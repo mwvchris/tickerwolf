@@ -1,0 +1,39 @@
+-----------------------------------------------------------------
+ Clean Data Ingestion Run Order
+-----------------------------------------------------------------
+
+** Prep: ***
+
+1.) Drop any cached configs or compiled routes from previous runs. Get fresh configs and env. vars
+
+php artisan optimize:clear
+php artisan cache:clear
+php artisan config:clear
+php artisan route:clear
+php artisan view:clear
+
+
+2.) Clear out all old queue data to start clean:
+
+php artisan queue:flush
+php artisan queue:prune-batches --hours=0
+php artisan queue:prune-failed --hours=0
+
+3.) Kill any old workers, then restart the queue listener:
+
+php artisan queue:restart
+php artisan queue:work --queue=default --tries=3 --timeout=180
+
+------------------------------------------------------------------
+
+Tickers:
+php artisan polygon:tickers:ingest --market=stocks
+
+Ticker Price Histories:
+php artisan polygon:ticker-price-histories:ingest --resolution=1d --from=2019-01-01 --sleep=2
+
+Incidators/Snapshots:
+php artisan tickers:compute-indicators --from=2019-01-01 --to=2025-11-04 --batch=500 --sleep=1 --include-inactive
+
+Ticker Metrics:
+php artisan tickers:build-snapshots --from=2019-01-01 --to=2025-11-04 --batch=500 --sleep=1 --include-inactive
