@@ -13,26 +13,52 @@ use Illuminate\Support\Facades\App;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
+/**
+ * Job: IngestTickerOverviewJob
+ *
+ * Processes a batch of ticker symbols by fetching their overview data
+ * from Polygon.io and upserting into the local DB.
+ *
+ * Note: This job is dispatched in batches by PolygonTickerOverviewsIngest.
+ * Each instance should only contain scalar ticker symbols (strings) to
+ * ensure serialization into the database queue works properly.
+ */
 class IngestTickerOverviewJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels, Batchable;
 
-    protected array $tickers;
+    /**
+     * @var array List of ticker symbols (strings only)
+     */
+    protected $tickers;
 
+    /**
+     * @param array $tickers Plain array of ticker symbols, e.g. ['AAPL','MSFT']
+     */
     public function __construct(array $tickers)
     {
-        $this->tickers = $tickers;
+        // Convert possible Eloquent models or objects to strings for safe serialization
+        $this->tickers = array_map(function ($t) {
+            if (is_object($t) && isset($t->ticker)) {
+                return $t->ticker;
+            }
+            return (string) $t;
+        }, $tickers);
     }
 
+    /**
+     * Handle the job.
+     */
     public function handle(): void
     {
         $service = App::make(PolygonTickerOverviewService::class);
         $batchId = $this->batchId ?? 'n/a';
         $total = count($this->tickers);
 
-        Log::channel('polygon')->info("Processing ticker overview batch", [
+        Log::channel('ingest')->info("🚀 Processing ticker overview batch", [
             'batch_id' => $batchId,
             'total_tickers' => $total,
+            'tickers_sample' => array_slice($this->tickers, 0, 5),
         ]);
 
         $processed = $succeeded = $failed = 0;
@@ -43,7 +69,7 @@ class IngestTickerOverviewJob implements ShouldQueue
                 $succeeded++;
             } catch (Throwable $e) {
                 $failed++;
-                Log::channel('polygon')->error("Failed to process ticker overview", [
+                Log::channel('ingest')->error("❌ Failed to process ticker overview", [
                     'ticker' => $ticker,
                     'batch_id' => $batchId,
                     'error' => $e->getMessage(),
@@ -51,9 +77,8 @@ class IngestTickerOverviewJob implements ShouldQueue
             }
 
             $processed++;
-
             if ($processed % 50 === 0 || $processed === $total) {
-                Log::channel('polygon')->info("Batch progress", [
+                Log::channel('ingest')->info("📊 Batch progress", [
                     'batch_id' => $batchId,
                     'processed' => $processed,
                     'succeeded' => $succeeded,
@@ -62,7 +87,7 @@ class IngestTickerOverviewJob implements ShouldQueue
             }
         }
 
-        Log::channel('polygon')->info("Batch complete", [
+        Log::channel('ingest')->info("✅ Batch complete", [
             'batch_id' => $batchId,
             'processed' => $processed,
             'succeeded' => $succeeded,

@@ -36,6 +36,8 @@ class PolygonTickerPriceHistoryService
 
     /**
      * Construct the service.
+     *
+     * @param  \App\Services\PolygonPriceHistoryService  $polygon
      */
     public function __construct(PolygonPriceHistoryService $polygon)
     {
@@ -59,9 +61,10 @@ class PolygonTickerPriceHistoryService
      */
     public function fetchAndStore(object $ticker, string $rangeFrom, string $rangeTo): void
     {
+        //------------------------------------------------------------------
+        // 1. Resolve basic context and sanity-check inputs
+        //------------------------------------------------------------------
         $logger = Log::channel($this->logChannel);
-
-        // Resolve symbol and sanity-check required attributes
         $symbol = $ticker->ticker ?? $ticker->symbol ?? null;
 
         if (empty($symbol) || empty($ticker->id)) {
@@ -69,20 +72,25 @@ class PolygonTickerPriceHistoryService
             return;
         }
 
-        // Normalize symbol according to asset type
+        //------------------------------------------------------------------
+        // 2. Normalize symbol and prep parameters
+        //------------------------------------------------------------------
         $normalizedSymbol = $this->normalizeSymbol($ticker);
-        $tickerId = (int)$ticker->id;
-        $resolution = '1d';
-        $multiplier = 1;
-        $timespan = 'day';
+        $tickerId = (int) $ticker->id;
+        $resolution = '1d';   // Daily bars
+        $multiplier = 1;      // 1-day interval
+        $timespan   = 'day';  // Polygon timespan keyword
 
         $logger->info("📈 Fetching Polygon data for {$normalizedSymbol} ({$rangeFrom} → {$rangeTo})");
 
+        //------------------------------------------------------------------
+        // 3. Attempt fetch and retry logic
+        //------------------------------------------------------------------
         try {
-            // Attempt initial fetch
+            // Primary request (normalized case)
             $bars = $this->polygon->fetchAggregates($normalizedSymbol, $multiplier, $timespan, $rangeFrom, $rangeTo);
 
-            // If Polygon returns nothing, retry with raw/original symbol casing
+            // Retry with alternate casing if nothing returned
             if (empty($bars)) {
                 $altSymbol = $symbol;
                 if ($altSymbol !== $normalizedSymbol) {
@@ -91,18 +99,39 @@ class PolygonTickerPriceHistoryService
                 }
             }
 
-            // Still no data? Likely illiquid or unsupported instrument
+            // Still empty → likely illiquid, delisted, or no historical data
             if (empty($bars)) {
                 $logger->warning("⚠️ No data returned for {$normalizedSymbol} ({$rangeFrom} → {$rangeTo}). Possibly illiquid or unsupported.");
                 return;
             }
 
-            // Persist to database
-            $count = $this->polygon->upsertBars($tickerId, $normalizedSymbol, $resolution, $bars);
+            //------------------------------------------------------------------
+            // 4. Persist to database via PolygonPriceHistoryService::upsertBars()
+            //------------------------------------------------------------------
+            //
+            // 🔸 NEW ADDITION:
+            // We now explicitly pass the `ticker` symbol along with `ticker_id`
+            // to ensure inserts satisfy the NOT NULL constraint on the `ticker`
+            // column in ticker_price_histories.
+            //
+            // This keeps database integrity intact without relaxing the schema.
+            //
+            // Signature reminder:
+            // upsertBars(int $tickerId, string $symbol, string $resolution, array $bars): int
+            //
+            $count = $this->polygon->upsertBars(
+                $tickerId,
+                $normalizedSymbol,
+                $resolution,
+                $bars,
+                ticker: $symbol // <— ensures the ticker field gets inserted
+            );
 
             $logger->info("✅ Stored {$count} bars for {$normalizedSymbol} ({$rangeFrom} → {$rangeTo})");
         } catch (Throwable $e) {
-            // Catch and log unexpected runtime exceptions
+            //------------------------------------------------------------------
+            // 5. Handle unexpected runtime exceptions
+            //------------------------------------------------------------------
             $logger->error("❌ Exception fetching/storing data for {$normalizedSymbol}: {$e->getMessage()}", [
                 'ticker_id' => $ticker->id,
                 'symbol'    => $normalizedSymbol,
@@ -139,7 +168,7 @@ class PolygonTickerPriceHistoryService
             return strtoupper($raw);
         }
 
-        // Preserve case otherwise
+        // Preserve mixed or lowercase for other instruments
         return $raw;
     }
 }

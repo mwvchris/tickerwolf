@@ -23,8 +23,9 @@ use Throwable;
  * of ingestion, response counts, and API behavior differences across
  * instrument types (CS, PFD, UNIT, ETF, etc.).
  *
- * 🚀 v2.6.5 — Added pre-upsert sanitization to skip abnormal numeric values
- *             that exceed safe column ranges (prevents 22003 SQLSTATE errors).
+ * 🚀 v2.8.0 — Added support for explicit `ticker` field upsert
+ *             to ensure non-null constraint satisfaction.
+ *             Retains v2.7.0 sanitization and safety features.
  */
 class PolygonPriceHistoryService
 {
@@ -81,12 +82,10 @@ class PolygonPriceHistoryService
             $log->debug("📡 Attempt {$attempt} to fetch {$symbol} (wait={$wait}s)");
 
             try {
-                // Send HTTP request
                 $resp = Http::timeout($this->timeout)->get($url);
                 $status = $resp->status();
                 $body = $resp->body();
 
-                // ✅ Successful HTTP 200
                 if ($resp->successful()) {
                     $json = $resp->json();
 
@@ -115,14 +114,12 @@ class PolygonPriceHistoryService
                     return $json['results'] ?? [];
                 }
 
-                // 🚦 Rate-limited: 429 Too Many Requests
+                // Rate-limiting and error handling
                 if ($status === 429) {
                     $retryAfter = $resp->header('Retry-After') ?? $wait;
                     $log->warning("⏳ 429 Too Many Requests for {$symbol}, retrying in {$retryAfter}s (attempt {$attempt})");
                     sleep((int)$retryAfter);
-                }
-                // 💥 5xx Server Error
-                elseif ($resp->serverError()) {
+                } elseif ($resp->serverError()) {
                     $log->warning("⚠️ Server error for {$symbol}: status={$status}");
                     if ($attempt >= $this->maxRetries) {
                         $log->error("❌ Aborting {$symbol} after {$attempt} server errors");
@@ -130,15 +127,12 @@ class PolygonPriceHistoryService
                     }
                     sleep($wait);
                     $wait *= 2;
-                }
-                // ⚠️ 4xx Client Error (e.g. 400/404)
-                else {
+                } else {
                     $log->warning("⚠️ Client error for {$symbol}: status={$status}", [
                         'body_snippet' => substr($body, 0, 300),
                     ]);
                     return [];
                 }
-
             } catch (Throwable $e) {
                 $log->error("💥 HTTP exception on attempt {$attempt} for {$symbol}: {$e->getMessage()}");
                 if ($attempt >= $this->maxRetries) {
@@ -149,7 +143,6 @@ class PolygonPriceHistoryService
                 $wait *= 2;
             }
 
-            // Stop looping after repeated failures
             if ($attempt >= ($this->maxRetries + 3)) {
                 $log->error("🛑 Max retry limit reached for {$symbol}");
                 break;
@@ -163,23 +156,19 @@ class PolygonPriceHistoryService
     /**
      * Upsert Polygon bar data into ticker_price_histories.
      *
-     * v2.7.0 — Hardened Sanitization Layer
-     * ------------------------------------
-     * This version adds stronger guards against malformed or extreme values
-     * that could trigger SQLSTATE[22003] or silently corrupt analytics data.
+     * v2.8.0 — Hardened Sanitization + Explicit Ticker
+     * -----------------------------------------------
+     * Adds an optional `$ticker` argument for explicit ticker string insertion.
+     * Prevents SQLSTATE[HY000]: Field 'ticker' doesn't have a default value.
      *
-     * Key protections:
-     *  • Skips bars with any NaN, INF, negative, or absurdly large values.
-     *  • Ensures all numeric fields are finite, positive, and within sane bounds.
-     *  • Logs granular warnings per skipped bar.
-     *
-     * @param  int    $tickerId
-     * @param  string $symbol
-     * @param  string $resolution
-     * @param  array  $bars
+     * @param  int         $tickerId
+     * @param  string      $symbol
+     * @param  string      $resolution
+     * @param  array       $bars
+     * @param  string|null $ticker   Optional plain-text ticker (fallback to $symbol)
      * @return int
      */
-    public function upsertBars(int $tickerId, string $symbol, string $resolution, array $bars): int
+    public function upsertBars(int $tickerId, string $symbol, string $resolution, array $bars, ?string $ticker = null): int
     {
         $logger = Log::channel($this->logChannel);
 
@@ -200,7 +189,6 @@ class PolygonPriceHistoryService
                 }
 
                 // 🧩 SANITIZATION: Hardened numeric checks
-                // ------------------------------------------------------
                 $fields = ['o', 'h', 'l', 'c', 'vw'];
                 $valid = true;
                 foreach ($fields as $field) {
@@ -209,14 +197,7 @@ class PolygonPriceHistoryService
                     }
 
                     $val = (float)$b[$field];
-
-                    // Reject NaN, INF, absurdly large, or non-sensical values
-                    if (
-                        !is_finite($val) ||
-                        $val <= 0 ||                        // zero or negative price
-                        $val > 10_000_000 ||                // 10 million upper limit
-                        $val < 0.0001                       // lower bound sanity floor
-                    ) {
+                    if (!is_finite($val) || $val <= 0 || $val > 10_000_000 || $val < 0.0001) {
                         $logger->warning("⚠️ Skipping abnormal {$field}={$b[$field]} for {$symbol} at {$b['t']}");
                         $valid = false;
                         break;
@@ -224,14 +205,15 @@ class PolygonPriceHistoryService
                 }
 
                 if (!$valid) {
-                    continue; // Skip entire bar
+                    continue;
                 }
 
-                // Convert Polygon’s millisecond timestamp (UTC) → MySQL datetime
+                // Convert timestamp
                 $ts = Carbon::createFromTimestampMsUTC((int)$b['t'])->format('Y-m-d H:i:s');
 
                 $rows[] = [
                     'ticker_id'   => $tickerId,
+                    'ticker'      => $ticker ?? $symbol, // ✅ Ensures DB field always populated
                     'resolution'  => $resolution,
                     't'           => $ts,
                     'year'        => (int)substr($ts, 0, 4),

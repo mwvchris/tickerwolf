@@ -29,6 +29,12 @@ php artisan queue:work --queue=default --tries=3 --timeout=180
 Tickers:
 php artisan polygon:tickers:ingest --market=stocks
 
+Ticker Slugs:
+php artisan tickers:generate-slugs
+
+Ticker Overviews:
+php artisan polygon:ticker-overviews:ingest --batch=500 --sleep=2
+
 Ticker Price Histories:
 php artisan polygon:ticker-price-histories:ingest --resolution=1d --from=2019-01-01 --sleep=2
 
