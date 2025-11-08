@@ -4,6 +4,7 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Str;
 
 /**
  * Model: Ticker
@@ -114,9 +115,9 @@ class Ticker extends Model
      * Generate a lowercase slug for SEO-friendly routing.
      * Example: /ticker/aapl
      */
-    public function getSlugAttribute(): string
+    public function getSlugAttribute($value): string
     {
-        return strtolower($this->ticker);
+         return $value ?: Str::slug($this->name ?? $this->ticker);
     }
 
     /**
@@ -168,4 +169,5 @@ class Ticker extends Model
             ? number_format($this->total_employees)
             : null;
     }
+
 }

@@ -38,7 +38,10 @@ Route::post('/search', [SearchController::class, 'performSearch'])->name('search
 
 // Canonical ticker profile (Inertia)
 Route::get('/tickers/{symbol}/{slug?}', [TickerController::class, 'show'])
-    ->where('symbol', '[A-Za-z0-9\.\-]+')
+    ->where([
+        'symbol' => '[A-Za-z0-9\.\-]+',
+        'slug'   => '[a-z0-9\-]+',
+    ])
     ->name('tickers.show');
 
 // Convenience redirect /ticker/{symbol}

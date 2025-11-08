@@ -25,11 +25,13 @@ class TickerController extends Controller
             }])
             ->firstOrFail();
 
-        $canonicalSlug = $ticker->slug ?? Str::slug($ticker->name ?? '');
+        // Canonical slug derived from DB (or fallback)
+        $canonicalSlug = $ticker->slug ?? Str::slug($ticker->name ?? $ticker->ticker);
 
-        if (empty($slug) || $slug !== $canonicalSlug) {
+        // Normalize and redirect only if needed
+        if ($slug !== $canonicalSlug) {
             return redirect()->route('tickers.show', [
-                'symbol' => $ticker->ticker,
+                'symbol' => strtoupper($ticker->ticker),
                 'slug'   => $canonicalSlug,
             ], 301);
         }
