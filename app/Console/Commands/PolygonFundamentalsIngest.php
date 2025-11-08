@@ -81,7 +81,7 @@ class PolygonFundamentalsIngest extends Command
 
     protected function handleSingleTicker(string $ticker, array $options, array $timeframes, bool $syncMode = false): int
     {
-        $symbol = strtoupper(trim($ticker));
+        $symbol = trim($ticker);
         $this->info("📘 Queuing fundamentals ingestion for {$symbol}...");
         Log::channel('ingest')->info("📘 Queuing single-ticker fundamentals ingestion", [
             'symbol' => $symbol,

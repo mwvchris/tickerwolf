@@ -37,7 +37,7 @@ class PolygonTickerNewsIngest extends Command
     protected function handleSingleTicker(string $ticker, int $limit): int
     {
         $this->info("📰 Queuing news ingestion for {$ticker}...");
-        $tickerModel = Ticker::where('ticker', strtoupper($ticker))->first();
+        $tickerModel = Ticker::where('ticker', $ticker)->first();
 
         if (! $tickerModel) {
             $this->error("Ticker {$ticker} not found.");

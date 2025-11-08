@@ -24,6 +24,27 @@ php artisan queue:prune-failed --hours=0
 php artisan queue:restart
 php artisan queue:work --queue=default --tries=3 --timeout=180
 
+--- OR ---
+
+Run ALL:
+
+php artisan optimize:clear
+php artisan cache:clear
+php artisan config:clear
+php artisan route:clear
+php artisan view:clear
+php artisan queue:flush
+php artisan queue:prune-batches --hours=0
+php artisan queue:prune-failed --hours=0
+php artisan queue:restart
+
+php artisan queue:work --queue=default --tries=3 --timeout=180
+php artisan queue:work --queue=default --tries=3 --timeout=180
+php artisan queue:work --queue=default --tries=3 --timeout=180
+php artisan queue:work --queue=default --tries=3 --timeout=180
+
+php artisan monitor:batches --refresh=5
+
 ------------------------------------------------------------------
 
 Tickers:
@@ -38,8 +59,14 @@ php artisan polygon:ticker-overviews:ingest --batch=500 --sleep=2
 Ticker Price Histories:
 php artisan polygon:ticker-price-histories:ingest --resolution=1d --from=2019-01-01 --sleep=2
 
-Incidators/Snapshots:
-php artisan tickers:compute-indicators --from=2019-01-01 --to=2025-11-04 --batch=500 --sleep=1 --include-inactive
+Ticker Incidators/Snapshots:
+php artisan tickers:compute-indicators --from=2019-01-01 --to=2030-01-01 --batch=3000 --sleep=1 --include-inactive
 
 Ticker Metrics:
-php artisan tickers:build-snapshots --from=2019-01-01 --to=2025-11-04 --batch=500 --sleep=1 --include-inactive
+php artisan tickers:build-snapshots --from=2019-01-01 --to=2030-01-01 --batch=500 --sleep=1 --include-inactive
+
+Ticker Fundamentals:
+php artisan polygon:fundamentals:ingest --timeframe=all --gte=2019-01-01 --batch=2000 --sleep=1
+
+Ticker News Items:
+

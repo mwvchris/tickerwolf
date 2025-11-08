@@ -1,0 +1,75 @@
+That error —
+
+```
+Error: EACCES: permission denied, unlink '/home/chris/Sites/websites/tickerwolf.ai/node_modules/.vite/deps/@inertiajs_core.js'
+```
+
+— means **Vite is trying to delete or modify a file it doesn’t have permission to access**. This is usually caused by incorrect file ownership or permission issues in the `node_modules/.vite` directory.
+
+Let’s fix it step-by-step 👇
+
+---
+
+### 🧹 1. Clear Vite’s cache
+
+Sometimes Vite’s pre-bundled dependencies get corrupted or left with bad permissions.
+
+```bash
+rm -rf node_modules/.vite
+```
+
+Then restart the dev server:
+
+```bash
+npm run dev
+```
+
+If that doesn’t work, continue below.
+
+---
+
+### 🔑 2. Fix file ownership and permissions
+
+Check which user owns the project files:
+
+```bash
+ls -ld /home/chris/Sites/websites/tickerwolf.ai
+ls -ld /home/chris/Sites/websites/tickerwolf.ai/node_modules/.vite
+```
+
+If you see files owned by `root` or another user, fix ownership:
+
+```bash
+sudo chown -R $USER:$USER /home/chris/Sites/websites/tickerwolf.ai
+```
+
+Then set correct permissions:
+
+```bash
+chmod -R u+rw node_modules/.vite
+```
+
+---
+
+### 🔄 3. Reinstall dependencies (if needed)
+
+If the issue persists, delete all dependencies and reinstall cleanly:
+
+```bash
+rm -rf node_modules package-lock.json
+npm install
+npm run dev
+```
+
+---
+
+### ⚡ 4. If you’re using WSL or Docker
+
+If this project is running in WSL (Windows Subsystem for Linux) or a containerized environment, file permissions can sometimes mismatch between host and guest systems. In that case:
+
+* Try running `npm run dev` **inside the same environment** where `node_modules` were installed.
+* Or delete and reinstall dependencies inside that environment.
+
+---
+
+Would you like to tell me whether you’re running this on plain Linux, WSL, or Docker? I can tailor the fix for your setup.
