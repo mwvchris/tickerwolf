@@ -1,0 +1,47 @@
+{
+    "name": "lineone",
+    "version": "3.2.1",
+    "$schema": "https://json.schemastore.org/package.json",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "build": "vite build",
+        "dev": "vite"
+    },
+    "devDependencies": {
+        "@tailwindcss/vite": "^4.1.15",
+        "axios": "^1.12.2",
+        "concurrently": "^9.2.1",
+        "laravel-vite-plugin": "^2.0.1",
+        "tailwindcss": "^4.1.15",
+        "vite": "^7.1.11",
+        "@tailwindcss/postcss": "^4.1.15",
+        "postcss": "^8.5.6",
+        "prettier": "^3.6.2",
+        "prettier-plugin-tailwindcss": "^0.7.1"
+    },
+    "dependencies": {
+        "@alpinejs/collapse": "^3.15.0",
+        "@alpinejs/intersect": "^3.15.0",
+        "@alpinejs/persist": "^3.15.0",
+        "@caneara/iodine": "^8.5.0",
+        "@fortawesome/fontawesome-free": "^7.1.0",
+        "@popperjs/core": "^2.11.8",
+        "alpinejs": "^3.15.0",
+        "apexcharts": "^5.3.5",
+        "cleave.js": "^1.6.0",
+        "dayjs": "^1.11.18",
+        "filepond": "^4.32.9",
+        "filepond-plugin-image-preview": "^4.6.12",
+        "flatpickr": "^4.6.13",
+        "gridjs": "^6.2.0",
+        "highlight.js": "^11.11.1",
+        "quill": "^2.0.3",
+        "simplebar": "^6.3.2",
+        "sortablejs": "^1.15.6",
+        "swiper": "^12.0.2",
+        "tippy.js": "^6.3.7",
+        "toastify-js": "^1.12.0",
+        "tom-select": "^2.4.3"
+    }
+}
