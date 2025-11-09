@@ -19,7 +19,7 @@
          These handle all application styling and scripts.
     ============================================================ -->
     @vite([
-        'resources/css/app.css',
+        'resources/css/lineone/app.css',
         'resources/js/app.ts',
     ])
 

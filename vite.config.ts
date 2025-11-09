@@ -1,13 +1,8 @@
 /**
  * --------------------------------------------------------------------------
- * Vite Config — TickerWolf.ai (Vue 3 + Inertia + Lineone)
+ * Vite Config — TickerWolf.ai (Laravel 12 + Inertia + Vue 3 + Lineone)
  * --------------------------------------------------------------------------
- *  Modernized for:
- *   • Laravel 12 + Inertia + Vue 3.5
- *   • Tailwind CSS 4 (via @tailwindcss/vite)
- *   • Vite 7 (Lineone 3.2.x compatible)
- *   • Full JS architecture: app.js, main.js, components, services, utils
- *   • Public assets (fonts/images) from /public/
+ * Mirrors Lineone-Laravel 3.2.1 baseline while supporting Inertia/Vue.
  * --------------------------------------------------------------------------
  */
 
@@ -20,51 +15,35 @@ import { globSync } from 'glob'
 
 export default defineConfig({
   plugins: [
-    // -----------------------------------------------------------------------
-    // Laravel + Inertia integration
-    // -----------------------------------------------------------------------
+    // Laravel / Inertia integration
     laravel({
       input: [
-        // --- Core entries ---
-        'resources/js/app.ts',        // Inertia SPA entry
-        'resources/js/blade-app.js',  // Blade-only entry
+        // Core entries
+        'resources/css/app.css',
+        'resources/js/app.ts',
+        'resources/js/blade-app.js',
 
-        // --- Lineone global initializers ---
+        // Lineone assets
+        'resources/css/lineone/app.css',
         'resources/js/lineone/app.js',
         'resources/js/lineone/main.js',
 
-        // --- Auto-include all Lineone modular JS files ---
+        // Optional JS modules
         ...globSync('resources/js/lineone/pages/**/*.js'),
         ...globSync('resources/js/lineone/libs/**/*.js'),
-
-        // --- Include Lineone theme CSS root ---
-        'resources/css/lineone/app.css',
       ],
-      ssr: 'resources/js/ssr.ts',
       refresh: true,
     }),
 
-    // -----------------------------------------------------------------------
-    // Vue 3 single-file component (SFC) support
-    // -----------------------------------------------------------------------
+    // Vue 3 SFC support
     vue({
-      template: {
-        transformAssetUrls: {
-          base: null,
-          includeAbsolute: false,
-        },
-      },
+      template: { transformAssetUrls: { base: null, includeAbsolute: false } },
     }),
 
-    // -----------------------------------------------------------------------
-    // Tailwind CSS 4 integration
-    // -----------------------------------------------------------------------
+    // Single Tailwind runtime (do NOT duplicate in PostCSS)
     tailwindcss(),
   ],
 
-  // -------------------------------------------------------------------------
-  // Resolve Aliases
-  // -------------------------------------------------------------------------
   resolve: {
     alias: {
       '@': path.resolve(__dirname, 'resources/js'),
@@ -78,42 +57,18 @@ export default defineConfig({
     },
   },
 
-  // -------------------------------------------------------------------------
-  // Build Output Configuration
-  // -------------------------------------------------------------------------
   build: {
     outDir: 'public/build',
     assetsDir: 'assets',
     manifest: true,
     emptyOutDir: true,
-    rollupOptions: {
-      output: {
-        entryFileNames: 'js/[name].js',
-        chunkFileNames: 'js/[name]-[hash].js',
-        assetFileNames: ({ name }) => {
-          if (/\.(css)$/.test(name ?? '')) return 'css/[name]-[hash][extname]'
-          if (/\.(png|jpe?g|gif|svg|ico)$/.test(name ?? ''))
-            return 'images/[name]-[hash][extname]'
-          if (/\.(woff2?|eot|ttf|otf)$/.test(name ?? ''))
-            return 'fonts/[name]-[hash][extname]'
-          return 'assets/[name]-[hash][extname]'
-        },
-      },
-    },
   },
 
-  // -------------------------------------------------------------------------
-  // Dev Server Configuration (Docker-aware)
-  // -------------------------------------------------------------------------
   server: {
     host: '0.0.0.0',
     port: 5173,
     strictPort: true,
-    watch: {
-      usePolling: true, // important for Docker bind mounts
-    },
-    hmr: {
-      host: 'localhost',
-    },
+    watch: { usePolling: true },
+    hmr: { host: 'tickerwolf.test' },
   },
 })
