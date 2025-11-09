@@ -2,9 +2,8 @@
  * --------------------------------------------------------------------------
  * Vite Config — TickerWolf.ai (Laravel 12 + Inertia + Vue 3 + Lineone)
  * --------------------------------------------------------------------------
- * - Uses @tailwindcss/vite for single Tailwind instance.
- * - Supports both Inertia (app.ts) and Blade (blade-app.js) entrypoints.
- * - Compatible with Vite 7.1+ and Tailwind 4.1+.
+ * Clean Tailwind 4.1.x + Lineone 3.2.1 integration.
+ * Ensures single Tailwind runtime, correct entry order, and HMR stability.
  * --------------------------------------------------------------------------
  */
 
@@ -17,36 +16,32 @@ import { globSync } from 'glob'
 
 export default defineConfig({
   plugins: [
-    // Laravel / Inertia integration
+    // Laravel + Inertia entrypoints
     laravel({
       input: [
-        // Vue/Inertia apps
+        // Inertia app
         'resources/js/app.ts',
+        // Blade-only JS
         'resources/js/blade-app.js',
 
-        // Lineone base styles + JS
+        // Lineone theme entry
         'resources/css/lineone/app.css',
         'resources/js/lineone/app.js',
         'resources/js/lineone/main.js',
 
-        // Optional JS modules
+        // Optional dynamic Lineone modules
         ...globSync('resources/js/lineone/pages/**/*.js'),
         ...globSync('resources/js/lineone/libs/**/*.js'),
       ],
       refresh: true,
     }),
 
-    // Vue 3 SFC support
+    // Vue support
     vue({
-      template: {
-        transformAssetUrls: {
-          base: null,
-          includeAbsolute: false,
-        },
-      },
+      template: { transformAssetUrls: { base: null, includeAbsolute: false } },
     }),
 
-    // TailwindCSS runtime (do NOT duplicate in postcss.config.js)
+    // ✅ Single Tailwind 4 runtime (no duplication via PostCSS)
     tailwindcss(),
   ],
 
@@ -71,12 +66,14 @@ export default defineConfig({
   },
 
   server: {
-    host: '0.0.0.0',
+    host: 'tickerwolf.ai', // 👈 match your Laravel app host
     port: 5173,
     strictPort: true,
     watch: { usePolling: true },
     hmr: {
-      host: 'tickerwolf.test',
+      host: 'tickerwolf.ai',
+      protocol: 'ws',
     },
+    cors: true,
   },
 })
