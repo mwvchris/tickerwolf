@@ -1,0 +1,106 @@
+// Updated: 11/8/2025
+
+{
+  "name": "tickerwolf",
+  "private": true,
+  "type": "module",
+
+  // ---------------------------------------------------------------------------
+  // SCRIPTS
+  // ---------------------------------------------------------------------------
+  "scripts": {
+    "dev": "vite",                         // Lineone's "mix" replaced with Vite
+    "build": "vite build",
+    "build:ssr": "vite build && vite build --ssr",
+    "format": "prettier --write resources/",
+    "format:check": "prettier --check resources/",
+    "lint": "eslint . --fix"
+  },
+
+  // ---------------------------------------------------------------------------
+  // RUNTIME DEPENDENCIES
+  // ---------------------------------------------------------------------------
+  "dependencies": {
+    // --- Laravel + Vue / Inertia stack ---
+    "@headlessui/vue": "^1.7.23",
+    "@heroicons/vue": "^2.2.0",
+    "@inertiajs/vue3": "^2.2.15",
+    "@vue/compiler-sfc": "^3.5.24",
+    "@vue/runtime-core": "^3.5.24",
+    "@vue/tsconfig": "^0.8.1",
+    "@vueuse/core": "^12.8.2",
+    "vue": "^3.5.24",
+    "vue-router": "^4.6.3",
+    "ziggy-js": "^2.6.0",
+
+    // --- UI / Tailwind helper libs ---
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "lucide-vue-next": "^0.468.0",
+    "reka-ui": "^2.4.1",
+    "remixicon": "^4.7.0",
+    "tailwind-merge": "^3.2.0",
+    "tailwindcss": "^4.1.15",         // keep latest (same as Lineone)
+    "tw-animate-css": "^1.2.5",
+
+    // --- Imported from Lineone UI kit ---
+    "@fortawesome/fontawesome-free": "^7.1.0",
+    "@popperjs/core": "^2.11.8",
+    "accordion-js": "^3.4.1",
+    "apexcharts": "^5.3.5",
+    "cleave.js": "^1.6.0",
+    "dayjs": "^1.11.18",
+    "filepond": "^4.32.9",
+    "filepond-plugin-image-preview": "^4.6.12",
+    "flatpickr": "^4.6.13",
+    "gridjs": "^6.2.0",
+    "highlight.js": "^11.11.1",
+    "quill": "^2.0.3",
+    "simplebar": "^6.3.2",
+    "sortablejs": "^1.15.6",
+    "swiper": "^12.0.2",
+    "tippy.js": "^6.3.7",
+    "toastify-js": "^1.12.0",
+    "tom-select": "^2.4.3"
+  },
+
+  // ---------------------------------------------------------------------------
+  // DEV DEPENDENCIES
+  // ---------------------------------------------------------------------------
+  "devDependencies": {
+    // --- Vite + Tailwind ---
+    "@laravel/vite-plugin-wayfinder": "^0.1.3",
+    "@tailwindcss/vite": "^4.1.11",
+    "@vitejs/plugin-vue": "^6.0.1",
+    "vite": "^7.0.4",
+
+    // --- TypeScript / ESLint / Prettier toolchain ---
+    "typescript": "^5.9.3",
+    "vue-tsc": "^2.2.4",
+    "@eslint/js": "^9.19.0",
+    "@vue/eslint-config-typescript": "^14.3.0",
+    "eslint": "^9.17.0",
+    "eslint-config-prettier": "^10.0.1",
+    "eslint-plugin-vue": "^9.32.0",
+    "prettier": "^3.6.2",
+    "prettier-plugin-organize-imports": "^4.1.0",
+    "prettier-plugin-tailwindcss": "^0.7.1",
+
+    // --- Misc / utility ---
+    "concurrently": "^9.0.1",
+    "@types/node": "^22.19.0",
+    "source-map-loader": "^5.0.0"     // retained from Lineone for debugging
+  },
+
+  // ---------------------------------------------------------------------------
+  // OPTIONAL DEPENDENCIES
+  // ---------------------------------------------------------------------------
+  "optionalDependencies": {
+    "@rollup/rollup-linux-x64-gnu": "4.9.5",
+    "@rollup/rollup-win32-x64-msvc": "4.9.5",
+    "@tailwindcss/oxide-linux-x64-gnu": "^4.0.1",
+    "@tailwindcss/oxide-win32-x64-msvc": "^4.0.1",
+    "lightningcss-linux-x64-gnu": "^1.29.1",
+    "lightningcss-win32-x64-msvc": "^1.29.1"
+  }
+}

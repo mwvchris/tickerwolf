@@ -1,39 +1,82 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="{{ str_replace('_', '-', app()->getLocale()) }}">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width,initial-scale=1">
+  <head>
+    <!-- ============================================================
+         Meta / App Configuration
+    ============================================================ -->
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta
+      name="viewport"
+      content="width=device-width, user-scalable=no, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0"
+    />
 
-    <title>@yield('title', config('app.name'))</title>
-    <meta name="description" content="@yield('meta_description', 'Ticker profiles and search')">
+    <title>{{ config('app.name', 'TickerWolf.ai') }} — Blurred Header</title>
+    <link rel="icon" type="image/png" href="{{ asset('images/favicon.png') }}" />
 
-    <!-- Tailwind compiled CSS (assume using Vite or Mix) -->
-    @vite('resources/css/app.css')
-    @vite('resources/js/app.js')
-</head>
-<body class="bg-gray-50 text-gray-900">
-    <header class="bg-white shadow-sm">
-        <div class="container mx-auto px-4 py-4 flex items-center justify-between">
-            <a href="{{ route('home') }}" class="font-semibold text-lg">{{ config('app.name', 'TickersApp') }}</a>
+    <!-- ============================================================
+         CSS & JS — Compiled by Vite
+         These handle all application styling and scripts.
+    ============================================================ -->
+    @vite([
+        'resources/css/app.css',
+        'resources/js/app.ts',
+    ])
 
-            <form action="{{ route('search.perform') }}" method="POST" class="flex">
-                @csrf
-                <input name="q" type="text" placeholder="Search ticker or company" class="border rounded-l px-3 py-2 w-64 focus:outline-none focus:ring" />
-                <button type="submit" class="bg-blue-600 text-white rounded-r px-4">Search</button>
-            </form>
+    <!-- ============================================================
+         Google Fonts
+    ============================================================ -->
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Poppins:ital,wght@0,300;0,400;0,500;0,600;0,700;1,300;1,400;1,500;1,600;1,700&display=swap" rel="stylesheet" />
+
+    <!-- ============================================================
+         Dark Mode — Flicker Prevention
+         Keeps dark theme before app JS initializes.
+    ============================================================ -->
+    <script>
+      if (localStorage.getItem('dark-mode') === 'dark') {
+        document.documentElement.classList.add('dark');
+      }
+    </script>
+
+    <!-- Allow pages to inject additional <head> content -->
+    @stack('head')
+  </head>
+
+  <body class="is-header-blur is-sidebar-open">
+
+    <!-- ============================================================
+         App Preloader
+    ============================================================ -->
+    <div class="app-preloader fixed z-50 grid h-full w-full place-content-center bg-slate-50 dark:bg-navy-900">
+      <div class="app-preloader-inner relative inline-block size-48"></div>
+    </div>
+
+    <!-- Page Wrapper -->
+    <div id="root" class="min-h-100vh cloak flex grow bg-slate-50 dark:bg-navy-900">
+
+      <!-- Sidebar -->
+      @include('partials.left-sidebar')
+
+      <!-- App Header Wrapper-->
+      @include('partials.header')
+
+      <!-- Mobile Searchbar -->
+      @include('partials.mobile-searchbar')
+
+      <!-- Right Sidebar -->
+      @include('partials.right-sidebar')
+
+      <!-- Main Content Wrapper -->
+      <main class="main-content w-full px-[var(--margin-x)] pb-8">
+        <div class="flex items-center space-x-4 py-5 lg:py-6">
+          <h2 class="text-xl font-medium text-slate-800 dark:text-navy-50 lg:text-2xl">Current Page Heading</h2>
         </div>
-    </header>
-
-    <main class="container mx-auto px-4 py-8">
-        @if(session('error'))
-            <div class="mb-4 text-sm text-red-700 bg-red-100 p-3 rounded">{{ session('error') }}</div>
-        @endif
-
         @yield('content')
-    </main>
+      </main>
 
-    <footer class="text-sm text-gray-600 py-6 border-t mt-8">
-        <div class="container mx-auto px-4 text-center">© {{ date('Y') }} {{ config('app.name') }}</div>
-    </footer>
-</body>
+    </div>
+
+  </body>
 </html>
