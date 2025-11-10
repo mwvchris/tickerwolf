@@ -20,6 +20,7 @@
     ============================================================ -->
     @vite([
         'resources/css/lineone/app.css',
+        'resources/js/lineone/libs/components.js',
         'resources/js/lineone/app.js',
         'resources/js/blade-app.js',
     ])
@@ -45,7 +46,9 @@
     @stack('head')
   </head>
 
-  <body class="is-header-blur is-sidebar-open">
+  <!-- Add 'is-header-blur' class to enable blurred header -->
+  <!-- Add 'is-sidebar-open' class to show sidebar by default -->
+  <body class="is-header-blur">
 
     <!-- ============================================================
          App Preloader
@@ -73,10 +76,12 @@
       @include('partials.right-sidebar')
 
       <!-- Main Content Wrapper -->
-      <main class="main-content w-full px-[var(--margin-x)] pb-8">
+      <main class="main-content w-full pb-8">
+        <!--
         <div class="flex items-center space-x-4 py-5 lg:py-6">
           <h2 class="text-xl font-medium text-slate-800 dark:text-navy-50 lg:text-2xl">Current Page Heading</h2>
         </div>
+        -->
         @yield('content')
       </main>
 

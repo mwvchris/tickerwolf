@@ -174,7 +174,7 @@ const onLoad = () => {
   });
 
   // Bandwith Report chart
-  bandwidthConfig = {
+  const bandwidthConfig = {
     colors: ["#4467EF"],
 
     series: [

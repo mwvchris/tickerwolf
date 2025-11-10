@@ -21,6 +21,9 @@ const devPort = Number(parsedDevUrl.port || 5173)
 const devProtocol = parsedDevUrl.protocol.replace(':', '') || 'http'
 const hmrProtocol = devProtocol === 'https' ? 'wss' : 'ws'
 
+const backendUrl = process.env.APP_URL ?? 'http://tickerwolf.test'
+const parsedBackendUrl = new URL(backendUrl)
+
 export default defineConfig({
   plugins: [
     // Laravel + Inertia entrypoints
@@ -78,6 +81,17 @@ export default defineConfig({
     strictPort: true,
     cors: {
       origin: true, // mirror requesting origin (tickerwolf.test) so module scripts/fonts pass CORS checks
+    },
+    proxy: {
+      '/fonts': {
+        target: parsedBackendUrl.origin,
+        changeOrigin: false,
+      },
+      '/resources/css/fonts': {
+        target: parsedBackendUrl.origin,
+        changeOrigin: false,
+        rewrite: (path) => path.replace('/resources/css/fonts', '/fonts'),
+      },
     },
     watch: {
       usePolling: true,
