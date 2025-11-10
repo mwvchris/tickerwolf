@@ -89,20 +89,27 @@ services:
     ports:
       - "80:80"
 
-#  vite:
-#    image: node:20-alpine
-#    container_name: tickerwolf-vite
-#    working_dir: /www/websites/tickerwolf.ai
-#    volumes:
-#      - ./:/www/websites/tickerwolf.ai
-#    ports:
-#      - "5173:5173"
-#    command: sh -c "npm install && npm run dev"
-#    depends_on:
-#      - php
+  vite:
+    image: node:22-alpine
+    container_name: tickerwolf-vite
+    restart: unless-stopped
+    working_dir: /www/websites/tickerwolf.ai
+    environment:
+      NODE_ENV: development
+    volumes:
+      - ./:/www/websites/tickerwolf.ai
+      - vite-node-modules:/www/websites/tickerwolf.ai/node_modules
+    ports:
+      - "5173:5173"
+    command: >
+      sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173 --strictPort"
+    depends_on:
+      - php
 
 volumes:
   mariadb-data:
     driver: local
   redis-data:
+    driver: local
+  vite-node-modules:
     driver: local

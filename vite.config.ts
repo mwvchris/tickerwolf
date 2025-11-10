@@ -13,6 +13,13 @@ import tailwindcss from '@tailwindcss/vite'
 import path from 'path'
 import { globSync } from 'glob'
 
+const devServerUrl = process.env.VITE_DEV_SERVER_URL ?? 'http://tickerwolf.test:5173'
+const parsedDevUrl = new URL(devServerUrl)
+const devHost = parsedDevUrl.hostname || 'tickerwolf.test'
+const devPort = Number(parsedDevUrl.port || 5173)
+const devProtocol = parsedDevUrl.protocol.replace(':', '') || 'http'
+const hmrProtocol = devProtocol === 'https' ? 'wss' : 'ws'
+
 export default defineConfig({
   plugins: [
     // Laravel / Inertia integration
@@ -66,9 +73,18 @@ export default defineConfig({
 
   server: {
     host: '0.0.0.0',
-    port: 5173,
+    port: devPort,
     strictPort: true,
-    watch: { usePolling: true },
-    hmr: { host: 'tickerwolf.test' },
+    origin: parsedDevUrl.origin,
+    watch: {
+      usePolling: true,
+      interval: 150,
+    },
+    hmr: {
+      host: devHost,
+      port: devPort,
+      clientPort: devPort,
+      protocol: hmrProtocol,
+    },
   },
 })
