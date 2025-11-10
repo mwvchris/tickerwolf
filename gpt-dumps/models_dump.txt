@@ -1,4 +1,4 @@
-===== GPT DUMP GENERATED: 2025-11-03T10:24:19Z =====
+===== GPT DUMP GENERATED: 2025-11-10T05:30:52Z =====
 ===== DIRECTORY: app/Models =====
 
 app/Models/TickerIndicator.php
@@ -454,17 +454,29 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Support\Str;
 
+/**
+ * Model: Ticker
+ *
+ * Represents a single financial instrument reference entity
+ * (stock, ETF, crypto, etc.) as defined by Polygon.io’s /v3/reference/tickers.
+ *
+ * This table holds *static or slowly changing* metadata such as company info,
+ * identifiers, and branding.
+ */
 class Ticker extends Model
 {
     use HasFactory;
 
     /**
      * Mass-assignable fields.
-     * Includes core Polygon fields + newly added overview fields.
+     *
+     * Includes core Polygon reference fields + enriched metadata fields.
+     * Note: `market_cap` has been removed (belongs to ticker_overviews).
      */
     protected $fillable = [
-        // --- Core fields from Polygon /v3/reference/tickers ---
+        // --- Core fields from Polygon.io /v3/reference/tickers ---
         'ticker',
         'name',
         'market',
@@ -484,11 +496,10 @@ class Ticker extends Model
         'delisted_utc',
         'raw',
 
-        // --- Overview fields from Polygon /v3/reference/tickers/{ticker} ---
+        // --- Enriched / Overview metadata ---
         'description',
         'homepage_url',
         'list_date',
-        'market_cap',
         'phone_number',
         'total_employees',
         'sic_code',
@@ -500,40 +511,46 @@ class Ticker extends Model
         'round_lot',
         'branding_logo_url',
         'branding_icon_url',
+        'address_json',
     ];
 
     /**
-     * Attribute casting.
+     * Attribute casting for consistent data handling.
      */
     protected $casts = [
-        'active' => 'boolean',
-        'raw' => 'array',
-        'last_updated_utc' => 'datetime',
-        'delisted_utc' => 'datetime',
-        'list_date' => 'date',
-        'market_cap' => 'integer',
-        'total_employees' => 'integer',
+        'active'                       => 'boolean',
+        'raw'                          => 'array',
+        'last_updated_utc'             => 'datetime',
+        'delisted_utc'                 => 'datetime',
+        'list_date'                    => 'date',
+        'total_employees'              => 'integer',
         'share_class_shares_outstanding' => 'integer',
-        'weighted_shares_outstanding' => 'integer',
-        'round_lot' => 'integer',
+        'weighted_shares_outstanding'  => 'integer',
+        'round_lot'                    => 'integer',
+        'address_json'                 => 'array',
     ];
 
     /**
-     * Timestamps enabled.
+     * Enable automatic timestamps.
      */
     public $timestamps = true;
 
     /**
      * Relationships
+     * -----------------------------------------------------------------
      */
 
-    // Each ticker can have multiple Polygon overview snapshots
+    /**
+     * Each ticker can have multiple daily overview snapshots.
+     */
     public function overviews()
     {
         return $this->hasMany(TickerOverview::class);
     }
 
-    // Each ticker can have multiple AI/analysis records (future-proofing)
+    /**
+     * Each ticker can have multiple AI/analysis records.
+     */
     public function analyses()
     {
         return $this->hasMany(TickerAnalysis::class);
@@ -541,47 +558,70 @@ class Ticker extends Model
 
     /**
      * Accessors
+     * -----------------------------------------------------------------
      */
 
-    // Generate a lowercase slug for routing (e.g. /ticker/aapl)
-    public function getSlugAttribute(): string
+    /**
+     * Generate a lowercase slug for SEO-friendly routing.
+     * Example: /ticker/aapl
+     */
+    public function getSlugAttribute($value): string
     {
-        return strtolower($this->ticker);
+         return $value ?: Str::slug($this->name ?? $this->ticker);
     }
 
-    // Return a formatted market cap (e.g. $1.23B)
-    public function getFormattedMarketCapAttribute(): ?string
+    /**
+     * Derived convenience accessor for company city/state from address_json.
+     */
+    public function getLocationAttribute(): ?string
     {
-        if (! $this->market_cap) {
+        if (! $this->address_json || !is_array($this->address_json)) {
             return null;
         }
 
-        $value = $this->market_cap;
-        if ($value >= 1_000_000_000) {
-            return '$' . number_format($value / 1_000_000_000, 2) . 'B';
-        } elseif ($value >= 1_000_000) {
-            return '$' . number_format($value / 1_000_000, 2) . 'M';
+        $city = $this->address_json['city'] ?? null;
+        $state = $this->address_json['state'] ?? null;
+
+        if ($city && $state) {
+            return "{$city}, {$state}";
         }
 
-        return '$' . number_format($value);
+        return $city ?? $state ?? null;
     }
 
     /**
      * Scopes
+     * -----------------------------------------------------------------
      */
 
-    // Scope: only active tickers
+    /**
+     * Scope: only active tickers.
+     */
     public function scopeActive($query)
     {
         return $query->where('active', true);
     }
 
-    // Scope: find ticker by symbol (case-insensitive)
+    /**
+     * Scope: find a ticker by symbol (case-insensitive).
+     */
     public function scopeBySymbol($query, string $symbol)
     {
         return $query->whereRaw('LOWER(ticker) = ?', [strtolower($symbol)]);
     }
-}app/Models/DataValidationLog.php
+
+    /**
+     * Utility: formatted display for employee count (e.g., "154,000").
+     */
+    public function getFormattedEmployeeCountAttribute(): ?string
+    {
+        return $this->total_employees
+            ? number_format($this->total_employees)
+            : null;
+    }
+
+}
+app/Models/DataValidationLog.php
 
 
 ===== FILE: app/Models/DataValidationLog.php =====
@@ -760,44 +800,63 @@ namespace App\Models;
 
 use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Carbon;
 
+/**
+ * Model: TickerOverview
+ *
+ * Represents a daily snapshot of a ticker’s volatile attributes
+ * (market cap, active status, etc.) fetched from Polygon.io.
+ *
+ * This table stores time-variant metrics and raw API responses
+ * for auditing and reprocessing historical data.
+ */
 class TickerOverview extends Model
 {
     use HasFactory;
 
     /**
-     * Table name (explicit for clarity).
+     * Explicit table name for clarity.
      */
     protected $table = 'ticker_overviews';
 
     /**
-     * Mass assignable attributes.
+     * Mass-assignable attributes.
+     *
+     * Only include fields that actually exist in the ticker_overviews table
+     * (after schema cleanup).
      */
     protected $fillable = [
         'ticker_id',
         'overview_date',
         'active',
         'market_cap',
-        'primary_exchange',
-        'locale',
         'status',
         'results_raw',
         'fetched_at',
+        'created_at',
+        'updated_at',
     ];
 
     /**
-     * Attribute casting.
+     * Attribute casting for correct data types.
      */
     protected $casts = [
-        'active' => 'boolean',
-        'market_cap' => 'integer',
-        'results_raw' => 'array',
+        'active'        => 'boolean',
+        'market_cap'    => 'integer',
+        'results_raw'   => 'array',
         'overview_date' => 'date',
-        'fetched_at' => 'datetime',
+        'fetched_at'    => 'datetime',
     ];
 
     /**
-     * Relationship: belongs to a ticker.
+     * Relationships
+     * -----------------------------------------------------------------
+     */
+
+    /**
+     * Each overview belongs to a single ticker.
      */
     public function ticker()
     {
@@ -805,11 +864,18 @@ class TickerOverview extends Model
     }
 
     /**
-     * Scope: fetch only the latest overview for each ticker.
+     * Scopes
+     * -----------------------------------------------------------------
      */
-    public function scopeLatestForEachTicker($query)
+
+    /**
+     * Scope: fetch only the latest overview for each ticker.
+     *
+     * Note:
+     * Uses a subquery for MySQL/MariaDB to retrieve the latest ID per ticker.
+     */
+    public function scopeLatestForEachTicker(Builder $query): Builder
     {
-        // Note: This is DB-driver specific; for MySQL, we can use a subquery
         return $query->whereIn('id', function ($sub) {
             $sub->selectRaw('MAX(id)')
                 ->from('ticker_overviews')
@@ -819,9 +885,12 @@ class TickerOverview extends Model
 
     /**
      * Accessors
+     * -----------------------------------------------------------------
      */
 
-    // Nicely formatted market cap for display
+    /**
+     * Nicely formatted market cap for display (e.g., $1.25B).
+     */
     public function getFormattedMarketCapAttribute(): ?string
     {
         if (! $this->market_cap) {
@@ -829,6 +898,7 @@ class TickerOverview extends Model
         }
 
         $value = $this->market_cap;
+
         if ($value >= 1_000_000_000) {
             return '$' . number_format($value / 1_000_000_000, 2) . 'B';
         } elseif ($value >= 1_000_000) {
@@ -838,7 +908,9 @@ class TickerOverview extends Model
         return '$' . number_format($value);
     }
 
-    // Derived ticker symbol for convenience
+    /**
+     * Derived convenience accessor for ticker symbol.
+     */
     public function getSymbolAttribute(): ?string
     {
         return optional($this->ticker)->ticker;
@@ -846,26 +918,25 @@ class TickerOverview extends Model
 
     /**
      * Utility: Create or update overview record from a Polygon API response.
-     * 
+     *
      * @param  \App\Models\Ticker  $ticker
-     * @param  array  $polygonData  Raw JSON data from Polygon API
+     * @param  array  $polygonData  Raw Polygon.io results
      * @return static
      */
     public static function fromPolygonResponse(Ticker $ticker, array $polygonData): self
     {
         $parsed = [
-            'ticker_id'        => $ticker->id,
-            'overview_date'    => now()->toDateString(),
-            'active'           => $polygonData['active'] ?? null,
-            'market_cap'       => $polygonData['market_cap'] ?? null,
-            'primary_exchange' => $polygonData['primary_exchange'] ?? null,
-            'locale'           => $polygonData['locale'] ?? null,
-            'status'           => $polygonData['status'] ?? null,
-            'results_raw'      => $polygonData,
-            'fetched_at'       => now(),
+            'ticker_id'     => $ticker->id,
+            'overview_date' => now()->toDateString(),
+            'active'        => $polygonData['active'] ?? null,
+            'market_cap'    => $polygonData['market_cap'] ?? null,
+            'status'        => $polygonData['status'] ?? (
+                ($polygonData['active'] ?? false) ? 'active' : 'inactive'
+            ),
+            'results_raw'   => $polygonData,
+            'fetched_at'    => now(),
         ];
 
-        // Upsert for ticker + overview_date uniqueness
         return static::updateOrCreate(
             ['ticker_id' => $ticker->id, 'overview_date' => $parsed['overview_date']],
             $parsed

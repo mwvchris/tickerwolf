@@ -1,4 +1,4 @@
-===== GPT DUMP GENERATED: 2025-11-03T10:24:19Z =====
+===== GPT DUMP GENERATED: 2025-11-10T05:30:52Z =====
 ===== DIRECTORY: app/Http =====
 
 app/Http/Middleware/RedirectIfAuthenticated.php
@@ -356,7 +356,7 @@ class HomeController extends Controller
 {
     public function index()
     {
-        return view('home');
+        return view('pages.home');
     }
 }
 app/Http/Controllers/Controller.php
@@ -664,11 +664,13 @@ class TickerController extends Controller
             }])
             ->firstOrFail();
 
-        $canonicalSlug = $ticker->slug ?? Str::slug($ticker->name ?? '');
+        // Canonical slug derived from DB (or fallback)
+        $canonicalSlug = $ticker->slug ?? Str::slug($ticker->name ?? $ticker->ticker);
 
-        if (empty($slug) || $slug !== $canonicalSlug) {
+        // Normalize and redirect only if needed
+        if ($slug !== $canonicalSlug) {
             return redirect()->route('tickers.show', [
-                'symbol' => $ticker->ticker,
+                'symbol' => strtoupper($ticker->ticker),
                 'slug'   => $canonicalSlug,
             ], 301);
         }

@@ -1,4 +1,4 @@
-===== GPT DUMP GENERATED: 2025-11-03T10:24:19Z =====
+===== GPT DUMP GENERATED: 2025-11-10T05:30:52Z =====
 ===== DIRECTORY: app/Services =====
 
 app/Services/TickerSlugService.php
@@ -394,8 +394,9 @@ use Throwable;
  * of ingestion, response counts, and API behavior differences across
  * instrument types (CS, PFD, UNIT, ETF, etc.).
  *
- * 🚀 v2.6.5 — Added pre-upsert sanitization to skip abnormal numeric values
- *             that exceed safe column ranges (prevents 22003 SQLSTATE errors).
+ * 🚀 v2.8.0 — Added support for explicit `ticker` field upsert
+ *             to ensure non-null constraint satisfaction.
+ *             Retains v2.7.0 sanitization and safety features.
  */
 class PolygonPriceHistoryService
 {
@@ -452,12 +453,10 @@ class PolygonPriceHistoryService
             $log->debug("📡 Attempt {$attempt} to fetch {$symbol} (wait={$wait}s)");
 
             try {
-                // Send HTTP request
                 $resp = Http::timeout($this->timeout)->get($url);
                 $status = $resp->status();
                 $body = $resp->body();
 
-                // ✅ Successful HTTP 200
                 if ($resp->successful()) {
                     $json = $resp->json();
 
@@ -486,14 +485,12 @@ class PolygonPriceHistoryService
                     return $json['results'] ?? [];
                 }
 
-                // 🚦 Rate-limited: 429 Too Many Requests
+                // Rate-limiting and error handling
                 if ($status === 429) {
                     $retryAfter = $resp->header('Retry-After') ?? $wait;
                     $log->warning("⏳ 429 Too Many Requests for {$symbol}, retrying in {$retryAfter}s (attempt {$attempt})");
                     sleep((int)$retryAfter);
-                }
-                // 💥 5xx Server Error
-                elseif ($resp->serverError()) {
+                } elseif ($resp->serverError()) {
                     $log->warning("⚠️ Server error for {$symbol}: status={$status}");
                     if ($attempt >= $this->maxRetries) {
                         $log->error("❌ Aborting {$symbol} after {$attempt} server errors");
@@ -501,15 +498,12 @@ class PolygonPriceHistoryService
                     }
                     sleep($wait);
                     $wait *= 2;
-                }
-                // ⚠️ 4xx Client Error (e.g. 400/404)
-                else {
+                } else {
                     $log->warning("⚠️ Client error for {$symbol}: status={$status}", [
                         'body_snippet' => substr($body, 0, 300),
                     ]);
                     return [];
                 }
-
             } catch (Throwable $e) {
                 $log->error("💥 HTTP exception on attempt {$attempt} for {$symbol}: {$e->getMessage()}");
                 if ($attempt >= $this->maxRetries) {
@@ -520,7 +514,6 @@ class PolygonPriceHistoryService
                 $wait *= 2;
             }
 
-            // Stop looping after repeated failures
             if ($attempt >= ($this->maxRetries + 3)) {
                 $log->error("🛑 Max retry limit reached for {$symbol}");
                 break;
@@ -534,23 +527,19 @@ class PolygonPriceHistoryService
     /**
      * Upsert Polygon bar data into ticker_price_histories.
      *
-     * v2.7.0 — Hardened Sanitization Layer
-     * ------------------------------------
-     * This version adds stronger guards against malformed or extreme values
-     * that could trigger SQLSTATE[22003] or silently corrupt analytics data.
+     * v2.8.0 — Hardened Sanitization + Explicit Ticker
+     * -----------------------------------------------
+     * Adds an optional `$ticker` argument for explicit ticker string insertion.
+     * Prevents SQLSTATE[HY000]: Field 'ticker' doesn't have a default value.
      *
-     * Key protections:
-     *  • Skips bars with any NaN, INF, negative, or absurdly large values.
-     *  • Ensures all numeric fields are finite, positive, and within sane bounds.
-     *  • Logs granular warnings per skipped bar.
-     *
-     * @param  int    $tickerId
-     * @param  string $symbol
-     * @param  string $resolution
-     * @param  array  $bars
+     * @param  int         $tickerId
+     * @param  string      $symbol
+     * @param  string      $resolution
+     * @param  array       $bars
+     * @param  string|null $ticker   Optional plain-text ticker (fallback to $symbol)
      * @return int
      */
-    public function upsertBars(int $tickerId, string $symbol, string $resolution, array $bars): int
+    public function upsertBars(int $tickerId, string $symbol, string $resolution, array $bars, ?string $ticker = null): int
     {
         $logger = Log::channel($this->logChannel);
 
@@ -571,7 +560,6 @@ class PolygonPriceHistoryService
                 }
 
                 // 🧩 SANITIZATION: Hardened numeric checks
-                // ------------------------------------------------------
                 $fields = ['o', 'h', 'l', 'c', 'vw'];
                 $valid = true;
                 foreach ($fields as $field) {
@@ -580,14 +568,7 @@ class PolygonPriceHistoryService
                     }
 
                     $val = (float)$b[$field];
-
-                    // Reject NaN, INF, absurdly large, or non-sensical values
-                    if (
-                        !is_finite($val) ||
-                        $val <= 0 ||                        // zero or negative price
-                        $val > 10_000_000 ||                // 10 million upper limit
-                        $val < 0.0001                       // lower bound sanity floor
-                    ) {
+                    if (!is_finite($val) || $val <= 0 || $val > 10_000_000 || $val < 0.0001) {
                         $logger->warning("⚠️ Skipping abnormal {$field}={$b[$field]} for {$symbol} at {$b['t']}");
                         $valid = false;
                         break;
@@ -595,14 +576,15 @@ class PolygonPriceHistoryService
                 }
 
                 if (!$valid) {
-                    continue; // Skip entire bar
+                    continue;
                 }
 
-                // Convert Polygon’s millisecond timestamp (UTC) → MySQL datetime
+                // Convert timestamp
                 $ts = Carbon::createFromTimestampMsUTC((int)$b['t'])->format('Y-m-d H:i:s');
 
                 $rows[] = [
                     'ticker_id'   => $tickerId,
+                    'ticker'      => $ticker ?? $symbol, // ✅ Ensures DB field always populated
                     'resolution'  => $resolution,
                     't'           => $ts,
                     'year'        => (int)substr($ts, 0, 4),
@@ -647,7 +629,8 @@ class PolygonPriceHistoryService
             return 0;
         }
     }
-}app/Services/LLMProviderFactory.php
+}
+app/Services/LLMProviderFactory.php
 
 
 ===== FILE: app/Services/LLMProviderFactory.php =====
@@ -714,6 +697,8 @@ class PolygonTickerPriceHistoryService
 
     /**
      * Construct the service.
+     *
+     * @param  \App\Services\PolygonPriceHistoryService  $polygon
      */
     public function __construct(PolygonPriceHistoryService $polygon)
     {
@@ -737,9 +722,10 @@ class PolygonTickerPriceHistoryService
      */
     public function fetchAndStore(object $ticker, string $rangeFrom, string $rangeTo): void
     {
+        //------------------------------------------------------------------
+        // 1. Resolve basic context and sanity-check inputs
+        //------------------------------------------------------------------
         $logger = Log::channel($this->logChannel);
-
-        // Resolve symbol and sanity-check required attributes
         $symbol = $ticker->ticker ?? $ticker->symbol ?? null;
 
         if (empty($symbol) || empty($ticker->id)) {
@@ -747,20 +733,25 @@ class PolygonTickerPriceHistoryService
             return;
         }
 
-        // Normalize symbol according to asset type
+        //------------------------------------------------------------------
+        // 2. Normalize symbol and prep parameters
+        //------------------------------------------------------------------
         $normalizedSymbol = $this->normalizeSymbol($ticker);
-        $tickerId = (int)$ticker->id;
-        $resolution = '1d';
-        $multiplier = 1;
-        $timespan = 'day';
+        $tickerId = (int) $ticker->id;
+        $resolution = '1d';   // Daily bars
+        $multiplier = 1;      // 1-day interval
+        $timespan   = 'day';  // Polygon timespan keyword
 
         $logger->info("📈 Fetching Polygon data for {$normalizedSymbol} ({$rangeFrom} → {$rangeTo})");
 
+        //------------------------------------------------------------------
+        // 3. Attempt fetch and retry logic
+        //------------------------------------------------------------------
         try {
-            // Attempt initial fetch
+            // Primary request (normalized case)
             $bars = $this->polygon->fetchAggregates($normalizedSymbol, $multiplier, $timespan, $rangeFrom, $rangeTo);
 
-            // If Polygon returns nothing, retry with raw/original symbol casing
+            // Retry with alternate casing if nothing returned
             if (empty($bars)) {
                 $altSymbol = $symbol;
                 if ($altSymbol !== $normalizedSymbol) {
@@ -769,18 +760,39 @@ class PolygonTickerPriceHistoryService
                 }
             }
 
-            // Still no data? Likely illiquid or unsupported instrument
+            // Still empty → likely illiquid, delisted, or no historical data
             if (empty($bars)) {
                 $logger->warning("⚠️ No data returned for {$normalizedSymbol} ({$rangeFrom} → {$rangeTo}). Possibly illiquid or unsupported.");
                 return;
             }
 
-            // Persist to database
-            $count = $this->polygon->upsertBars($tickerId, $normalizedSymbol, $resolution, $bars);
+            //------------------------------------------------------------------
+            // 4. Persist to database via PolygonPriceHistoryService::upsertBars()
+            //------------------------------------------------------------------
+            //
+            // 🔸 NEW ADDITION:
+            // We now explicitly pass the `ticker` symbol along with `ticker_id`
+            // to ensure inserts satisfy the NOT NULL constraint on the `ticker`
+            // column in ticker_price_histories.
+            //
+            // This keeps database integrity intact without relaxing the schema.
+            //
+            // Signature reminder:
+            // upsertBars(int $tickerId, string $symbol, string $resolution, array $bars): int
+            //
+            $count = $this->polygon->upsertBars(
+                $tickerId,
+                $normalizedSymbol,
+                $resolution,
+                $bars,
+                ticker: $symbol // <— ensures the ticker field gets inserted
+            );
 
             $logger->info("✅ Stored {$count} bars for {$normalizedSymbol} ({$rangeFrom} → {$rangeTo})");
         } catch (Throwable $e) {
-            // Catch and log unexpected runtime exceptions
+            //------------------------------------------------------------------
+            // 5. Handle unexpected runtime exceptions
+            //------------------------------------------------------------------
             $logger->error("❌ Exception fetching/storing data for {$normalizedSymbol}: {$e->getMessage()}", [
                 'ticker_id' => $ticker->id,
                 'symbol'    => $normalizedSymbol,
@@ -817,7 +829,7 @@ class PolygonTickerPriceHistoryService
             return strtoupper($raw);
         }
 
-        // Preserve case otherwise
+        // Preserve mixed or lowercase for other instruments
         return $raw;
     }
 }app/Services/Compute/FeatureSnapshotBuilder.php
@@ -1047,29 +1059,44 @@ class VolatilityIndicator extends BaseIndicator
 namespace App\Services\Compute\Indicators;
 
 use App\Services\Compute\BaseIndicator;
+use Illuminate\Support\Facades\Log;
 
 /**
- * ADXIndicator
+ * ============================================================================
+ *  ADXIndicator (v2.3.1 — Safe Division + Enhanced Stability)
+ * ============================================================================
  *
- * Computes the Average Directional Index — a trend strength indicator
- * derived from directional movement (+DI, -DI).
+ * 🧮 Computes the Average Directional Index (ADX) — a measure of trend strength
+ *     derived from Directional Movement (+DI, -DI).
  *
- * Math summary:
- *   +DM = High_t - High_(t-1) if greater than (Low_(t-1) - Low_t)
- *   -DM = Low_(t-1) - Low_t   if greater than (High_t - High_(t-1))
- *   TR  = max(High - Low, abs(High - Close_(t-1)), abs(Low - Close_(t-1)))
+ * ----------------------------------------------------------------------------
+ *  Math Summary:
+ *    +DM = High_t - High_(t-1) if greater than (Low_(t-1) - Low_t)
+ *    -DM = Low_(t-1) - Low_t   if greater than (High_t - High_(t-1))
+ *    TR  = max(
+ *              High - Low,
+ *              |High - Close_(t-1)|,
+ *              |Low  - Close_(t-1)|
+ *           )
  *
- *   +DI = 100 * (Smoothed +DM / Smoothed TR)
- *   -DI = 100 * (Smoothed -DM / Smoothed TR)
- *   DX  = 100 * |(+DI - -DI)| / (+DI + -DI)
- *   ADX = SMA(DX, N)
+ *    +DI = 100 * (Smoothed +DM / Smoothed TR)
+ *    -DI = 100 * (Smoothed -DM / Smoothed TR)
+ *    DX  = 100 * |(+DI - -DI)| / (+DI + -DI)
+ *    ADX = SMA(DX, N)
+ * ----------------------------------------------------------------------------
  *
- * Characteristics:
- * - Quantifies trend strength (0–100), independent of direction.
- * - ADX < 20 → weak trend; > 40 → strong trend.
+ * ⚙️ Params:
+ *    - period (int): smoothing period (default: 14)
  *
- * Params:
- *   - period (int): smoothing period. Default = 14.
+ * 🔐 Safety Enhancements (v2.3.1):
+ *    - Protects against division by zero using epsilon guard values.
+ *    - Handles static or near-flat tickers (e.g. Treasury ETFs) gracefully.
+ *    - Adds debug log entry when TR == 0 fallback triggers (for diagnostics).
+ *
+ * 🧩 Characteristics:
+ *    - Quantifies trend strength (0–100), independent of direction.
+ *    - ADX < 20 → weak trend; ADX > 40 → strong trend.
+ * ============================================================================
  */
 class ADXIndicator extends BaseIndicator
 {
@@ -1081,43 +1108,88 @@ class ADXIndicator extends BaseIndicator
         'period' => 14,
     ];
 
+    /**
+     * Compute ADX, +DI, and -DI series for given OHLCV bars.
+     *
+     * @param array $bars   Normalized bars array: [['t','o','h','l','c','v'], ...]
+     * @param array $params Indicator parameters (period, etc.)
+     * @return array[]      Rows of ['t','indicator','value','meta']
+     */
     public function compute(array $bars, array $params = []): array
     {
         $bars = $this->normalizeBars($bars);
         $opts = $this->opts($params);
-        $period = (int)$opts['period'];
+        $period = max(1, (int)($opts['period'] ?? 14));
 
         $n = count($bars);
-        $tr = $plusDM = $minusDM = [];
+        if ($n <= $period) {
+            return [];
+        }
 
+        $tr = $plusDM = $minusDM = [];
+        $epsilon = 1e-10; // Prevent division by zero
+
+        // ---------------------------------------------------------------------
         // Step 1: Compute TR, +DM, and -DM
+        // ---------------------------------------------------------------------
         for ($i = 1; $i < $n; $i++) {
             $upMove = $bars[$i]['h'] - $bars[$i - 1]['h'];
             $downMove = $bars[$i - 1]['l'] - $bars[$i]['l'];
-            $plusDM[] = ($upMove > $downMove && $upMove > 0) ? $upMove : 0;
-            $minusDM[] = ($downMove > $upMove && $downMove > 0) ? $downMove : 0;
-            $tr[] = max(
+
+            $plusDM[]  = ($upMove > $downMove && $upMove > 0) ? $upMove : 0.0;
+            $minusDM[] = ($downMove > $upMove && $downMove > 0) ? $downMove : 0.0;
+
+            $trValue = max(
                 $bars[$i]['h'] - $bars[$i]['l'],
                 abs($bars[$i]['h'] - $bars[$i - 1]['c']),
                 abs($bars[$i]['l'] - $bars[$i - 1]['c'])
             );
+
+            // Guard for flat price bars
+            if ($trValue <= 0) {
+                $trValue = $epsilon;
+                if ($i < 5 || mt_rand(0, 1000) === 0) {
+                    // Log sparsely to avoid flooding logs
+                    Log::debug("ADXIndicator zero TR fallback", [
+                        'symbol' => $bars[$i]['s'] ?? null,
+                        'i' => $i,
+                        'date' => $bars[$i]['t'] ?? null,
+                    ]);
+                }
+            }
+
+            $tr[] = $trValue;
         }
 
-        // Step 2: Compute smoothed DI and DX
+        // ---------------------------------------------------------------------
+        // Step 2: Compute smoothed DIs and DX values
+        // ---------------------------------------------------------------------
         $rows = [];
+
         for ($i = $period - 1; $i < count($tr); $i++) {
-            $trN = array_sum(array_slice($tr, $i - $period + 1, $period));
-            $plusDIN = 100 * (array_sum(array_slice($plusDM, $i - $period + 1, $period)) / $trN);
-            $minusDIN = 100 * (array_sum(array_slice($minusDM, $i - $period + 1, $period)) / $trN);
-            $dx = ($plusDIN + $minusDIN) > 0 ? (abs($plusDIN - $minusDIN) / ($plusDIN + $minusDIN)) * 100 : 0;
+            // Sums over rolling window
+            $trN      = array_sum(array_slice($tr, max(0, $i - $period + 1), $period));
+            $plusDMN  = array_sum(array_slice($plusDM, max(0, $i - $period + 1), $period));
+            $minusDMN = array_sum(array_slice($minusDM, max(0, $i - $period + 1), $period));
+
+            // Safe divisor
+            $trN = max($epsilon, $trN);
+
+            $plusDI = 100 * ($plusDMN / $trN);
+            $minusDI = 100 * ($minusDMN / $trN);
+
+            $sumDI = $plusDI + $minusDI;
+            $dx = ($sumDI > $epsilon)
+                ? (abs($plusDI - $minusDI) / $sumDI) * 100
+                : 0.0;
 
             $rows[] = [
-                't' => $bars[$i + 1]['t'],
+                't' => $bars[$i + 1]['t'] ?? $bars[$i]['t'],
                 'indicator' => "adx_{$period}",
                 'value' => round($dx, 6),
                 'meta' => json_encode([
-                    '+DI' => round($plusDIN, 6),
-                    '-DI' => round($minusDIN, 6),
+                    '+DI' => round($plusDI, 6),
+                    '-DI' => round($minusDI, 6),
                 ]),
             ];
         }
@@ -3745,89 +3817,239 @@ namespace App\Services;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Schema;
 use App\Models\Ticker;
 
+/**
+ * Service: PolygonTickerOverviewService
+ *
+ * Responsibilities:
+ *  - Fetch reference data from Polygon.io for each ticker
+ *  - Upsert daily volatile data into ticker_overviews
+ *  - Update stable ticker metadata in tickers
+ *  - Normalize phone numbers and store structured address JSON
+ *  - Handle graceful failures and detailed ingest logging
+ */
 class PolygonTickerOverviewService
 {
     protected PolygonApiClient $client;
-    protected array $tickerColumns;
 
     public function __construct(PolygonApiClient $client)
     {
         $this->client = $client;
-        $this->tickerColumns = DB::getSchemaBuilder()->getColumnListing('tickers');
     }
 
-    public function fetchAndUpsertOverview(Ticker $ticker): void
+    /**
+     * Fetch and upsert Polygon.io overview data for a ticker.
+     */
+    public function fetchAndUpsertOverview(string|Ticker $ticker): void
     {
-        $endpoint = "/v3/reference/tickers/{$ticker->ticker}";
+        //------------------------------------------------------------------
+        // 1. Normalize ticker reference
+        //------------------------------------------------------------------
+        if ($ticker instanceof Ticker) {
+            $symbol = $ticker->ticker;
+            $tickerId = $ticker->id;
+            $tickerModel = $ticker;
+        } else {
+            $symbol = trim($ticker); // 🔸 (keep lowercase as per your version)
+            $tickerModel = Ticker::where('ticker', $symbol)->first();
+            $tickerId = $tickerModel?->id;
+        }
+
+        if (! $tickerId) {
+            Log::channel('ingest')->warning("⚠️ Unknown ticker skipped", ['symbol' => $symbol]);
+            return;
+        }
+
+        //------------------------------------------------------------------
+        // 2. API request
+        //------------------------------------------------------------------
+        $endpoint = "/v3/reference/tickers/{$symbol}";
         $response = $this->client->get($endpoint);
 
         if (! $response->ok()) {
-            $this->logFailure($ticker, "HTTP {$response->status()}");
+            $this->logFailure($symbol, "HTTP {$response->status()}", $tickerId);
             return;
         }
 
         $data = $response->json('results') ?? null;
-
-        if (!$data) {
-            $this->logFailure($ticker, 'No results returned');
+        if (! $data) {
+            $this->logFailure($symbol, "No results returned", $tickerId);
             return;
         }
 
-        $marketCap = is_numeric($data['market_cap'] ?? null) ? (int)$data['market_cap'] : null;
+        //------------------------------------------------------------------
+        // 3. Normalize & derive fields
+        //------------------------------------------------------------------
+        $marketCap = is_numeric($data['market_cap'] ?? null)
+            ? (int) $data['market_cap']
+            : null;
 
-        DB::table('ticker_overviews')->upsert([[
-            'ticker_id' => $ticker->id,
-            'overview_date' => Carbon::now()->toDateString(),
-            'active' => $data['active'] ?? null,
-            'market_cap' => $marketCap,
-            'primary_exchange' => $data['primary_exchange'] ?? null,
-            'locale' => $data['locale'] ?? null,
-            'status' => $data['status'] ?? 'unknown',
-            'results_raw' => json_encode($data),
-            'fetched_at' => now(),
-            'updated_at' => now(),
-        ]], ['ticker_id', 'overview_date'], [
-            'active', 'market_cap', 'primary_exchange', 'locale',
-            'status', 'results_raw', 'fetched_at', 'updated_at'
+        $status = $data['status'] ?? (($data['active'] ?? false) ? 'active' : 'inactive');
+
+        $currencyName = strtolower($data['currency_name'] ?? '');
+        $currencySymbolMap = [
+            'usd' => '$', 'eur' => '€', 'gbp' => '£',
+            'jpy' => '¥', 'cad' => 'C$'
+        ];
+        $currencySymbol = $currencySymbolMap[$currencyName] ?? null;
+
+        $formattedPhone = $this->normalizePhone($data['phone_number'] ?? null);
+
+        $addressJson = isset($data['address']) && is_array($data['address'])
+            ? json_encode($data['address'], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES)
+            : null;
+
+        //------------------------------------------------------------------
+        // 4. Upsert volatile snapshot into ticker_overviews
+        //------------------------------------------------------------------
+        DB::table('ticker_overviews')->upsert(
+            [[
+                'ticker_id'     => $tickerId,
+                'overview_date' => Carbon::now()->toDateString(),
+                'active'        => $data['active'] ?? null,
+                'market_cap'    => $marketCap,
+                'status'        => $status,
+                'results_raw'   => json_encode($data),
+                'created_at'    => now(),
+                'updated_at'    => now(),
+                'fetched_at'    => now(),
+            ]],
+            ['ticker_id', 'overview_date'],
+            [
+                'active', 'market_cap', 'status',
+                'results_raw', 'fetched_at', 'updated_at'
+            ]
+        );
+
+        //------------------------------------------------------------------
+        // 5. Update static ticker metadata
+        //------------------------------------------------------------------
+        if ($tickerModel ?? false) {
+            // Refresh columns live (avoid cached schema)
+            $columns = Schema::getColumnListing('tickers');
+
+            $updateData = [
+                'name'                        => $data['name'] ?? null,
+                'description'                 => $data['description'] ?? null,
+                'homepage_url'                => $data['homepage_url'] ?? null,
+                'list_date'                   => $data['list_date'] ?? null,
+                'market'                      => $data['market'] ?? null,
+                'primary_exchange'            => $data['primary_exchange'] ?? null,
+                'type'                        => $data['type'] ?? null,
+                'status'                      => $status,
+                'active'                      => $data['active'] ?? null,
+                'phone_number'                => $formattedPhone,
+                'cik'                         => $data['cik'] ?? null,
+                'composite_figi'              => $data['composite_figi'] ?? null,
+                'share_class_figi'            => $data['share_class_figi'] ?? null,
+                'ticker_root'                 => $data['ticker_root'] ?? null,
+                'ticker_suffix'               => $data['ticker_suffix'] ?? null,
+                'sic_code'                    => $data['sic_code'] ?? null,
+                'sic_description'             => $data['sic_description'] ?? null,
+                'share_class_shares_outstanding' => $data['share_class_shares_outstanding'] ?? null,
+                'weighted_shares_outstanding' => $data['weighted_shares_outstanding'] ?? null,
+                'total_employees'             => $data['total_employees'] ?? null,
+                'round_lot'                   => $data['round_lot'] ?? null,
+                'currency_name'               => $currencyName,
+                'currency_symbol'             => $currencySymbol,
+                'base_currency_name'          => $data['base_currency_name'] ?? null,
+                'base_currency_symbol'        => $data['base_currency_symbol'] ?? null,
+                'branding_logo_url'           => $data['branding']['logo_url'] ?? null,
+                'branding_icon_url'           => $data['branding']['icon_url'] ?? null,
+                'address_json'                => $addressJson,
+            ];
+
+            $filtered = array_intersect_key($updateData, array_flip($columns));
+            $tickerModel->fill($filtered);
+            $tickerModel->save();
+
+            // Fallback write if somehow filtered out
+            if (!empty($addressJson) && in_array('address_json', $columns)) {
+                DB::table('tickers')->where('id', $tickerId)->update(['address_json' => $addressJson]);
+            }
+        }
+
+        //------------------------------------------------------------------
+        // 6. Log success
+        //------------------------------------------------------------------
+        Log::channel('ingest')->info("✅ Polygon overview upserted", [
+            'symbol'       => $symbol,
+            'ticker_id'    => $tickerId,
+            'market_cap'   => $marketCap,
+            'status'       => $status,
+            'currency'     => $currencyName,
+            'symbol_map'   => $currencySymbol,
+            'address_json' => $addressJson !== null,
+            'phone_normalized' => $formattedPhone ?? null,
         ]);
-
-        $updateData = array_intersect_key([
-            'description' => $data['description'] ?? null,
-            'homepage_url' => $data['homepage_url'] ?? null,
-            'market_cap' => $marketCap,
-            'total_employees' => $data['total_employees'] ?? null,
-            'sic_code' => $data['sic_code'] ?? null,
-            'branding_logo_url' => $data['branding']['logo_url'] ?? null,
-            'branding_icon_url' => $data['branding']['icon_url'] ?? null,
-        ], array_flip($this->tickerColumns));
-
-        $ticker->fill($updateData);
-        $ticker->save();
     }
 
-    public function processBatch($tickers): void
+    /**
+     * Normalize phone numbers into (XXX) XXX-XXXX format if US-style.
+     */
+    protected function normalizePhone(?string $phone): ?string
+    {
+        if (empty($phone)) return null;
+        $digits = preg_replace('/\D+/', '', $phone);
+
+        if (strlen($digits) === 10) {
+            return sprintf('(%s) %s-%s',
+                substr($digits, 0, 3),
+                substr($digits, 3, 3),
+                substr($digits, 6)
+            );
+        }
+        if (strlen($digits) === 11 && $digits[0] === '1') {
+            return sprintf('(%s) %s-%s',
+                substr($digits, 1, 3),
+                substr($digits, 4, 3),
+                substr($digits, 7)
+            );
+        }
+        return $phone;
+    }
+
+    /**
+     * Batch processor for multiple tickers.
+     */
+    public function processBatch(array $tickers): void
     {
         foreach ($tickers as $ticker) {
             try {
                 $this->fetchAndUpsertOverview($ticker);
             } catch (\Throwable $e) {
-                $this->logFailure($ticker, $e->getMessage());
+                $symbol = $ticker instanceof Ticker ? $ticker->ticker : $ticker;
+                $this->logFailure($symbol, $e->getMessage());
             }
         }
     }
 
-    protected function logFailure(Ticker $ticker, string $reason): void
+    /**
+     * Record a failed overview attempt.
+     */
+    protected function logFailure(string $symbol, string $reason, ?int $tickerId = null): void
     {
-        DB::table('failed_ticker_overviews')->insert([
-            'ticker_id' => $ticker->id,
-            'ticker' => $ticker->ticker,
-            'reason' => $reason,
-            'failed_at' => now(),
-        ]);
+        try {
+            DB::table('failed_ticker_overviews')->insert([
+                'ticker_id' => $tickerId,
+                'ticker'    => $symbol,
+                'reason'    => $reason,
+                'failed_at' => now(),
+            ]);
+        } catch (\Throwable $e) {
+            Log::channel('ingest')->error("Failed to record ingestion failure", [
+                'symbol' => $symbol,
+                'reason' => $reason,
+                'error'  => $e->getMessage(),
+            ]);
+        }
 
-        Log::warning("Failed overview for {$ticker->ticker}: {$reason}");
+        Log::channel('ingest')->warning("❌ Polygon overview fetch failed", [
+            'symbol' => $symbol,
+            'reason' => $reason,
+        ]);
     }
 }app/Services/PolygonFundamentalsService.php
 
@@ -4614,38 +4836,62 @@ use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\Config;
 use App\Services\Validation\Validators\PolygonDataValidator;
+use App\Services\Validation\Validators\PriceHistoryValidator;
+use App\Services\Validation\Validators\IndicatorsValidator;
+use App\Services\Validation\Validators\SnapshotsValidator;
+use App\Services\Validation\Validators\MetricsValidator;
 
 /**
  * ============================================================================
- *  DataIntegrityService  (v2 — Config-Driven + Severity Scoring)
+ *  DataIntegrityService  (v3.0 — Unified Validator Orchestration Layer)
  * ============================================================================
  *
  * 🔧 Purpose:
- *   Performs configurable structural validation of ticker price histories
- *   (duplicates, gaps, flatlines, spikes) and coordinates with
- *   PolygonDataValidator to confirm upstream data availability.
+ *   Provides a unified framework for validating ticker-level data integrity
+ *   across all critical datasets (price history, indicators, snapshots,
+ *   metrics, etc.), while retaining specialized logic for Polygon upstream
+ *   checks and severity-based health scoring.
  *
  * 🧠 Behavior:
  * ----------------------------------------------------------------------------
- *   • Loads configurable thresholds and weights from config/data_validation.php.
- *   • Detects anomalies and computes severity scores (0–1).
- *   • Aggregates an overall ticker “health score” (1 = perfect, 0 = bad).
- *   • Delegates missing or empty datasets to PolygonDataValidator.
- *   • Returns unified structured results for commands/loggers.
+ *   • Central registry of all registered validators (config-driven & auto-wired)
+ *   • Supports per-validator runs or full-suite execution
+ *   • Aggregates results, computes global integrity scores, and logs diagnostics
+ *   • Integrates seamlessly with existing PolygonDataValidator
  *
- * 📦 Example Output:
+ * 📦 Example Usage:
+ * ----------------------------------------------------------------------------
+ *   // Run specific validator (micro-level)
+ *   app(DataIntegrityService::class)->runValidator('price_history', ['limit' => 250]);
+ *
+ *   // Run all validators (global integrity sweep)
+ *   app(DataIntegrityService::class)->runAll();
+ *
+ * 📊 Example Output:
+ * ----------------------------------------------------------------------------
  *   [
- *     'ticker_id'   => 8255,
- *     'health'      => 0.93,
- *     'severity'    => ['gaps'=>0.02,'flat'=>0.03,'spikes'=>0.01],
- *     'issues'      => ['gaps'=>[...],'flat'=>[...]],
- *     'root_causes' => ['missing_price_data'=>'upstream_empty_response'],
- *     'upstream'    => ['status'=>200,'found'=>false],
+ *     'overall_health' => 0.96,
+ *     'validators' => [
+ *        'price_history' => ['passed'=>true, 'tickers_failed'=>2, ...],
+ *        'indicator'     => ['passed'=>false, ...],
+ *     ],
+ *     'upstream_checked' => 118,
+ *     'issues' => [...],
  *   ]
  * ============================================================================
  */
 class DataIntegrityService
 {
+    /**
+     * @var array<string,string> Validator registry map
+     */
+    protected array $validators = [
+        'price_history' => PriceHistoryValidator::class,
+        'indicators'    => IndicatorsValidator::class,
+        'snapshots'     => SnapshotsValidator::class,
+        // 'metrics'      => \App\Services\Validation\Validators\MetricsValidator::class,
+    ];
+
     public function __construct(
         protected ?PolygonDataValidator $polygonValidator = null
     ) {
@@ -4653,18 +4899,120 @@ class DataIntegrityService
     }
 
     /**
-     * Scan ticker data for local anomalies + upstream validation.
+     * Run all registered validators and produce a unified integrity report.
      *
-     * @param  int  $tickerId
      * @return array<string,mixed>
+     */
+    public function runAll(array $options = []): array
+    {
+        Log::channel('validation')->info('🧩 DataIntegrityService: Running full validation suite');
+
+        $report = [
+            'started_at'      => now()->toDateTimeString(),
+            'validators_run'  => [],
+            'issues'          => [],
+            'overall_health'  => 1.0,
+            'upstream_checked'=> 0,
+        ];
+
+        $healthScores = [];
+
+        foreach ($this->validators as $key => $class) {
+            $validator = app($class);
+            $result = $validator->run($options);
+
+            $report['validators_run'][$key] = [
+                'passed' => $result['passed'] ?? false,
+                'summary'=> $result['summary'] ?? [],
+                'issues' => $result['issues'] ?? [],
+            ];
+
+            if (!empty($result['issues'])) {
+                $report['issues'][$key] = $result['issues'];
+            }
+
+            // Compute validator-level health score
+            $score = $this->calculateHealthFromSummary($result['summary'] ?? []);
+            $healthScores[$key] = $score;
+        }
+
+        // Aggregate overall integrity health (average across validators)
+        $report['overall_health'] = count($healthScores)
+            ? round(array_sum($healthScores) / count($healthScores), 4)
+            : 1.0;
+
+        $report['completed_at'] = now()->toDateTimeString();
+
+        Log::channel('validation')->info('🏁 DataIntegrityService complete', [
+            'overall_health' => $report['overall_health'],
+            'validators'     => array_keys($this->validators),
+        ]);
+
+        return $report;
+    }
+
+    /**
+     * Run a specific validator by key.
+     *
+     * @param  string  $validatorKey
+     * @param  array   $options
+     * @return array<string,mixed>
+     */
+    public function runValidator(string $validatorKey, array $options = []): array
+    {
+        if (!isset($this->validators[$validatorKey])) {
+            throw new \InvalidArgumentException("Unknown validator: {$validatorKey}");
+        }
+
+        $class = $this->validators[$validatorKey];
+        $validator = app($class);
+
+        Log::channel('validation')->info("▶️ Running DataIntegrity validator: {$validatorKey}");
+
+        $result = $validator->run($options);
+        $health = $this->calculateHealthFromSummary($result['summary'] ?? []);
+
+        $response = [
+            'validator' => $validatorKey,
+            'health'    => $health,
+            'result'    => $result,
+        ];
+
+        Log::channel('validation')->info("🏁 Validator complete: {$validatorKey}", [
+            'health' => $health,
+            'tickers_failed' => $result['summary']['tickers_failed'] ?? null,
+        ]);
+
+        return $response;
+    }
+
+    /**
+     * Compute a simplified health score from a validator's summary block.
+     *
+     * @param  array<string,mixed>  $summary
+     * @return float
+     */
+    protected function calculateHealthFromSummary(array $summary): float
+    {
+        $tested = $summary['tickers_tested'] ?? 0;
+        $failed = $summary['tickers_failed'] ?? 0;
+
+        if ($tested === 0) return 1.0;
+        $score = max(0.0, 1.0 - ($failed / $tested));
+
+        return round($score, 4);
+    }
+
+    /**
+     * Perform a single-ticker structural integrity check with optional
+     * Polygon upstream validation.
+     *
+     * This retains your original anomaly-scanning logic for OHLCV data.
      */
     public function scanTicker(int $tickerId): array
     {
-        /*
-        |--------------------------------------------------------------------------
-        | 1️⃣ Load bars
-        |--------------------------------------------------------------------------
-        */
+        Log::channel('validation')->info('🔍 Running single-ticker integrity scan', ['ticker_id' => $tickerId]);
+
         $bars = DB::table('ticker_price_histories')
             ->where('ticker_id', $tickerId)
             ->where('resolution', '1d')
@@ -4690,15 +5038,11 @@ class DataIntegrityService
             'severity'    => [],
         ];
 
-        /*
-        |--------------------------------------------------------------------------
-        | 2️⃣ Handle insufficient local data
-        |--------------------------------------------------------------------------
-        */
+        // Insufficient local data
         if (count($bars) < $cfg['min_bars']) {
-            Log::channel('ingest')->warning('⚠️ Insufficient local bars', ['ticker_id' => $tickerId]);
-
+            Log::channel('validation')->warning('⚠️ Insufficient local bars', ['ticker_id' => $tickerId]);
             $symbol = DB::table('tickers')->where('id', $tickerId)->value('ticker');
+
             if ($symbol) {
                 $validation = $this->polygonValidator->validateTicker($tickerId, $symbol);
                 $result = array_merge($result, $validation);
@@ -4709,89 +5053,54 @@ class DataIntegrityService
             return $result;
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | 3️⃣ Local anomaly detection
-        |--------------------------------------------------------------------------
-        */
+        // Basic anomaly checks
         $issues = ['duplicates'=>[], 'gaps'=>[], 'flat'=>[], 'spikes'=>[]];
         $dates  = array_column($bars, 't');
         $closes = array_column($bars, 'c');
         $total  = count($closes);
 
-        // Duplicates
-        $dupes = collect($bars)->groupBy('t')->filter(fn($g) => $g->count() > 1)->keys()->all();
-        if ($dupes) $issues['duplicates'] = $dupes;
-
-        // Gaps
-        for ($i = 1; $i < $total; $i++) {
-            $diff = (strtotime($dates[$i]) - strtotime($dates[$i - 1])) / 86400;
-            if ($diff > $cfg['gap_days_tolerance']) {
-                $issues['gaps'][] = ['from'=>$dates[$i - 1],'to'=>$dates[$i],'days'=>$diff];
-            }
-        }
-
-        // Flatlines + Spikes
         for ($i = 1; $i < $total; $i++) {
             $prev = $closes[$i - 1];
             $curr = $closes[$i];
-            $ret  = $prev > 0 ? ($curr - $prev) / $prev : 0.0;
+            $diffDays = (strtotime($dates[$i]) - strtotime($dates[$i - 1])) / 86400;
+
+            if ($diffDays > $cfg['gap_days_tolerance']) {
+                $issues['gaps'][] = ['from'=>$dates[$i - 1],'to'=>$dates[$i],'days'=>$diffDays];
+            }
 
             if ($curr == $prev) {
                 $issues['flat'][] = $dates[$i];
-            } elseif (abs($ret) > $cfg['spike_threshold']) {
-                $issues['spikes'][] = ['date'=>$dates[$i],'return'=>round($ret,2)];
+            } elseif ($prev > 0 && abs(($curr - $prev) / $prev) > $cfg['spike_threshold']) {
+                $issues['spikes'][] = ['date'=>$dates[$i],'return'=>round(($curr - $prev) / $prev, 2)];
             }
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | 4️⃣ Severity scoring & health aggregation
-        |--------------------------------------------------------------------------
-        */
-        $weights  = $cfg['weights'];
-        $severity = [];
-
+        // Severity scoring
+        $weights = $cfg['weights'];
         foreach (['gaps','flat','spikes'] as $key) {
             $count = count($issues[$key]);
-            $severity[$key] = min(1.0, $count / max(1, $total)) * ($weights[$key] ?? 0);
+            $result['severity'][$key] = min(1.0, $count / max(1, $total)) * ($weights[$key] ?? 0);
         }
 
-        $totalSeverity = array_sum($severity);
-        $health = max(0.0, round(1 - $totalSeverity, 4));
+        $totalSeverity = array_sum($result['severity']);
+        $result['health'] = max(0.0, round(1 - $totalSeverity, 4));
+        $result['issues'] = array_filter($issues);
 
-        $result['issues']   = array_filter($issues, fn($v)=>!empty($v));
-        $result['severity'] = $severity;
-        $result['health']   = $health;
-        $result['status']   = $health < 0.9 ? 'warning' : 'success';
-
-        /*
-        |--------------------------------------------------------------------------
-        | 5️⃣ Integrate Polygon upstream verification if data missing entirely
-        |--------------------------------------------------------------------------
-        */
-        if (empty($bars)) {
+        if ($result['health'] < 0.9) {
             $symbol = DB::table('tickers')->where('id', $tickerId)->value('ticker');
             if ($symbol) {
-                $validation = $this->polygonValidator->validateTicker($tickerId, $symbol);
-                $result = array_merge($result, $validation);
+                try {
+                    $result['upstream'] = $this->polygonValidator->verifyTickerUpstream($symbol);
+                } catch (\Throwable $e) {
+                    Log::channel('validation')->error('❌ Upstream verification failed', [
+                        'ticker_id' => $tickerId,
+                        'error'     => $e->getMessage(),
+                    ]);
+                }
             }
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | 6️⃣ Logging + Return
-        |--------------------------------------------------------------------------
-        */
-        if ($health < 0.9) {
-            Log::channel('ingest')->warning('⚠️ Data integrity warning', [
-                'ticker_id' => $tickerId,
-                'health'    => $health,
-                'severity'  => $severity,
-                'issues'    => array_keys($result['issues']),
-            ]);
-        }
-
+        Log::channel('validation')->info('🏁 scanTicker complete', $result);
         return $result;
     }
 }app/Services/Validation/Validators/PolygonDataValidator.php
@@ -4807,66 +5116,27 @@ use App\Services\Validation\Probes\PolygonProbe;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Carbon\Carbon;
 
 /**
  * ============================================================================
- *  PolygonDataValidator (v2.2 — adds live verifyTickerUpstream)
+ *  PolygonDataValidator
+ *  (v3.1.0 — Hybrid Range Verification + Configurable Quick Window)
  * ============================================================================
  *
  * 🔧 Purpose:
- *   Bridges local Polygon.io–sourced data validation with live upstream
- *   verification. Performs both local completeness checks and on-the-fly
- *   Polygon API probes.
+ *   Enhances live verification logic to support both "quick" (short look-back)
+ *   and "full-range" Polygon API queries, selectable per call. Used by
+ *   TickersIntegrityScanCommand v3.4+ for hybrid scanning performance.
  *
- * 🧠 Behavior:
+ * 🆕 v3.1.0 Enhancements:
  * ----------------------------------------------------------------------------
- *   • validateTicker() → existing local+upstream completeness logic.
- *   • verifyTickerUpstream() → NEW: direct live API check for recent bars.
- * ============================================================================
- *   This validator acts as the “bridge” between **local data health** and
- *   **Polygon upstream truth**. It performs a two-phase analysis:
- *
- *   1️⃣ **Local Completeness Check**
- *       - Confirms the ticker has sufficient rows in `ticker_price_histories`
- *         for the expected date range (e.g. several hundred trading days).
- *       - Flags any tickers with *zero* records or extremely small counts
- *         (`< 5` bars total) as “missing_price_data”.
- *       - Optionally could later expand to detect *partial ranges* (e.g.,
- *         a symbol with data only from 2024 but missing 2023).
- *
- *   2️⃣ **Upstream Root-Cause Probe**
- *       - When local data is missing or empty, the validator calls
- *         `PolygonProbe::checkTickerData()` to determine whether Polygon.io
- *         also reports no data.
- *       - This distinguishes:
- *           🟢 Upstream Empty (Polygon has no data) → “upstream_empty_response”
- *           🟠 Local Failure  (Polygon has data, but we failed to ingest it)
- *           🔴 Upstream Error (Polygon API returned 4xx/5xx or rate-limit)
- *
- *   3️⃣ **Gap and Coverage Analysis**
- *       - The validator can be extended to check for time gaps between
- *         local bars (e.g. ≥5 consecutive missing weekdays) to identify
- *         *partial data availability* cases.
- *       - These “coverage anomalies” will be surfaced as
- *         `'partial_price_history' => ['missing_days' => N]` in results.
- *
- * 🧮 Decision Logic:
- * ----------------------------------------------------------------------------
- *   • If 0 bars locally → mark `missing_price_data` and call PolygonProbe.
- *   • If 1–4 bars → mark as “insufficient sample”.
- *   • If Polygon returns HTTP 200 but empty → `upstream_empty_response`.
- *   • If Polygon returns non-200 → `upstream_error`.
- *   • If Polygon returns valid bars but none locally → `local_ingestion_failure`.
- *
- * 📦 Example Result:
- * ----------------------------------------------------------------------------
- *   [
- *     'issues'       => ['missing_price_data'],
- *     'root_causes'  => ['missing_price_data' => 'upstream_empty_response'],
- *     'upstream'     => ['status' => 200, 'found' => false],
- *     'valid'        => false,
- *   ]
- *
+ *   • Adds `$fullRange` flag to verifyTickerUpstream($symbol, $fullRange = false)
+ *   • Quick mode uses polygon.quick_verify_days_back (default 60)
+ *   • Full range mode uses config date window (2020-01-01 → today)
+ *   • Logs both window type and date boundaries for clarity
+ *   • Retains retries, exponential back-off, and stub-detection logic
+ *   • Produces uniform response structure (`resultsCount` + `count`)
  * ============================================================================
  */
 class PolygonDataValidator
@@ -4874,7 +5144,7 @@ class PolygonDataValidator
     public function __construct(protected PolygonProbe $probe) {}
 
     /**
-     * Validate Polygon-sourced data for one ticker (local + probe).
+     * ✅ Local DB validation
      */
     public function validateTicker(int $tickerId, string $symbol): array
     {
@@ -4885,7 +5155,6 @@ class PolygonDataValidator
             'valid'       => true,
         ];
 
-        // 1️⃣ Local completeness check
         $count = DB::table('ticker_price_histories')
             ->where('ticker_id', $tickerId)
             ->count();
@@ -4894,7 +5163,6 @@ class PolygonDataValidator
             $result['issues'][] = 'missing_price_data';
             $result['valid']    = false;
 
-            // 2️⃣ Probe Polygon upstream (cached probe class)
             $probeResult = $this->probe->checkTickerData($symbol);
             $result['upstream'] = $probeResult;
 
@@ -4914,72 +5182,1034 @@ class PolygonDataValidator
     }
 
     /**
-     * 🔍 Live Polygon.io verification for a ticker (read-only).
+     * 🔍 Live Polygon.io verification (hybrid: quick or full range)
      *
-     * @param  string  $symbol
-     * @param  int     $daysBack  Defaults to 30
+     * @param string $symbol     The ticker symbol
+     * @param bool   $fullRange  If true → use full historical window (slow)
+     *                           If false → use quick look-back window (fast)
+     */
+    public function verifyTickerUpstream(string $symbol, bool $fullRange = false): array
+    {
+        $apiKey   = config('services.polygon.key');
+        $attempts = (int) config('polygon.verify_stub_retry_attempts', 3);
+        $delays   = (array) config('polygon.verify_stub_delay_schedule', [1, 3, 6]);
+
+        /*
+        |--------------------------------------------------------------------------
+        | Determine time window (quick vs full)
+        |--------------------------------------------------------------------------
+        */
+        if ($fullRange) {
+            $from = config('polygon.price_history_min_date', '2020-01-01');
+            $to   = config('polygon.price_history_max_date', Carbon::now()->toDateString());
+            $rangeType = 'full';
+        } else {
+            $daysBack = (int) config('polygon.quick_verify_days_back', 60);
+            $from     = Carbon::now()->subDays($daysBack)->toDateString();
+            $to       = Carbon::now()->toDateString();
+            $rangeType = "quick_{$daysBack}d";
+        }
+
+        $multiplier = config('polygon.default_multiplier', 1);
+        $timespan   = config('polygon.default_timespan', 'day');
+        $url        = "https://api.polygon.io/v2/aggs/ticker/{$symbol}/range/{$multiplier}/{$timespan}/{$from}/{$to}";
+
+        /*
+        |--------------------------------------------------------------------------
+        | Retry logic (stub detection, back-off, and full JSON normalization)
+        |--------------------------------------------------------------------------
+        */
+        for ($attempt = 1; $attempt <= $attempts; $attempt++) {
+            $t0 = microtime(true);
+
+            try {
+                $resp = Http::timeout(config('polygon.request_timeout', 15))
+                    ->withHeaders(['Accept' => 'application/json'])
+                    ->get($url, [
+                        'adjusted' => 'true',
+                        'sort'     => 'asc',
+                        'limit'    => 50000,
+                        'apiKey'   => $apiKey,
+                    ]);
+
+                $elapsed = round((microtime(true) - $t0) * 1000, 2);
+                $status  = $resp->status();
+                $body    = $resp->body();
+                $bodyLen = strlen($body);
+
+                $json = $resp->json();
+                if (!is_array($json)) {
+                    $json = json_decode($body, true);
+                }
+
+                if (!is_array($json)) {
+                    Log::channel('ingest')->error('❌ Invalid JSON from Polygon', [
+                        'symbol' => $symbol,
+                        'status' => $status,
+                        'range'  => $rangeType,
+                        'body_snippet' => substr($body, 0, 400),
+                    ]);
+                    return $this->emptyResponse($symbol, $status, 'invalid_json', $rangeType);
+                }
+
+                $polygonStatus = $json['status'] ?? 'UNKNOWN';
+                $hasResults    = isset($json['results']) && is_array($json['results']);
+                $count         = $json['resultsCount']
+                    ?? $json['count']
+                    ?? ($hasResults ? count($json['results']) : 0);
+                $found = $count > 0;
+
+                $isStub = (
+                    $polygonStatus === 'DELAYED' &&
+                    !$hasResults &&
+                    $count === 0 &&
+                    $bodyLen < 200
+                );
+
+                Log::channel('ingest')->info('📡 Polygon verifyTickerUpstream', [
+                    'symbol'         => $symbol,
+                    'attempt'        => $attempt,
+                    'status'         => $status,
+                    'polygon_status' => $polygonStatus,
+                    'resultsCount'   => $count,
+                    'found'          => $found,
+                    'hasResults'     => $hasResults,
+                    'isStub'         => $isStub,
+                    'body_bytes'     => $bodyLen,
+                    'latency_ms'     => $elapsed,
+                    'from'           => $from,
+                    'to'             => $to,
+                    'range_type'     => $rangeType,
+                ]);
+
+                if ($isStub && $attempt < $attempts) {
+                    $wait = $delays[$attempt - 1] ?? 2;
+                    Log::channel('ingest')->warning("⏳ Polygon DELAYED stub detected — retrying in {$wait}s", [
+                        'symbol'  => $symbol,
+                        'attempt' => $attempt,
+                        'range'   => $rangeType,
+                    ]);
+                    sleep($wait);
+                    continue;
+                }
+
+                return [
+                    'symbol'         => $symbol,
+                    'status'         => $status,
+                    'polygon_status' => $polygonStatus,
+                    'found'          => $found,
+                    'resultsCount'   => $count,
+                    'count'          => $count,
+                    'message'        => $found ? 'ok' : 'empty',
+                    'range_type'     => $rangeType,
+                    'checked_at'     => now()->toIso8601String(),
+                ];
+
+            } catch (\Throwable $e) {
+                Log::channel('ingest')->error('❌ verifyTickerUpstream exception', [
+                    'symbol'  => $symbol,
+                    'attempt' => $attempt,
+                    'range'   => $rangeType,
+                    'error'   => $e->getMessage(),
+                ]);
+
+                if ($attempt < $attempts) {
+                    $wait = $delays[$attempt - 1] ?? 2;
+                    sleep($wait);
+                    continue;
+                }
+
+                return $this->emptyResponse($symbol, 0, $e->getMessage(), $rangeType);
+            }
+        }
+
+        return $this->emptyResponse($symbol, 0, 'max_attempts_exceeded', $rangeType);
+    }
+
+    /**
+     * 🧩 Empty / fallback response factory
+     */
+    private function emptyResponse(string $symbol, int $status, string $message, string $rangeType = 'unknown'): array
+    {
+        return [
+            'symbol'       => $symbol,
+            'status'       => $status,
+            'found'        => false,
+            'resultsCount' => 0,
+            'count'        => 0,
+            'message'      => $message,
+            'range_type'   => $rangeType,
+            'checked_at'   => now()->toIso8601String(),
+        ];
+    }
+}app/Services/Validation/Validators/PriceHistoryValidator.php
+
+
+===== FILE: app/Services/Validation/Validators/PriceHistoryValidator.php =====
+
+<?php
+
+namespace App\Services\Validation\Validators;
+
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Config;
+
+/**
+ * ============================================================================
+ *  PriceHistoryValidator  (v2.0 — Schema-Aware + Configurable Thresholds)
+ * ============================================================================
+ *
+ * 🔍 Purpose:
+ *   Performs structural and statistical integrity validation on the
+ *   `ticker_price_histories` table for a given ticker.
+ *
+ * 🧠 Behavior:
+ * ----------------------------------------------------------------------------
+ *   • Reads compact OHLCV fields (t,o,h,l,c,v) and aliases them to
+ *     semantic keys (date, open, high, low, close, volume).
+ *   • Detects:
+ *       - Missing or insufficient bars
+ *       - Duplicated timestamps
+ *       - Gaps larger than N days
+ *       - Zero-volume or zero-price streaks
+ *       - Spike detection (optional)
+ *   • Computes a normalized health score between 0 and 1.
+ *
+ * 📦 Output:
+ * ----------------------------------------------------------------------------
+ *   [
+ *     'ticker_id' => 1234,
+ *     'summary' => [
+ *         'tickers_tested' => 1,
+ *         'tickers_failed' => 0,
+ *         'bars' => 1255,
+ *         'gaps' => 0,
+ *         'flat' => 0,
+ *         'duplicates' => 0,
+ *     ],
+ *     'issues' => [
+ *         'gaps' => [...],
+ *         'flat' => [...],
+ *         'duplicates' => [...],
+ *     ],
+ *     'health' => 0.995,
+ *     'status' => 'success'
+ *   ]
+ *
+ * ============================================================================
+ */
+class PriceHistoryValidator
+{
+    /**
+     * -------------------------------------------------------------------------
+     * Run validator for a given ticker ID.
+     * -------------------------------------------------------------------------
+     *
+     * @param  array<string,mixed>  $params
      * @return array<string,mixed>
      */
-    public function verifyTickerUpstream(string $symbol, int $daysBack = 30): array
+    public function run(array $params = []): array
     {
-        $apiKey = config('services.polygon.key');
-        $now  = now()->format('Y-m-d');
-        $past = now()->subDays($daysBack)->format('Y-m-d');
-        $url  = "https://api.polygon.io/v2/aggs/ticker/{$symbol}/range/1/day/{$past}/{$now}";
+        $tickerId = (int) ($params['ticker_id'] ?? 0);
 
-        try {
-            $resp = Http::timeout(8)->get($url, ['apiKey' => $apiKey, 'limit' => 5]);
-            $status = $resp->status();
-
-            if ($status === 429) {
-                Log::warning("⚠️ Polygon rate-limit hit during verifyTickerUpstream", ['symbol' => $symbol]);
-                return [
-                    'symbol'     => $symbol,
-                    'status'     => 429,
-                    'found'      => false,
-                    'count'      => 0,
-                    'message'    => 'rate_limited',
-                    'checked_at' => now()->toIso8601String(),
-                ];
-            }
-
-            if (!$resp->ok()) {
-                return [
-                    'symbol'     => $symbol,
-                    'status'     => $status,
-                    'found'      => false,
-                    'count'      => 0,
-                    'message'    => "HTTP {$status}",
-                    'checked_at' => now()->toIso8601String(),
-                ];
-            }
-
-            $json  = $resp->json();
-            $count = $json['resultsCount'] ?? 0;
-            $found = $count > 0;
-
+        if ($tickerId <= 0) {
             return [
-                'symbol'     => $symbol,
-                'status'     => $status,
-                'found'      => $found,
-                'count'      => $count,
-                'message'    => $found ? 'ok' : 'empty',
-                'checked_at' => now()->toIso8601String(),
-            ];
-        } catch (\Throwable $e) {
-            Log::error("❌ verifyTickerUpstream failed", [
-                'symbol' => $symbol,
-                'error'  => $e->getMessage(),
-            ]);
-            return [
-                'symbol'     => $symbol,
-                'status'     => 0,
-                'found'      => false,
-                'count'      => 0,
-                'message'    => $e->getMessage(),
-                'checked_at' => now()->toIso8601String(),
+                'status' => 'error',
+                'error'  => 'Invalid ticker_id provided',
+                'health' => 0.0,
             ];
         }
+
+        // Load config thresholds (fallback defaults)
+        $cfg = Config::get('data_validation', [
+            'gap_days_tolerance'    => 10,
+            'flat_streak_tolerance' => 5,
+            'spike_threshold'       => 0.5,
+            'weights'               => ['gaps'=>0.4,'flat'=>0.3,'duplicates'=>0.3],
+            'min_bars'              => 10,
+        ]);
+
+        /*
+        |--------------------------------------------------------------------------
+        | 1️⃣ Load OHLCV data from ticker_price_histories
+        |--------------------------------------------------------------------------
+        | Using compact Polygon-style columns and aliasing them for clarity.
+        */
+        $bars = DB::table('ticker_price_histories')
+            ->where('ticker_id', $tickerId)
+            ->where('resolution', '1d')
+            ->orderBy('t', 'asc')
+            ->get([
+                't as date',
+                'o as open',
+                'h as high',
+                'l as low',
+                'c as close',
+                'v as volume',
+            ])
+            ->map(fn($r) => [
+                'date'   => $r->date,
+                'open'   => (float) $r->open,
+                'high'   => (float) $r->high,
+                'low'    => (float) $r->low,
+                'close'  => (float) $r->close,
+                'volume' => (float) $r->volume,
+            ])
+            ->toArray();
+
+        $barCount = count($bars);
+        $result = [
+            'ticker_id' => $tickerId,
+            'summary'   => [
+                'tickers_tested' => 1,
+                'tickers_failed' => 0,
+                'bars'           => $barCount,
+                'gaps'           => 0,
+                'flat'           => 0,
+                'duplicates'     => 0,
+            ],
+            'issues' => [],
+            'health' => 1.0,
+            'status' => 'success',
+        ];
+
+        if ($barCount < $cfg['min_bars']) {
+            $result['status'] = 'insufficient';
+            $result['health'] = 0.0;
+            $result['summary']['tickers_failed'] = 1;
+            Log::channel('ingest')->warning('⚠️ Insufficient bars', [
+                'ticker_id' => $tickerId,
+                'bars'      => $barCount,
+            ]);
+            return $result;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 2️⃣ Detect anomalies: duplicates, gaps, flats, spikes
+        |--------------------------------------------------------------------------
+        */
+        $issues = ['duplicates'=>[], 'gaps'=>[], 'flat'=>[], 'spikes'=>[]];
+        $dates  = array_column($bars, 'date');
+        $closes = array_column($bars, 'close');
+        $vols   = array_column($bars, 'volume');
+        $n      = count($bars);
+
+        // Duplicates
+        $dupes = collect($dates)->countBy()->filter(fn($c) => $c > 1)->keys()->all();
+        if (!empty($dupes)) {
+            $issues['duplicates'] = $dupes;
+            $result['summary']['duplicates'] = count($dupes);
+        }
+
+        // Gaps (days between consecutive bars)
+        for ($i = 1; $i < $n; $i++) {
+            $days = (strtotime($dates[$i]) - strtotime($dates[$i - 1])) / 86400;
+            if ($days > $cfg['gap_days_tolerance']) {
+                $issues['gaps'][] = [
+                    'from' => $dates[$i - 1],
+                    'to'   => $dates[$i],
+                    'days' => $days,
+                ];
+            }
+        }
+        $result['summary']['gaps'] = count($issues['gaps']);
+
+        // Flat closes (no price or volume change)
+        for ($i = 1; $i < $n; $i++) {
+            $prevC = $closes[$i - 1];
+            $currC = $closes[$i];
+            $prevV = $vols[$i - 1];
+            $currV = $vols[$i];
+
+            if ($currC == $prevC || ($currV == 0 && $prevV == 0)) {
+                $issues['flat'][] = $dates[$i];
+            } elseif ($prevC > 0) {
+                $ret = abs(($currC - $prevC) / $prevC);
+                if ($ret > $cfg['spike_threshold']) {
+                    $issues['spikes'][] = [
+                        'date' => $dates[$i],
+                        'return' => round($ret, 3),
+                    ];
+                }
+            }
+        }
+
+        $result['summary']['flat'] = count($issues['flat']);
+
+        /*
+        |--------------------------------------------------------------------------
+        | 3️⃣ Health scoring
+        |--------------------------------------------------------------------------
+        */
+        $weights = $cfg['weights'];
+        $severity = [];
+
+        foreach (['gaps', 'flat', 'duplicates'] as $cat) {
+            $count = count($issues[$cat]);
+            $severity[$cat] = min(1.0, $count / max(1, $barCount)) * ($weights[$cat] ?? 0);
+        }
+
+        $totalSeverity = array_sum($severity);
+        $health = max(0.0, round(1 - $totalSeverity, 4));
+
+        $result['issues']   = array_filter($issues, fn($v) => !empty($v));
+        $result['health']   = $health;
+        $result['severity'] = $severity;
+        $result['status']   = $health < 0.9 ? 'warning' : 'success';
+        if ($result['status'] !== 'success') {
+            $result['summary']['tickers_failed'] = 1;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 4️⃣ Logging
+        |--------------------------------------------------------------------------
+        */
+        if ($result['status'] !== 'success') {
+            Log::channel('ingest')->warning('⚠️ PriceHistoryValidator anomaly', [
+                'ticker_id' => $tickerId,
+                'health'    => $health,
+                'issues'    => array_keys($result['issues']),
+            ]);
+        } else {
+            Log::channel('ingest')->info('✅ PriceHistoryValidator passed', [
+                'ticker_id' => $tickerId,
+                'bars'      => $barCount,
+                'health'    => $health,
+            ]);
+        }
+
+        return $result;
+    }
+}app/Services/Validation/Validators/IndicatorsValidator.php
+
+
+===== FILE: app/Services/Validation/Validators/IndicatorsValidator.php =====
+
+<?php
+
+namespace App\Services\Validation\Validators;
+
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Config;
+
+/**
+ * ============================================================================
+ *  IndicatorsValidator  (v1.0 — Structural + Statistical Health Audit)
+ * ============================================================================
+ *
+ * 🔍 Purpose:
+ *   Validate the completeness, consistency, and variability of computed
+ *   technical indicators stored in the `ticker_indicators` table.
+ *
+ * ⚙️ Evaluation Dimensions:
+ * ----------------------------------------------------------------------------
+ *   1️⃣ Completeness — missing or null indicators per ticker
+ *   2️⃣ Flatlines — indicators that remain constant over long periods
+ *   3️⃣ Gaps — date gaps where indicator rows should exist but do not
+ *   4️⃣ Noise/Range sanity — detect extreme or unrealistic values
+ *
+ * 📊 Scoring Model:
+ * ----------------------------------------------------------------------------
+ *   • Each category contributes to an overall severity weight
+ *   • Health = 1 - Σ(weighted_severity)
+ *   • status = success / warning / insufficient / error
+ *
+ * 🧩 Example usage:
+ *   php artisan tickers:integrity-scan --validator=indicators --limit=100
+ *
+ * ============================================================================
+ */
+class IndicatorsValidator
+{
+    /**
+     * Validate indicator data for a single ticker.
+     *
+     * @param  array  $context  Expected keys: ['ticker_id']
+     * @return array<string,mixed>
+     */
+    public function run(array $context): array
+    {
+        $tickerId = $context['ticker_id'] ?? null;
+        if (!$tickerId) {
+            return [
+                'status'  => 'error',
+                'message' => 'Missing ticker_id in validation context',
+                'health'  => 0.0,
+                'issues'  => ['missing_context' => true],
+            ];
+        }
+
+        // ---------------------------------------------------------------------
+        // 1️⃣ Load data
+        // ---------------------------------------------------------------------
+        $rows = DB::table('ticker_indicators')
+            ->where('ticker_id', $tickerId)
+            ->select(['t', 'indicator', 'value'])
+            ->orderBy('t', 'asc')
+            ->get();
+
+        $total = $rows->count();
+        $cfg = Config::get('data_validation.indicators', [
+            'min_rows'          => 10,
+            'flat_streak_limit' => 15,
+            'gap_tolerance_days'=> 10,
+            'spike_threshold'   => 10.0, // overly large indicator values (e.g., RSI > 1000)
+            'weights'           => [
+                'missing' => 0.4,
+                'flat'    => 0.3,
+                'gaps'    => 0.2,
+                'spikes'  => 0.1,
+            ],
+        ]);
+
+        $result = [
+            'ticker_id'   => $tickerId,
+            'status'      => 'success',
+            'health'      => 1.0,
+            'issues'      => [],
+            'severity'    => [],
+        ];
+
+        if ($total < $cfg['min_rows']) {
+            Log::channel('ingest')->warning('⚠️ Insufficient indicator data', [
+                'ticker_id' => $tickerId,
+                'rows'      => $total,
+            ]);
+            return [
+                'ticker_id' => $tickerId,
+                'status'    => 'insufficient',
+                'health'    => 0.0,
+                'issues'    => ['insufficient_rows' => $total],
+            ];
+        }
+
+        // ---------------------------------------------------------------------
+        // 2️⃣ Prepare grouped indicators
+        // ---------------------------------------------------------------------
+        $grouped = $rows->groupBy('indicator');
+        $issues = ['missing' => [], 'flat' => [], 'gaps' => [], 'spikes' => []];
+
+        foreach ($grouped as $indicator => $points) {
+            $values = $points->pluck('value')->map(fn($v) => (float)$v)->all();
+            $dates  = $points->pluck('t')->all();
+            $n      = count($values);
+
+            // -- missing/null detection
+            if ($n < $cfg['min_rows'] || in_array(null, $values, true)) {
+                $issues['missing'][] = $indicator;
+            }
+
+            // -- flatline detection
+            $flatCount = 0;
+            for ($i = 1; $i < $n; $i++) {
+                if ($values[$i] === $values[$i - 1]) {
+                    $flatCount++;
+                } else {
+                    $flatCount = 0;
+                }
+                if ($flatCount >= $cfg['flat_streak_limit']) {
+                    $issues['flat'][] = $indicator;
+                    break;
+                }
+            }
+
+            // -- gap detection
+            for ($i = 1; $i < $n; $i++) {
+                $diffDays = (strtotime($dates[$i]) - strtotime($dates[$i - 1])) / 86400;
+                if ($diffDays > $cfg['gap_tolerance_days']) {
+                    $issues['gaps'][] = $indicator;
+                    break;
+                }
+            }
+
+            // -- spike/outlier detection
+            foreach ($values as $v) {
+                if (abs($v) > $cfg['spike_threshold']) {
+                    $issues['spikes'][] = $indicator;
+                    break;
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------------
+        // 3️⃣ Compute severity & health
+        // ---------------------------------------------------------------------
+        $weights = $cfg['weights'];
+        $severity = [];
+
+        foreach (['missing','flat','gaps','spikes'] as $type) {
+            $count = count(array_unique($issues[$type]));
+            $severity[$type] = min(1.0, $count / max(1, count($grouped))) * ($weights[$type] ?? 0);
+        }
+
+        $totalSeverity = array_sum($severity);
+        $health = max(0.0, round(1 - $totalSeverity, 4));
+
+        $status = 'success';
+        if ($health < 0.9) {
+            $status = 'warning';
+        }
+        if (count($issues['missing']) > 0 && $health < 0.7) {
+            $status = 'error';
+        }
+
+        // ---------------------------------------------------------------------
+        // 4️⃣ Log + return structured result
+        // ---------------------------------------------------------------------
+        if ($status !== 'success') {
+            Log::channel('ingest')->warning('⚠️ IndicatorsValidator anomalies detected', [
+                'ticker_id' => $tickerId,
+                'health'    => $health,
+                'issues'    => array_keys(array_filter($issues, fn($v)=>!empty($v))),
+            ]);
+        }
+
+        $result['status']   = $status;
+        $result['health']   = $health;
+        $result['issues']   = array_filter($issues, fn($v)=>!empty($v));
+        $result['severity'] = $severity;
+
+        return $result;
+    }
+}app/Services/Validation/Validators/SnapshotsValidator.php
+
+
+===== FILE: app/Services/Validation/Validators/SnapshotsValidator.php =====
+
+<?php
+
+namespace App\Services\Validation\Validators;
+
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Config;
+
+/**
+ * ============================================================================
+ *  SnapshotsValidator  (v1.3 — Optimized for Large Datasets)
+ * ============================================================================
+ *
+ * 🔍 Purpose:
+ *   Fast health check for ticker_feature_snapshots with sampling & row limits.
+ *
+ * ⚙️ Key Improvements:
+ *   • Limit rows per ticker (default 300 most recent)
+ *   • Lightweight JSON inspection (no full decode)
+ *   • Same scoring model as v1.2
+ * ============================================================================
+ */
+class SnapshotsValidator
+{
+    protected int $rowLimit = 300; // limit per ticker for speed
+
+    public function run(array $context): array
+    {
+        $tickerId = $context['ticker_id'] ?? null;
+        if (!$tickerId) {
+            return ['status' => 'error', 'health' => 0.0, 'issues' => ['missing_context' => true]];
+        }
+
+        // ---------------------------------------------------------------------
+        // Pull limited recent rows
+        // ---------------------------------------------------------------------
+        $rows = DB::table('ticker_feature_snapshots')
+            ->where('ticker_id', $tickerId)
+            ->select(['t', 'indicators'])
+            ->orderByDesc('t')
+            ->limit($this->rowLimit)
+            ->get()
+            ->reverse(); // restore chronological order
+
+        $count = $rows->count();
+        $cfg = Config::get('data_validation.snapshots', [
+            'min_rows'           => 10,
+            'gap_tolerance_days' => 14,
+            'flat_streak_limit'  => 5,
+            'spike_threshold'    => 9999,
+            'weights'            => [
+                'missing' => 0.4,
+                'gaps'    => 0.3,
+                'flat'    => 0.2,
+                'spikes'  => 0.1,
+            ],
+        ]);
+
+        if ($count === 0) {
+            return ['ticker_id' => $tickerId, 'status' => 'error', 'health' => 0.0, 'issues' => ['no_snapshots' => true]];
+        }
+
+        if ($count < $cfg['min_rows']) {
+            return ['ticker_id' => $tickerId, 'status' => 'insufficient', 'health' => 0.0, 'issues' => ['insufficient_rows' => $count]];
+        }
+
+        // ---------------------------------------------------------------------
+        // Quick sampling metrics instead of full JSON parse
+        // ---------------------------------------------------------------------
+        $dates = $rows->pluck('t')->all();
+        $missing = 0;
+        $flatline = 0;
+        $spikes = 0;
+
+        $prevIndicatorHash = null;
+
+        foreach ($rows as $r) {
+            // Instead of full decode, just inspect length and numeric pattern
+            $json = $r->indicators;
+            if (!$json || $json === 'null') {
+                $missing++;
+                continue;
+            }
+
+            // detect flatlines via hash of JSON
+            $hash = md5($json);
+            if ($hash === $prevIndicatorHash) {
+                $flatline++;
+            }
+            $prevIndicatorHash = $hash;
+
+            // detect spikes by searching numeric tokens over threshold
+            if (preg_match_all('/[-+]?\d*\.?\d+/', $json, $m)) {
+                foreach ($m[0] as $num) {
+                    if (abs((float)$num) > $cfg['spike_threshold']) {
+                        $spikes++;
+                        break 2;
+                    }
+                }
+            }
+        }
+
+        // Frequency gaps
+        $gaps = 0;
+        for ($i = 1; $i < count($dates); $i++) {
+            $diff = (strtotime($dates[$i]) - strtotime($dates[$i - 1])) / 86400;
+            if ($diff > $cfg['gap_tolerance_days']) $gaps++;
+        }
+
+        // ---------------------------------------------------------------------
+        // Compute severity + health
+        // ---------------------------------------------------------------------
+        $weights = $cfg['weights'];
+        $severity = [
+            'missing' => min(1.0, $missing / $count) * $weights['missing'],
+            'gaps'    => min(1.0, $gaps / $count) * $weights['gaps'],
+            'flat'    => min(1.0, $flatline / $count) * $weights['flat'],
+            'spikes'  => min(1.0, $spikes / $count) * $weights['spikes'],
+        ];
+
+        $health = max(0.0, round(1 - array_sum($severity), 4));
+        $status = $health < 0.7 ? 'error' : ($health < 0.9 ? 'warning' : 'success');
+
+        return [
+            'ticker_id' => $tickerId,
+            'status'    => $status,
+            'health'    => $health,
+            'issues'    => array_filter([
+                'missing_rows' => $missing,
+                'gaps'         => $gaps,
+                'flatlines'    => $flatline,
+                'spikes'       => $spikes,
+            ]),
+            'severity'  => $severity,
+        ];
+    }
+}app/Services/Validation/Validators/MetricsValidator.php
+
+
+===== FILE: app/Services/Validation/Validators/MetricsValidator.php =====
+
+<?php
+
+namespace App\Services\Validation\Validators;
+
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Config;
+
+/**
+ * ============================================================================
+ *  MetricsValidator  (v1.2 — Schema-Aware: ticker_feature_metrics)
+ * ============================================================================
+ *
+ * 🔍 Purpose:
+ *   Validate numerical and relational integrity of aggregated
+ *   ticker metrics from the `ticker_feature_metrics` table.
+ *
+ * 🧩 Table:
+ *   - ticker_feature_metrics
+ *     • ticker_id (FK)
+ *     • t (date)
+ *     • sharpe_60, volatility_30, drawdown, beta_60, momentum_10
+ *
+ * ⚙️ Evaluation Dimensions:
+ * ----------------------------------------------------------------------------
+ *   1️⃣ Completeness — null or NaN values
+ *   2️⃣ Flatlines — zero variance over time
+ *   3️⃣ Outliers — extreme values via z-score
+ *   4️⃣ Correlation Consistency — expected positive relationships
+ *
+ * 📊 Scoring:
+ *   • Health = 1 - Σ(weighted severity)
+ *   • Weights configurable via config/data_validation.metrics
+ *   • Status thresholds:
+ *       success ≥ 0.9, warning 0.7–0.9, error < 0.7
+ * ============================================================================
+ */
+class MetricsValidator
+{
+    public function run(array $context): array
+    {
+        $tickerId = $context['ticker_id'] ?? null;
+        if (!$tickerId) {
+            return ['status'=>'error','health'=>0.0,'issues'=>['missing_context'=>true]];
+        }
+
+        $rows = DB::table('ticker_feature_metrics')
+            ->where('ticker_id', $tickerId)
+            ->select(['t','sharpe_60','volatility_30','drawdown','beta_60','momentum_10'])
+            ->orderBy('t','asc')
+            ->get();
+
+        $count = $rows->count();
+        $cfg = Config::get('data_validation.metrics', [
+            'min_rows'            => 10,
+            'outlier_z_threshold' => 6.0,
+            'weights'             => [
+                'missing'     => 0.3,
+                'flat'        => 0.3,
+                'outliers'    => 0.3,
+                'correlation' => 0.1,
+            ],
+        ]);
+
+        if ($count === 0) {
+            return [
+                'ticker_id' => $tickerId,
+                'status'    => 'error',
+                'health'    => 0.0,
+                'issues'    => ['no_metrics'=>true],
+            ];
+        }
+
+        if ($count < $cfg['min_rows']) {
+            return [
+                'ticker_id'=>$tickerId,
+                'status'=>'insufficient',
+                'health'=>0.0,
+                'issues'=>['insufficient_rows'=>$count],
+            ];
+        }
+
+        // Collect metric arrays
+        $columns = ['sharpe_60','volatility_30','drawdown','beta_60','momentum_10'];
+        $values = [];
+        foreach ($columns as $col) {
+            $values[$col] = $rows->pluck($col)->map(fn($v)=>is_numeric($v)?(float)$v:null)->all();
+        }
+
+        $issues = ['missing'=>[],'flat'=>[],'outliers'=>[],'correlation'=>[]];
+
+        // Missing
+        foreach ($values as $k=>$vals){
+            if (in_array(null,$vals,true)) $issues['missing'][]=$k;
+        }
+
+        // Flatlines
+        foreach ($values as $k=>$vals){
+            $unique=array_unique(array_filter($vals,'is_numeric'));
+            if(count($unique)<=1) $issues['flat'][]=$k;
+        }
+
+        // Outliers
+        foreach ($values as $k=>$vals){
+            $vals=array_filter($vals,'is_numeric');
+            if(count($vals)<5) continue;
+            $mean=array_sum($vals)/count($vals);
+            $var=array_sum(array_map(fn($v)=>pow($v-$mean,2),$vals))/count($vals);
+            $std=sqrt($var);
+            if($std==0) continue;
+            foreach($vals as $v){
+                if(abs(($v-$mean)/$std)>$cfg['outlier_z_threshold']){
+                    $issues['outliers'][]=$k;
+                    break;
+                }
+            }
+        }
+
+        // Correlation heuristics
+        $pairs=[['sharpe_60','volatility_30'],['momentum_10','drawdown']];
+        foreach($pairs as[$a,$b]){
+            if(!isset($values[$a],$values[$b]))continue;
+            $A=$values[$a];$B=$values[$b];
+            $n=min(count($A),count($B));
+            if($n<5)continue;
+            $corr=$this->pearsonCorrelation($A,$B,$n);
+            if($corr<-0.5)$issues['correlation'][]="$a<->$b";
+        }
+
+        // Health computation
+        $weights=$cfg['weights'];$severity=[];
+        foreach(['missing','flat','outliers','correlation']as$t){
+            $c=count(array_unique($issues[$t]));
+            $severity[$t]=min(1.0,$c/max(1,count($values)))*($weights[$t]??0);
+        }
+        $health=max(0.0,round(1-array_sum($severity),4));
+        $status=$health<0.7?'error':($health<0.9?'warning':'success');
+
+        return[
+            'ticker_id'=>$tickerId,
+            'status'=>$status,
+            'health'=>$health,
+            'issues'=>array_filter($issues,fn($v)=>!empty($v)),
+            'severity'=>$severity,
+        ];
+    }
+
+    protected function pearsonCorrelation(array $a,array $b,int $n):float
+    {
+        $meanA=array_sum($a)/$n;
+        $meanB=array_sum($b)/$n;
+        $num=0;$denA=0;$denB=0;
+        for($i=0;$i<$n;$i++){
+            $da=$a[$i]-$meanA;
+            $db=$b[$i]-$meanB;
+            $num+=$da*$db;
+            $denA+=$da**2;
+            $denB+=$db**2;
+        }
+        return($denA>0&&$denB>0)?$num/sqrt($denA*$denB):0.0;
+    }
+}app/Services/Validation/DataAuditService.php
+
+
+===== FILE: app/Services/Validation/DataAuditService.php =====
+
+<?php
+
+namespace App\Services\Validation;
+
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * ============================================================================
+ *  DataAuditService (v1.1)
+ * ============================================================================
+ *
+ * Adds table-level "Health %" scoring and overall system health summary.
+ * ============================================================================
+ */
+class DataAuditService
+{
+    /** @var array<string> List of core ticker-related tables to audit */
+    protected array $tables = [
+        'ticker_price_histories',
+        'ticker_indicators',
+        'ticker_feature_snapshots',
+        'ticker_feature_metrics',
+    ];
+
+    public function run(int $limit = 0, bool $detail = false): array
+    {
+        $summary = ['tables' => [], 'cross' => [], 'overall' => []];
+
+        $totalTickers = DB::table('tickers')->count();
+        $healthScores = [];
+
+        // ------------------------------------------------------------------
+        // 1️⃣ Table-level record counts + health %
+        // ------------------------------------------------------------------
+        foreach ($this->tables as $table) {
+            $count = DB::table($table)->count();
+
+            // derive approximate ticker coverage ratio
+            $tickersWithData = DB::table($table)->distinct('ticker_id')->count('ticker_id');
+            $ratio = $totalTickers > 0 ? round(($tickersWithData / $totalTickers) * 100, 2) : 0;
+
+            $status = match (true) {
+                $ratio >= 99.5 => 'OK',
+                $ratio >= 95   => 'WARN',
+                default        => 'ERROR',
+            };
+
+            $summary['tables'][$table] = [
+                'count'   => $count,
+                'tickers_with_data' => $tickersWithData,
+                'total_tickers'     => $totalTickers,
+                'health_percent'    => $ratio,
+                'status'            => $status,
+            ];
+
+            $healthScores[] = $ratio;
+        }
+
+        // ------------------------------------------------------------------
+        // 2️⃣ Cross-table consistency checks
+        // ------------------------------------------------------------------
+        $summary['cross'] = [
+            'Tickers with no price history'      => $this->countMissing('ticker_price_histories'),
+            'Tickers missing indicators'         => $this->countMissing('ticker_indicators'),
+            'Tickers missing snapshots'          => $this->countMissing('ticker_feature_snapshots'),
+            'Tickers missing metrics'            => $this->countMissing('ticker_feature_metrics'),
+            'Snapshots without matching metrics' => $this->countOrphans('ticker_feature_snapshots', 'ticker_feature_metrics'),
+            'Metrics without matching snapshots' => $this->countOrphans('ticker_feature_metrics', 'ticker_feature_snapshots'),
+        ];
+
+        if ($detail) {
+            $summary['details'] = [
+                'missing_metrics'   => $this->listMissing('ticker_feature_metrics', 25),
+                'missing_snapshots' => $this->listMissing('ticker_feature_snapshots', 25),
+            ];
+        }
+
+        // ------------------------------------------------------------------
+        // 3️⃣ Overall Health Score
+        // ------------------------------------------------------------------
+        $summary['overall']['system_health_percent'] =
+            count($healthScores) > 0 ? round(array_sum($healthScores) / count($healthScores), 2) : 0;
+
+        $summary['overall']['grade'] = match (true) {
+            $summary['overall']['system_health_percent'] >= 99.5 => 'Excellent',
+            $summary['overall']['system_health_percent'] >= 95   => 'Good',
+            $summary['overall']['system_health_percent'] >= 90   => 'Fair',
+            default => 'Critical',
+        };
+
+        Log::channel('ingest')->info('🧩 DataAuditService summary', $summary);
+        return $summary;
+    }
+
+    // ----------------------------------------------------------------------
+    // Helper methods
+    // ----------------------------------------------------------------------
+
+    protected function countMissing(string $table): int
+    {
+        return DB::table('tickers')
+            ->leftJoin($table, "$table.ticker_id", '=', 'tickers.id')
+            ->whereNull("$table.ticker_id")
+            ->count();
+    }
+
+    protected function countOrphans(string $left, string $right): int
+    {
+        return DB::table($left)
+            ->leftJoin($right, "$right.ticker_id", '=', "$left.ticker_id")
+            ->whereNull("$right.ticker_id")
+            ->distinct()
+            ->count("$left.ticker_id");
+    }
+
+    protected function listMissing(string $table, int $limit = 10): array
+    {
+        return DB::table('tickers')
+            ->leftJoin($table, "$table.ticker_id", '=', 'tickers.id')
+            ->whereNull("$table.ticker_id")
+            ->limit($limit)
+            ->pluck('ticker')
+            ->all();
     }
 }app/Services/Analytics/BaseAnalytics.php
 
@@ -5389,103 +6619,427 @@ class FeatureSnapshotBuilder
 namespace App\Services\Analytics;
 
 use App\Models\Ticker;
-use App\Models\TickerCorrelation;
-use App\Services\Compute\BaseIndicator;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Log;
 
 /**
- * CorrelationMatrixService
+ * =============================================================================
+ *  CorrelationMatrixService  (v4.0 — Config-Aware, Chunked, Fully Documented)
+ * =============================================================================
  *
- * Generates inter-ticker rolling correlations across all tickers
- * (or within a specified sector/universe).
+ * PURPOSE
+ * --------
+ * This service computes **pairwise correlation**, **beta**, and **R²**
+ * coefficients between all (or a subset of) active tickers based on their
+ * daily price history, and persists the results into the `ticker_correlations`
+ * table for analytical and visualization use.
  *
- * Usage:
- *   (new CorrelationMatrixService())->computeMatrix(lookbackDays: 90);
+ * It is the analytical backbone for:
+ *   • Heatmap correlation dashboards
+ *   • Sector/industry co-movement analysis
+ *   • Portfolio and LLM-driven narrative generation (“AAPL ↔ NVDA +0.92”)
+ *
+ * -----------------------------------------------------------------------------
+ * DESIGN OVERVIEW
+ * -----------------------------------------------------------------------------
+ * 1️⃣  Data Source
+ *     Uses `ticker_price_histories` as the canonical price source.
+ *     Only daily candles (`resolution = '1d'`) are used for correlation.
+ *
+ * 2️⃣  Data Window
+ *     Loads closing prices for a configurable lookback period
+ *     (default: 120 days) and computes per-ticker **log returns**.
+ *
+ * 3️⃣  Pairwise Computation
+ *     Computes correlations in **block-tiled** fashion (chunk×chunk)
+ *     to prevent O(n²) memory blowups. Default chunk: 200 tickers.
+ *
+ * 4️⃣  Statistical Metrics
+ *     • Correlation (Pearson)
+ *     • Beta = cov(A,B) / var(B)
+ *     • R²   = corr²
+ *
+ * 5️⃣  Data Integrity
+ *     • Canonical ordering enforced: (a < b)
+ *     • Requires minimum overlap of observations (default: 20)
+ *     • Guards against NaN/INF/zero-variance
+ *
+ * 6️⃣  Persistence
+ *     • Bulk upsert into `ticker_correlations` every N pairs (default: 5000)
+ *     • Uses ON DUPLICATE KEY UPDATE semantics via Laravel’s upsert()
+ *
+ * 7️⃣  Configuration
+ *     All tunables live in `/config/correlation.php`, under `defaults`.
+ *     Command-line overrides (e.g. --window, --lookback) always take priority.
+ *
+ * -----------------------------------------------------------------------------
+ * PERFORMANCE CHARACTERISTICS
+ * -----------------------------------------------------------------------------
+ * • Time complexity:  O(n²) pairs (chunked to bound memory)
+ * • Space complexity: O(chunk²)
+ * • Typical use: run nightly or periodically as a batch job.
+ *
+ * -----------------------------------------------------------------------------
+ * EXAMPLES
+ * -----------------------------------------------------------------------------
+ * ```bash
+ * php artisan compute:correlation-matrix
+ * php artisan compute:correlation-matrix --window=60 --lookback=180
+ * php artisan compute:correlation-matrix --limit=500 --chunk=100
+ * ```
+ *
+ * -----------------------------------------------------------------------------
+ * OUTPUT
+ * -----------------------------------------------------------------------------
+ * Each record in `ticker_correlations`:
+ *   ticker_id_a | ticker_id_b | as_of_date | corr | beta | r2 | timestamps
+ *
+ * -----------------------------------------------------------------------------
  */
 class CorrelationMatrixService extends BaseAnalytics
 {
     /**
-     * Compute pairwise correlations between tickers' daily closes.
+     * Primary entry point for correlation matrix computation.
      *
-     * @param int $lookbackDays How many days of data to use.
-     * @param int $window Rolling window for correlation (e.g., 20 days).
+     * @param  int|null  $lookbackDays   Number of calendar days of price data to load
+     * @param  int|null  $window         Rolling window size (number of returns)
+     * @param  int|null  $chunkSize      Ticker block size for memory tiling
+     * @param  int|null  $limit          Optional cap on ticker count
+     * @param  int|null  $minOverlap     Minimum overlapping observations required
+     * @return void
      */
-    public function computeMatrix(int $lookbackDays = 90, int $window = 20): void
-    {
-        $tickers = Ticker::where('active', true)->get(['id', 'ticker']);
-        $priceData = $this->fetchRecentCloses($tickers->pluck('id')->toArray(), $lookbackDays);
+    public function computeMatrix(
+        ?int $lookbackDays = null,
+        ?int $window = null,
+        ?int $chunkSize = null,
+        ?int $limit = null,
+        ?int $minOverlap = null
+    ): void {
+        /*
+        |--------------------------------------------------------------------------
+        | 0️⃣ Load configuration defaults
+        |--------------------------------------------------------------------------
+        */
+        $cfg = config('correlation.defaults');
+        $lookbackDays = $lookbackDays ?? $cfg['lookback_days'];
+        $window       = $window ?? $cfg['window'];
+        $chunkSize    = $chunkSize ?? $cfg['chunk_size'];
+        $minOverlap   = $minOverlap ?? $cfg['min_overlap'];
+        $flushEvery   = $cfg['flush_every'];
 
         $asOf = now()->toDateString();
-        $totalPairs = 0;
 
-        foreach ($tickers as $i => $a) {
-            for ($j = $i + 1; $j < count($tickers); $j++) {
-                $b = $tickers[$j];
-                $totalPairs++;
+        /*
+        |--------------------------------------------------------------------------
+        | 1️⃣ Resolve active ticker universe
+        |--------------------------------------------------------------------------
+        | We restrict to `active = true` to avoid stale/delisted symbols.
+        | Optionally, a `--limit` can cap the number of tickers for testing.
+        */
+        $tickerQuery = Ticker::query()
+            ->where('active', true)
+            ->orderBy('id')
+            ->select(['id', 'ticker']);
 
-                $seriesA = $priceData[$a->id] ?? [];
-                $seriesB = $priceData[$b->id] ?? [];
+        if ($limit && $limit > 0) {
+            $tickerQuery->limit($limit);
+        }
 
-                if (count($seriesA) < $window || count($seriesB) < $window) continue;
+        $tickers = $tickerQuery->get();
+        $ids     = $tickers->pluck('id')->all();
+        $n       = count($ids);
 
-                // Compute returns
-                $retA = $this->returns($seriesA);
-                $retB = $this->returns($seriesB);
+        if ($n < 2) {
+            Log::channel('ingest')->warning('⚠️ Not enough tickers for correlation computation', [
+                'count' => $n,
+            ]);
+            return;
+        }
 
-                // Align and compute rolling correlation
-                $corrSeries = $this->rollingCorrelation($retA, $retB, $window);
-                $betaSeries = $this->rollingBeta($retA, $retB, $window);
+        Log::channel('ingest')->info('▶️ Starting correlation matrix', [
+            'tickers'      => $n,
+            'lookbackDays' => $lookbackDays,
+            'window'       => $window,
+            'chunkSize'    => $chunkSize,
+            'minOverlap'   => $minOverlap,
+            'as_of'        => $asOf,
+        ]);
 
-                $lastIdx = count($corrSeries) - 1;
-                $corr = $corrSeries[$lastIdx];
-                $beta = $betaSeries[$lastIdx];
-                $r2   = $corr !== null ? pow($corr, 2) : null;
+        /*
+        |--------------------------------------------------------------------------
+        | 2️⃣ Load recent daily closes for all tickers in one bulk query
+        |--------------------------------------------------------------------------
+        | Pull only the required lookback window from `ticker_price_histories`.
+        | The query benefits from existing indexes on (ticker_id, resolution, t).
+        */
+        $since = now()->subDays($lookbackDays)->toDateString();
 
-                if ($corr === null) continue;
+        $rows = DB::table('ticker_price_histories')
+            ->whereIn('ticker_id', $ids)
+            ->where('resolution', '1d')
+            ->whereDate('t', '>=', $since)
+            ->orderBy('ticker_id')
+            ->orderBy('t')
+            ->get([
+                'ticker_id',
+                DB::raw('DATE(t) as d'),
+                'c',
+            ]);
 
-                TickerCorrelation::updateOrCreate(
-                    [
-                        'ticker_id_a' => $a->id,
-                        'ticker_id_b' => $b->id,
-                        'as_of_date'  => $asOf,
-                    ],
-                    [
-                        'corr' => $corr,
-                        'beta' => $beta,
-                        'r2'   => $r2,
-                    ]
-                );
+        /*
+        |--------------------------------------------------------------------------
+        | 3️⃣ Transform raw rows into per-ticker closing-price maps
+        |--------------------------------------------------------------------------
+        | Resulting structure:
+        |   $closesByTicker[123] = ['2025-01-01' => 123.45, '2025-01-02' => 124.10, ...]
+        */
+        $closesByTicker = [];
+        foreach ($rows as $r) {
+            if ($r->c !== null) {
+                $closesByTicker[(int)$r->ticker_id][$r->d] = (float)$r->c;
+            }
+        }
+        unset($rows); // free memory
+
+        /*
+        |--------------------------------------------------------------------------
+        | 4️⃣ Precompute log return series per ticker
+        |--------------------------------------------------------------------------
+        | Using natural log returns ensures additive stability and numerical
+        | safety for small price changes.
+        */
+        $returnsByTicker = [];
+        $datesByTicker   = [];
+
+        foreach ($closesByTicker as $tid => $series) {
+            ksort($series); // ensure chronological order
+            $dates   = array_keys($series);
+            $closes  = array_values($series);
+
+            // Compute log returns
+            $returns = $this->logReturns($closes);
+
+            // Align date array to match returns length (returns are N-1)
+            $alignedDates = array_slice($dates, 1);
+
+            $returnsByTicker[$tid] = $returns;
+            $datesByTicker[$tid]   = $alignedDates;
+        }
+
+        unset($closesByTicker);
+
+        /*
+        |--------------------------------------------------------------------------
+        | 5️⃣ Pairwise correlation computation (block-tiled for scalability)
+        |--------------------------------------------------------------------------
+        | - Iterates in tile blocks to keep memory O(chunk²)
+        | - Enforces canonical order (a < b)
+        | - Skips pairs with insufficient overlap
+        */
+        $pairRows = [];
+        $totalPairsConsidered = 0;
+        $totalPairsWritten = 0;
+
+        for ($aStart = 0; $aStart < $n; $aStart += $chunkSize) {
+            $aEnd = min($n, $aStart + $chunkSize);
+            $aBlock = array_slice($ids, $aStart, $aEnd - $aStart);
+
+            for ($bStart = $aStart; $bStart < $n; $bStart += $chunkSize) {
+                $bEnd = min($n, $bStart + $chunkSize);
+                $bBlock = array_slice($ids, $bStart, $bEnd - $bStart);
+
+                foreach ($aBlock as $aid) {
+                    foreach ($bBlock as $bid) {
+                        // Skip self and duplicates (upper triangle only)
+                        if ($bid <= $aid) continue;
+                        $totalPairsConsidered++;
+
+                        // Both tickers must have data
+                        if (!isset($returnsByTicker[$aid], $returnsByTicker[$bid])) continue;
+
+                        // Align by intersection of date sets
+                        $datesA = $datesByTicker[$aid];
+                        $datesB = $datesByTicker[$bid];
+                        $setB   = array_flip($datesB);
+                        $alignedA = [];
+                        $alignedB = [];
+
+                        foreach ($datesA as $idxA => $d) {
+                            if (isset($setB[$d])) {
+                                $alignedA[] = $returnsByTicker[$aid][$idxA];
+                                $idxB = $setB[$d];
+                                $alignedB[] = $returnsByTicker[$bid][$idxB];
+                            }
+                        }
+
+                        $m = count($alignedA);
+                        if ($m < max($window, $minOverlap)) continue;
+
+                        // Use only the most recent $window observations
+                        $sliceA = array_slice($alignedA, -$window);
+                        $sliceB = array_slice($alignedB, -$window);
+
+                        // Skip degenerate pairs with zero variance
+                        $stdA = $this->stddev($sliceA);
+                        $stdB = $this->stddev($sliceB);
+                        if ($stdA <= 0 || $stdB <= 0) continue;
+
+                        // Compute correlation / beta / r²
+                        $corr = $this->corr($sliceA, $sliceB, $stdA, $stdB);
+                        if (!is_finite($corr)) continue;
+
+                        $beta = $this->beta($sliceA, $sliceB);
+                        $r2   = $corr * $corr;
+
+                        // Append to batch for bulk upsert
+                        $pairRows[] = [
+                            'ticker_id_a' => $aid,
+                            'ticker_id_b' => $bid,
+                            'as_of_date'  => $asOf,
+                            'corr'        => round($corr, 6),
+                            'beta'        => is_finite($beta) ? round($beta, 6) : null,
+                            'r2'          => round($r2, 6),
+                            'created_at'  => now(),
+                            'updated_at'  => now(),
+                        ];
+
+                        // Periodic flush to DB
+                        if (count($pairRows) >= $flushEvery) {
+                            $this->flushUpsert($pairRows);
+                            $totalPairsWritten += count($pairRows);
+                            $pairRows = [];
+                        }
+                    }
+                }
             }
         }
 
-        Log::channel('ingest')->info("✅ Correlation matrix computed", [
-            'as_of' => $asOf,
-            'pairs' => $totalPairs,
+        // Final flush
+        if (!empty($pairRows)) {
+            $this->flushUpsert($pairRows);
+            $totalPairsWritten += count($pairRows);
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 6️⃣ Logging summary and completion status
+        |--------------------------------------------------------------------------
+        */
+        Log::channel('ingest')->info('✅ Correlation matrix computation complete', [
+            'as_of'         => $asOf,
+            'tickers'       => $n,
+            'pairs_seen'    => $totalPairsConsidered,
+            'pairs_written' => $totalPairsWritten,
+            'window'        => $window,
+            'lookbackDays'  => $lookbackDays,
         ]);
     }
 
+    // =========================================================================
+    // 🧩 Database I/O: Bulk Upsert
+    // =========================================================================
     /**
-     * Fetch recent closing prices (simple version for now).
+     * Efficiently write all correlation results into the database
+     * using Laravel’s bulk upsert (MySQL ON DUPLICATE KEY UPDATE).
      *
-     * @return array<int, array<float>> keyed by ticker_id
+     * @param  array<int,array<string,mixed>>  $rows
+     * @return void
      */
-    protected function fetchRecentCloses(array $tickerIds, int $lookbackDays): array
+    protected function flushUpsert(array $rows): void
     {
-        $rows = DB::table('ticker_bars')
-            ->whereIn('ticker_id', $tickerIds)
-            ->where('t', '>=', now()->subDays($lookbackDays))
-            ->orderBy('t')
-            ->get(['ticker_id', 'c']);
-
-        $data = [];
-        foreach ($rows as $r) {
-            $data[$r->ticker_id][] = (float)$r->c;
-        }
-        return $data;
+        DB::table('ticker_correlations')->upsert(
+            $rows,
+            ['ticker_id_a', 'ticker_id_b', 'as_of_date'],
+            ['corr', 'beta', 'r2', 'updated_at']
+        );
     }
-}
-app/Services/Analytics/AnalyticsCalculator.php
+
+    // =========================================================================
+    // 📊 Math Helpers
+    // =========================================================================
+
+    /**
+     * Compute natural log returns between consecutive closes.
+     *
+     * @param  array<float>  $closes
+     * @return array<float>
+     */
+    protected function logReturns(array $closes): array
+    {
+        $n = count($closes);
+        if ($n < 2) return [];
+        $out = [];
+        for ($i = 1; $i < $n; $i++) {
+            $prev = $closes[$i - 1];
+            $curr = $closes[$i];
+            $out[] = ($prev > 0 && $curr > 0) ? log($curr / $prev) : 0.0;
+        }
+        return $out;
+    }
+
+    /**
+     * Compute sample standard deviation.
+     */
+    protected function stddev(array $x): float
+    {
+        $n = count($x);
+        if ($n < 2) return 0.0;
+        $mean = array_sum($x) / $n;
+        $ss = 0.0;
+        foreach ($x as $v) {
+            $d = $v - $mean;
+            $ss += $d * $d;
+        }
+        return sqrt($ss / ($n - 1));
+    }
+
+    /**
+     * Compute Pearson correlation given precomputed stddevs.
+     */
+    protected function corr(array $a, array $b, float $stdA, float $stdB): float
+    {
+        $n = min(count($a), count($b));
+        if ($n < 2 || $stdA == 0.0 || $stdB == 0.0) return NAN;
+
+        $meanA = array_sum($a) / $n;
+        $meanB = array_sum($b) / $n;
+
+        $num = 0.0;
+        for ($i = 0; $i < $n; $i++) {
+            $num += ($a[$i] - $meanA) * ($b[$i] - $meanB);
+        }
+
+        $den = ($n - 1) * $stdA * $stdB;
+        return $den > 0.0 ? $num / $den : NAN;
+    }
+
+    /**
+     * Compute OLS Beta = Cov(A,B) / Var(B).
+     *
+     * B is treated as the “reference” series (e.g., market or peer).
+     */
+    protected function beta(array $a, array $b): float
+    {
+        $n = min(count($a), count($b));
+        if ($n < 2) return NAN;
+
+        $meanA = array_sum($a) / $n;
+        $meanB = array_sum($b) / $n;
+
+        $cov = 0.0;
+        $varB = 0.0;
+
+        for ($i = 0; $i < $n; $i++) {
+            $da = $a[$i] - $meanA;
+            $db = $b[$i] - $meanB;
+            $cov += $da * $db;
+            $varB += $db * $db;
+        }
+
+        if ($varB <= 0.0) return NAN;
+        return $cov / $varB;
+    }
+}app/Services/Analytics/AnalyticsCalculator.php
 
 
 ===== FILE: app/Services/Analytics/AnalyticsCalculator.php =====

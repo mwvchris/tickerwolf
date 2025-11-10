@@ -1,4 +1,4 @@
-===== GPT DUMP GENERATED: 2025-11-03T10:24:19Z =====
+===== GPT DUMP GENERATED: 2025-11-10T05:30:52Z =====
 ===== DIRECTORY: config =====
 
 config/fortify.php
@@ -1390,7 +1390,48 @@ return [
     ],
 
 ];
-config/indicators.php
+config/correlation.php
+
+
+===== FILE: config/correlation.php =====
+
+<?php
+
+return [
+
+    /*
+    |--------------------------------------------------------------------------
+    | Correlation Engine Defaults
+    |--------------------------------------------------------------------------
+    |
+    | These define the default parameters for the correlation matrix computation
+    | across tickers. Command-line options in `compute:correlation-matrix`
+    | will override these values when provided.
+    |
+    */
+
+    'defaults' => [
+
+        // Number of trading days of data to pull from ticker_price_histories
+        'lookback_days' => 120,
+
+        // Rolling window length (in returns) used to compute correlation/beta
+        'window' => 20,
+
+        // Ticker block size (chunk × chunk) to control memory footprint
+        'chunk_size' => 200,
+
+        // Minimum overlapping observations required between tickers
+        'min_overlap' => 20,
+
+        // Default ticker limit for safety (0 = all active tickers)
+        'limit' => 0,
+
+        // Number of pairs per bulk upsert operation
+        'flush_every' => 5000,
+    ],
+
+];config/indicators.php
 
 
 ===== FILE: config/indicators.php =====
@@ -1878,6 +1919,12 @@ return [
             'level' => 'debug',
         ],
 
+        'validation' => [
+            'driver' => 'single',
+            'path' => storage_path('logs/validation.log'),
+            'level' => 'info',
+        ],
+
         'papertrail' => [
             'driver' => 'monolog',
             'level' => env('LOG_LEVEL', 'debug'),
@@ -1959,6 +2006,27 @@ return [
 
     // Minimum number of bars required before meaningful validation
     'min_bars' => 10,
+
+    // Data completeness thresholds (used by integrity scan)
+    'coverage_thresholds' => [
+        'moderate' => 75,   // below this => "partial"
+        'critical' => 25,   // below this => "very sparse"
+    ],
+
+    // Liquidity thresholds (used by integrity scan)
+    'liquidity' => [
+        'min_avg_volume' => 100, // below this => "illiquid"
+    ],
+
+    // Optional flatness tolerance override (integrity scan)
+    'flat_ratio_threshold' => 0.5, // >50% flat bars = 'flat'
+
+    // Label display preferences (used for console reporting)
+    'label_colors' => [
+        'critical' => 'red',
+        'moderate' => 'yellow',
+        'healthy'  => 'green',
+    ],
 ];config/filesystems.php
 
 
