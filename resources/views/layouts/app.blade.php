@@ -12,7 +12,7 @@
     />
 
     <title>{{ config('app.name', 'TickerWolf.ai') }} — Blurred Header</title>
-    <link rel="icon" type="image/png" href="{{ asset('images/favicon.png') }}" />
+    <link rel="icon" type="image/svg+xml" href="{{ asset('images/app-logo.svg') }}" />
 
     <!-- ============================================================
          CSS & JS — Compiled by Vite
@@ -20,7 +20,8 @@
     ============================================================ -->
     @vite([
         'resources/css/lineone/app.css',
-        'resources/js/app.ts',
+        'resources/js/lineone/app.js',
+        'resources/js/blade-app.js',
     ])
 
     <!-- ============================================================
@@ -49,12 +50,15 @@
     <!-- ============================================================
          App Preloader
     ============================================================ -->
+    <!--
     <div class="app-preloader fixed z-50 grid h-full w-full place-content-center bg-slate-50 dark:bg-navy-900">
       <div class="app-preloader-inner relative inline-block size-48"></div>
     </div>
+    Note: If you want to use the preloader, add the 'cloak' class to the #root div below
+    -->
 
     <!-- Page Wrapper -->
-    <div id="root" class="min-h-100vh cloak flex grow bg-slate-50 dark:bg-navy-900">
+    <div id="root" class="min-h-100vh flex grow bg-slate-50 dark:bg-navy-900">
 
       <!-- Sidebar -->
       @include('partials.left-sidebar')

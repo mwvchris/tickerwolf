@@ -76,7 +76,9 @@ export default defineConfig({
     host: '0.0.0.0',
     port: devPort,
     strictPort: true,
-    origin: parsedDevUrl.origin,
+    cors: {
+      origin: true, // mirror requesting origin (tickerwolf.test) so module scripts/fonts pass CORS checks
+    },
     watch: {
       usePolling: true,
       interval: 150,

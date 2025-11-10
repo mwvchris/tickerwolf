@@ -97,7 +97,7 @@ hljs.configure({ ignoreUnescapedHTML: true });
  * Application Services
  */
 window.$breakpoint = new Breakpont();
-window.$darkmode = new DarkMode();
+window.$darkmode = new DarkMode('dark');
 window.$monochromemode = new MonochromeMode();
 window.$notification = Notification;
 window.$clipboard = Clipboard;
