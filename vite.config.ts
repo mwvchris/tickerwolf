@@ -2,7 +2,8 @@
  * --------------------------------------------------------------------------
  * Vite Config — TickerWolf.ai (Laravel 12 + Inertia + Vue 3 + Lineone)
  * --------------------------------------------------------------------------
- * Mirrors Lineone-Laravel 3.2.1 baseline while supporting Inertia/Vue.
+ * Clean Tailwind 4.1.x + Lineone 3.2.1 integration.
+ * Ensures single Tailwind runtime, correct entry order, and HMR stability.
  * --------------------------------------------------------------------------
  */
 
@@ -22,32 +23,32 @@ const hmrProtocol = devProtocol === 'https' ? 'wss' : 'ws'
 
 export default defineConfig({
   plugins: [
-    // Laravel / Inertia integration
+    // Laravel + Inertia entrypoints
     laravel({
       input: [
-        // Core entries
-        'resources/css/app.css',
+        // Inertia app
         'resources/js/app.ts',
+        // Blade-only JS
         'resources/js/blade-app.js',
 
-        // Lineone assets
+        // Lineone theme entry
         'resources/css/lineone/app.css',
         'resources/js/lineone/app.js',
         'resources/js/lineone/main.js',
 
-        // Optional JS modules
+        // Optional dynamic Lineone modules
         ...globSync('resources/js/lineone/pages/**/*.js'),
         ...globSync('resources/js/lineone/libs/**/*.js'),
       ],
       refresh: true,
     }),
 
-    // Vue 3 SFC support
+    // Vue support
     vue({
       template: { transformAssetUrls: { base: null, includeAbsolute: false } },
     }),
 
-    // Single Tailwind runtime (do NOT duplicate in PostCSS)
+    // ✅ Single Tailwind 4 runtime (no duplication via PostCSS)
     tailwindcss(),
   ],
 
