@@ -9,6 +9,7 @@
 @import "highlight.js/styles/atom-one-dark.css" layer(components); /* Just for demo purpose only for highlighting code */
 @import "./fontawesome-all.css" layer(utilities);
 @import "./fontawesome-overrides.css" layer(utilities);
+@import "../tickerwolf/style.css" layer(base);
 
 @custom-variant dark (&:where(.dark, .dark *));
 

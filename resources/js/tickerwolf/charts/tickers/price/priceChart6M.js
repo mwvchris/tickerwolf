@@ -1,54 +1,61 @@
 /**
- * 6M Price Chart — ~6 x-labels, right y-axis.
+ * --------------------------------------------------------------------------
+ * TickerWolf.ai — 6-Month Price Chart
+ * --------------------------------------------------------------------------
+ * Displays the last 6 months of price data with smooth transitions,
+ * ~6 x-axis labels, right-side y-axis, and consistent theme styling.
+ *
+ * This version uses the centralized chart configuration helper:
+ *   ➤ resources/js/tickerwolf/charts/_core/chart-styles.js
+ *
+ * Benefits:
+ *   - Unified styling (fonts, gradients, grid, tooltip) across all charts
+ *   - Single source of truth for theme/font/color logic
+ *   - Automatic dark-mode compatibility
+ * --------------------------------------------------------------------------
  */
-import ApexCharts from 'apexcharts';
-import { getChartTheme, getThemeMode } from '../../_core/theme.js';
 
-export function renderPriceChart(selector, series = []) {
-  const el = document.querySelector(selector);
-  if (!el || !series.length) return null;
+import ApexCharts from 'apexcharts'
+import { buildChartOptions } from '../../_core/chart-styles.js'
 
-  const theme = getChartTheme();
-  const tooltipTheme = getThemeMode(theme);
+/**
+ * Render the 6-Month Price Chart.
+ *
+ * @param {string|HTMLElement} selector
+ *    DOM selector or node where the chart will render (e.g. '#price-chart')
+ *
+ * @param {Array<{x:string|number|Date, y:number|null}>} series
+ *    Lightweight array of `{x:'YYYY-MM-DD', y:close}` points.
+ *    Data is already downsampled server-side for speed.
+ *
+ * @param {Object} [options={}]
+ *    Optional overrides (e.g. `{ currency:'USD' }`).
+ */
+export function renderPriceChart(selector, series = [], options = {}) {
+  const el = typeof selector === 'string' ? document.querySelector(selector) : selector
+  if (!el || !series.length) {
+    console.warn('[PriceChart:6M] No target element or empty data series.')
+    return null
+  }
 
-  const opts = {
-    chart: {
-      type: 'area',
-      height: 255,
-      toolbar: { show: false },
-      foreColor: theme.fontColor,
-    },
+  // ------------------------------------------------------------------------
+  // Build the shared chart configuration.
+  // This specifies what’s unique for the 6-month view:
+  //   • tickAmount: ~6 evenly spaced labels
+  //   • tooltipFormat: "MMM DD" (e.g. Nov 10)
+  // ------------------------------------------------------------------------
+  const opts = buildChartOptions({
     series: [{ name: 'Price', data: series }],
-    dataLabels: {
-      enabled: false,
-    },
-    xaxis: {
-      type: 'datetime',
-      tickAmount: 6,
-      labels: {
-        datetimeUTC: false,
-        datetimeFormatter: { month: 'MMM', day: 'MMM dd' },
-        style: { colors: theme.fontColor, fontSize: '11px' },
-      },
-      axisBorder: { show: false },
-      axisTicks:  { show: false },
-    },
-    yaxis: {
-      opposite: true,
-      labels: { formatter: (v) => `$${Number(v).toFixed(2)}`, style: { colors: theme.fontColor } },
-    },
-    stroke: { curve: 'smooth', width: 2, colors: [theme.colors.price] },
-    fill: { type: 'gradient', gradient: { shadeIntensity: 0.25, opacityFrom: 0.35, opacityTo: 0.05, stops: [0, 100] } },
-    grid: theme.grid,
-    tooltip: {
-      theme: tooltipTheme,
-      x: { formatter: (val) => new Date(val).toLocaleDateString(undefined, { month: 'short', day: '2-digit' }) },
-      y: { formatter: (v) => `$${Number(v).toFixed(2)}` },
-    },
-    markers: { size: 0 },
-  };
+    timeframe: '6M',
+    tickAmount: 6,
+    tooltipFormat: { month: 'short', day: '2-digit' },
+    currency: options.currency || 'USD',
+  })
 
-  const chart = new ApexCharts(el, opts);
-  chart.render();
-  return chart;
+  // ------------------------------------------------------------------------
+  // Instantiate and render the ApexChart instance.
+  // ------------------------------------------------------------------------
+  const chart = new ApexCharts(el, opts)
+  chart.render()
+  return chart
 }

@@ -1,73 +1,62 @@
 /**
- * 1D Price Chart — light series, right y-axis, ~6 x-labels.
+ * --------------------------------------------------------------------------
+ * TickerWolf.ai — 1-Day Price Chart
+ * --------------------------------------------------------------------------
+ * Displays a single day’s price movement (or last 24h, if intraday data
+ * is later added). Uses the unified chart style builder for consistent
+ * visuals, tooltip formatting, and typography across all range charts.
+ *
+ * Time granularity is supported (hour/minute precision) while preserving
+ * the same theme integration and smooth gradient area styling.
+ * --------------------------------------------------------------------------
  */
-import ApexCharts from 'apexcharts';
-import { getChartTheme, getThemeMode } from '../../_core/theme.js';
 
-export function renderPriceChart(selector, series = []) {
-  const el = document.querySelector(selector);
-  if (!el || !series.length) return null;
+import ApexCharts from 'apexcharts'
+import { buildChartOptions } from '../../_core/chart-styles.js'
 
-  const theme = getChartTheme();
-  const tooltipTheme = getThemeMode(theme);
+/**
+ * Render the 1-Day Price Chart.
+ *
+ * @param {string|HTMLElement} selector
+ *   DOM selector or node where the chart should render (e.g. '#price-chart').
+ *
+ * @param {Array<{x:string|number|Date, y:number|null}>} series
+ *   Array of `{x:'YYYY-MM-DDTHH:mm:ss', y:close}` points.
+ *   May contain daily or intraday timestamps.
+ *
+ * @param {Object} [options={}]
+ *   Optional overrides (e.g. `{ currency:'USD' }`).
+ */
+export function renderPriceChart(selector, series = [], options = {}) {
+  const el = typeof selector === 'string' ? document.querySelector(selector) : selector
+  if (!el || !series.length) {
+    console.warn('[PriceChart:1D] No target element or empty data series.')
+    return null
+  }
 
-  const opts = {
-    chart: {
-      type: 'area',
-      height: 255,
-      toolbar: { show: false },
-      foreColor: theme.fontColor,
-      animations: { enabled: true, easing: 'easeinout', speed: 300 },
-    },
+  // ------------------------------------------------------------------------
+  // Build the chart configuration for intraday or single-day display.
+  // The tooltip and x-axis use detailed "MMM DD, HH:mm" time formatting.
+  // ------------------------------------------------------------------------
+  const opts = buildChartOptions({
     series: [{ name: 'Price', data: series }],
-    dataLabels: {
-      enabled: false,
+    timeframe: '1D',
+    tickAmount: 6,
+    tooltipFormat: {
+      month: 'short',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
     },
-    xaxis: {
-      type: 'datetime',
-      tickAmount: 6,
-      labels: {
-        rotate: 0,
-        datetimeUTC: false,
-        datetimeFormatter: { year: 'yyyy', month: 'MMM dd', day: 'MMM dd', hour: 'MMM dd, HH:mm' },
-        style: { colors: theme.fontColor, fontSize: '11px' },
-      },
-      axisBorder: { show: false },
-      axisTicks:  { show: false },
-    },
-    yaxis: {
-      opposite: true,
-      decimalsInFloat: 2,
-      labels: {
-        formatter: (v) => `$${Number(v).toFixed(2)}`,
-        style: { colors: theme.fontColor },
-      },
-    },
-    stroke: { curve: 'smooth', width: 2, colors: [theme.colors.price] },
-    fill: {
-      type: 'gradient',
-      gradient: { shadeIntensity: 0.25, opacityFrom: 0.35, opacityTo: 0.05, stops: [0, 100] },
-    },
-    grid: theme.grid,
-    tooltip: {
-      theme: tooltipTheme,
-      x: {
-        formatter: (val) => {
-          // Include time for 1D when multiple points per day would exist.
-          // Our data is daily, but this formatter is future-proof.
-          const d = new Date(val);
-          return d.toLocaleString(undefined, { month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' });
-        },
-      },
-      y: { formatter: (v) => `$${Number(v).toFixed(2)}` },
-      shared: false,
-      intersect: true,
-      onDatasetHover: { highlightDataSeries: true },
-    },
-    markers: { size: 0 },
-  };
+    // 1-day charts can show hours on the x-axis for intraday resolution
+    axisTimeFormat: { hour: '2-digit', minute: '2-digit' },
+    currency: options.currency || 'USD',
+  })
 
-  const chart = new ApexCharts(el, opts);
-  chart.render();
-  return chart;
+  // ------------------------------------------------------------------------
+  // Instantiate and render the ApexChart instance.
+  // ------------------------------------------------------------------------
+  const chart = new ApexCharts(el, opts)
+  chart.render()
+  return chart
 }

@@ -16,6 +16,7 @@
             <h2 class="text-xl font-medium text-slate-800 dark:text-navy-50 lg:text-2xl">{{ $ticker->name }}</h2>
         </div>
 
+        {{--
         <h2 class="text-base font-medium tracking-wide text-slate-800 line-clamp-1 dark:text-navy-100">
             {{ $ticker->ticker }} Overview
         </h2>
@@ -23,24 +24,24 @@
         <div class="flex items-center space-x-2">
             {{ $ticker->primary_exchange ?? '-' }} &bull; {{ strtoupper($ticker->locale) }}
         </div>
-        
-      <div
-        id="sales-tab"
-        class="is-scrollbar-hidden overflow-x-auto rounded-lg bg-slate-200 text-slate-600 dark:bg-navy-800 dark:text-navy-200"
-      >
-        <div class="tabs-list flex p-1">
-            @foreach (['1D','1W','1M','6M','1Y','5Y'] as $range)
-            <button
-              data-chart-range="{{ $range }}"
-              class="tab btn shrink-0 px-3 py-1 text-xs-plus font-medium"
-              data-active-class="bg-white shadow-sm dark:bg-navy-500 dark:text-navy-100"
-              data-default-class="hover:text-slate-800 focus:text-slate-800 dark:hover:text-navy-100 dark:focus:text-navy-100"
-            >
-              {{ $range }}
-            </button>
-            @endforeach
+        --}}
+
+        {{-- Price Chart Tabs --}}
+        <div id="price-chart-tabs" class="is-scrollbar-hidden overflow-x-auto rounded-lg bg-slate-200 text-slate-600 dark:bg-navy-800 dark:text-navy-200">
+            <div class="tabs-list flex p-1">
+                @foreach (['1D','1W','1M','6M','1Y','5Y'] as $range)
+                <button
+                    data-chart-range="{{ $range }}"
+                    class="tab btn shrink-0 px-3 py-1 text-xs-plus font-medium"
+                    data-active-class="bg-white shadow-sm dark:bg-navy-500 dark:text-navy-100"
+                    data-default-class="hover:text-slate-800 focus:text-slate-800 dark:hover:text-navy-100 dark:focus:text-navy-100"
+                >
+                    {{ $range }}
+                </button>
+                @endforeach
+            </div>
         </div>
-      </div>
+
     </div>
 
     <div class="flex flex-col sm:flex-row sm:space-x-7">

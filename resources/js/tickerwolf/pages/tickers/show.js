@@ -20,12 +20,50 @@ export function init() {
 
   try {
     // ----------------------------------------------------------------------
-    //  Tabs
+    //  Main Price Chart Tabs
     // ----------------------------------------------------------------------
-    const salesTab = document.querySelector('#sales-tab');
-    if (salesTab) {
-      new Tab('#sales-tab');
-      console.debug('✔ Sales tab initialized');
+    const mainPriceChartTabs = document.querySelector('#price-chart-tabs');
+
+    if (mainPriceChartTabs) {
+    const buttons = mainPriceChartTabs.querySelectorAll('button[data-chart-range]');
+    if (!buttons.length) return;
+
+    // Utility: apply active/default classes
+    const setActiveTab = (activeBtn) => {
+        buttons.forEach((btn) => {
+        const activeClasses = btn.dataset.activeClass?.split(' ') || [];
+        const defaultClasses = btn.dataset.defaultClass?.split(' ') || [];
+
+        if (btn === activeBtn) {
+            btn.classList.remove(...defaultClasses);
+            btn.classList.add(...activeClasses);
+        } else {
+            btn.classList.remove(...activeClasses);
+            btn.classList.add(...defaultClasses);
+        }
+        });
+    };
+
+    // Default: activate the first tab (e.g. 1M)
+    const defaultActive = mainPriceChartTabs.querySelector('[data-chart-range="1M"]') || buttons[0];
+    setActiveTab(defaultActive);
+
+    // Click handling
+    buttons.forEach((btn) => {
+        btn.addEventListener('click', () => {
+        setActiveTab(btn);
+
+        // Optional: trigger custom event for chart updates
+        const range = btn.dataset.chartRange;
+        mainPriceChartTabs.dispatchEvent(
+            new CustomEvent('chart:range-change', { detail: range })
+        );
+
+        console.debug(`📊 Switched to ${range} chart`);
+        });
+    });
+
+    console.debug('✔ Main Price Chart Tabs initialized');
     }
 
     // ----------------------------------------------------------------------

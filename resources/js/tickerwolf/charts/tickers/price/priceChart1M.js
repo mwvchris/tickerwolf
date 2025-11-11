@@ -1,56 +1,65 @@
 /**
- * 1M Price Chart — show ~6 x-labels, right y-axis, smooth line/area.
+ * --------------------------------------------------------------------------
+ * TickerWolf.ai — 1-Month Price Chart
+ * --------------------------------------------------------------------------
+ * Displays roughly 30 trading days of data with:
+ *   - Smooth line/area transitions
+ *   - Right-aligned y-axis with currency formatting
+ *   - 4–6 x-axis labels for date readability
+ *   - Hover-only tooltips styled via shared chart-styles.js + global CSS
+ *
+ * This file now delegates its core configuration to the shared helper:
+ *   ➤ resources/js/tickerwolf/charts/_core/chart-styles.js
+ *
+ * Benefits:
+ *   - Ensures unified fonts, colors, gradients, and tooltips
+ *   - Eliminates duplication across chart range files (1D, 6M, 1Y, etc.)
+ *   - Makes future design updates instant across all charts
+ * --------------------------------------------------------------------------
  */
-import ApexCharts from 'apexcharts';
-import { getChartTheme, getThemeMode } from '../../_core/theme.js';
 
-export function renderPriceChart(selector, series = []) {
-  const el = document.querySelector(selector);
-  if (!el || !series.length) return null;
+import ApexCharts from 'apexcharts'
+import { buildChartOptions } from '../../_core/chart-styles.js'
 
-  const theme = getChartTheme();
-  const tooltipTheme = getThemeMode(theme);
+/**
+ * Render the 1-Month price chart.
+ *
+ * @param {string|HTMLElement} selector
+ *    DOM selector or node where the chart will render (e.g. '#price-chart')
+ *
+ * @param {Array<{x:string|number|Date, y:number|null}>} series
+ *    Lightweight array of `{x:'YYYY-MM-DD', y:close}` points.
+ *    The data is already downsampled server-side for speed.
+ *
+ * @param {Object} [options={}]
+ *    Optional overrides (e.g. `{ currency:'USD' }`).
+ */
+export function renderPriceChart(selector, series = [], options = {}) {
+  // Resolve the container element safely.
+  const el = typeof selector === 'string' ? document.querySelector(selector) : selector
+  if (!el || !series.length) {
+    console.warn('[PriceChart:1M] No target element or empty data series.')
+    return null
+  }
 
-  const opts = {
-    chart: {
-      type: 'area',
-      height: 255,
-      toolbar: { show: false },
-      foreColor: theme.fontColor,
-    },
+  // ------------------------------------------------------------------------
+  // Build shared chart configuration from the centralized helper.
+  // We only specify what’s unique to this timeframe:
+  //   - 6 x-axis labels
+  //   - short "MMM DD" tooltip and axis formatting
+  // ------------------------------------------------------------------------
+  const opts = buildChartOptions({
     series: [{ name: 'Price', data: series }],
-    dataLabels: {
-      enabled: false,
-    },
-    xaxis: {
-      type: 'datetime',
-      tickAmount: 6,
-      labels: {
-        datetimeUTC: false,
-        datetimeFormatter: { day: 'MMM dd' },
-        style: { colors: theme.fontColor, fontSize: '11px' },
-      },
-      axisBorder: { show: false },
-      axisTicks:  { show: false },
-    },
-    yaxis: {
-      opposite: true,
-      labels: { formatter: (v) => `$${Number(v).toFixed(2)}`, style: { colors: theme.fontColor } },
-    },
-    stroke: { curve: 'smooth', width: 2, colors: [theme.colors.price] },
-    fill: { type: 'gradient', gradient: { shadeIntensity: 0.25, opacityFrom: 0.35, opacityTo: 0.05, stops: [0, 100] } },
-    grid: theme.grid,
-    tooltip: {
-      theme: tooltipTheme,
-      x: {
-        formatter: (val) => new Date(val).toLocaleDateString(undefined, { month: 'short', day: '2-digit' }),
-      },
-      y: { formatter: (v) => `$${Number(v).toFixed(2)}` },
-    },
-    markers: { size: 0 },
-  };
+    timeframe: '1M',
+    tickAmount: 6,
+    tooltipFormat: { month: 'short', day: '2-digit' },
+    currency: options.currency || 'USD',
+  })
 
-  const chart = new ApexCharts(el, opts);
-  chart.render();
-  return chart;
+  // ------------------------------------------------------------------------
+  // Instantiate and render the ApexChart instance.
+  // ------------------------------------------------------------------------
+  const chart = new ApexCharts(el, opts)
+  chart.render()
+  return chart
 }

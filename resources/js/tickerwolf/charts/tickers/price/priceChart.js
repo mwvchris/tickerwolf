@@ -1,41 +1,33 @@
 /**
  * --------------------------------------------------------------------------
- * TickerWolf.ai — Dynamic Price Chart Controller
+ * TickerWolf.ai — Price Chart Controller (Backend-Driven)
  * --------------------------------------------------------------------------
- * Centralized controller that renders time-range price charts (1D, 1W, 1M,
- * 6M, 1Y, 5Y) using ApexCharts. Uses lightweight `{x:'YYYY-MM-DD', y:Number}`
- * series for speed. On range toggle, destroys/rebuilds the chart smoothly.
+ * The backend (TickerController + Ticker model) already performs
+ * all data shaping and downsampling for each range. This controller’s
+ * sole job is to:
+ *   - Select the correct chart renderer module (1D, 1W, 1M, 6M, 1Y, 5Y)
+ *   - Apply consistent tooltip + axis formatting via formatters.js
+ *   - Re-render when the UI theme changes
  *
- * This file dynamically imports one of:
- *   - priceChart1D.js
- *   - priceChart1W.js
- *   - priceChart1M.js
- *   - priceChart6M.js
- *   - priceChart1Y.js
- *   - priceChart5Y.js
- *
- * Each of those exports:  renderPriceChart(selector, seriesArray)
- * where `seriesArray` is an array of `{ x: string|Date, y: number|null }`.
+ * No client-side downsampling is performed here.
  * --------------------------------------------------------------------------
  */
 
 import { onChartThemeChange } from '../../_core/theme.js';
+import { number as fmtNumber, date as fmtDate } from '../../_core/formatters.js';
+import { currencyFormatter, shortDate } from '../../_core/utils.js';
 
 /**
- * Initialize the price chart with range toggles and theme reactivity.
+ * Initialize the interactive price chart with range toggles.
  *
  * @param {string} selector      DOM selector for chart container
- * @param {Object} datasets      Map of range -> series array (lightweight)
- *                               {
- *                                 '1M': [{x:'2025-01-01', y:123.45}, ...],
- *                                 '1Y': [...],
- *                               }
- * @param {string} defaultRange  Default range to show (e.g., '1M')
+ * @param {Object} datasets      Map of range → array of {x:'YYYY-MM-DD', y:Number}
+ * @param {string} defaultRange  Default range to render (e.g. '1M')
  */
 export function initPriceChart(selector, datasets = {}, defaultRange = '1M') {
   const container = document.querySelector(selector);
   if (!container) {
-    console.warn('[PriceChart] Container not found for selector:', selector);
+    console.warn('[PriceChart] Container not found:', selector);
     return;
   }
 
@@ -43,16 +35,25 @@ export function initPriceChart(selector, datasets = {}, defaultRange = '1M') {
   let currentChart = null;
 
   /**
-   * Dynamically import and render the appropriate chart module by range.
-   * @param {string} range  One of '1D','1W','1M','6M','1Y','5Y'
+   * Dynamically import and render the appropriate chart module.
+   * The data is already preprocessed on the backend.
    */
   async function renderChart(range) {
     const data = datasets[range] || [];
-    if (!data.length) {
-      console.warn(`[PriceChart] No series for range: ${range}`);
+    if (!Array.isArray(data) || data.length === 0) {
+      console.warn(`[PriceChart] Empty or invalid dataset for range: ${range}`);
       return;
     }
 
+    // Sanity check for suspiciously small datasets (likely double-downsampled)
+    if (data.length < 10 && (range === '1Y' || range === '5Y')) {
+      console.warn(
+        `[PriceChart] Warning: only ${data.length} points for ${range}. ` +
+        `Verify backend downsampling thresholds.`
+      );
+    }
+
+    // Determine module path by range
     let modulePath = './priceChart1M.js';
     switch (range) {
       case '1D': modulePath = './priceChart1D.js'; break;
@@ -60,33 +61,49 @@ export function initPriceChart(selector, datasets = {}, defaultRange = '1M') {
       case '6M': modulePath = './priceChart6M.js'; break;
       case '1Y': modulePath = './priceChart1Y.js'; break;
       case '5Y': modulePath = './priceChart5Y.js'; break;
-      case '1M':
       default:   modulePath = './priceChart1M.js'; break;
     }
 
-    const module = await import(modulePath);
+    try {
+      const module = await import(modulePath);
 
-    if (currentChart) currentChart.destroy(); // smooth teardown
-    currentChart = module.renderPriceChart(selector, data);
-    currentRange = range;
+      // Tear down old chart cleanly
+      if (currentChart && typeof currentChart.destroy === 'function') {
+        currentChart.destroy();
+      }
+
+      // Render new chart
+      currentChart = module.renderPriceChart(selector, data, {
+        range,
+        currency: 'USD',
+        formatters: { fmtNumber, fmtDate, currencyFormatter, shortDate },
+      });
+
+      currentRange = range;
+    } catch (err) {
+      console.error(`[PriceChart] Failed to import module for ${range}:`, err);
+    }
   }
 
-  // Wire up toggle buttons
-  document.querySelectorAll('[data-chart-range]').forEach((btn) => {
-    btn.addEventListener('click', (e) => {
-      const range = e.currentTarget.dataset.chartRange;
-      if (range && range !== currentRange) {
-        document.querySelectorAll('[data-chart-range]').forEach((b) => b.classList.remove('active'));
-        e.currentTarget.classList.add('active');
-        renderChart(range);
-      }
+  // Handle range toggle buttons
+  const rangeButtons = document.querySelectorAll('[data-chart-range]');
+  if (rangeButtons.length) {
+    rangeButtons.forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        const range = e.currentTarget.dataset.chartRange;
+        if (range && range !== currentRange) {
+          rangeButtons.forEach((b) => b.classList.remove('active'));
+          e.currentTarget.classList.add('active');
+          renderChart(range);
+        }
+      });
     });
-  });
+  }
 
   // Initial render
   renderChart(defaultRange);
 
-  // Re-render on theme change
+  // Re-render on theme change (dark/light)
   onChartThemeChange(() => {
     if (container && container.isConnected) renderChart(currentRange);
   });

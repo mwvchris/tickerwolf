@@ -257,36 +257,30 @@ class Ticker extends Model
     }
 
     /**
-     * Down-sample a daily time series by keeping points at least $stepDays apart.
-     * Always keeps the first and last points to preserve bounds.
+     * Down-sample a daily time series by keeping roughly every Nth point.
+     * Always keeps first & last elements. Uses index stepping instead of
+     * calendar diff to handle missing market days (weekends, holidays).
      *
      * @param  \Illuminate\Support\Collection  $series  items like ['t'=>'YYYY-MM-DD','c'=>float]
-     * @param  int $stepDays (e.g. 3 or 7)
+     * @param  int $stepDays  approximate spacing (e.g. 3 or 7)
      * @return \Illuminate\Support\Collection
      */
     public static function downsampleEveryNDays($series, int $stepDays)
     {
-        if ($series->count() <= 2) return $series;
-
-        $out = collect();
-        $lastKept = null;
-
-        foreach ($series as $i => $row) {
-            $date = Carbon::parse($row['t'])->startOfDay();
-            if ($i === 0) {
-                $out->push($row);
-                $lastKept = $date;
-                continue;
-            }
-            if ($date->diffInDays($lastKept) >= $stepDays) {
-                $out->push($row);
-                $lastKept = $date;
-            }
+        $count = $series->count();
+        if ($count <= 2 || $stepDays <= 1) {
+            return $series->values();
         }
 
-        // Ensure last point included
-        if ($out->last() !== $series->last()) {
-            $out->push($series->last());
+        // Determine index step — ensure at least 1
+        $step = max(1, (int) round($stepDays));
+
+        $out = collect();
+        foreach ($series->values() as $i => $row) {
+            // Always keep first, last, and roughly every Nth record
+            if ($i === 0 || $i % $step === 0 || $i === $count - 1) {
+                $out->push($row);
+            }
         }
 
         return $out->values();
@@ -336,11 +330,11 @@ class Ticker extends Model
                 break;
             case '1Y':
                 $start = $now->copy()->subYear();
-                $stepDays = $favorSparseForLargeRanges ? 2 : 1;
+                $stepDays = $favorSparseForLargeRanges ? 3 : 1;
                 break;
             case '5Y':
                 $start = $now->copy()->subYears(5);
-                $stepDays = 5;
+                $stepDays = 5; // was 5, fine
                 break;
             case 'MAX':
             default:
@@ -357,9 +351,12 @@ class Ticker extends Model
         }
 
         return [
-            // Lightweight `{x,y}` data for ApexCharts (x will be treated as datetime)
             'points' => $series->map(fn($row) => ['x' => $row['t'], 'y' => $row['c']])->values()->all(),
-            'meta'   => ['range' => strtoupper($range), 'stepDays' => $stepDays],
+            'meta'   => [
+                'range'    => strtoupper($range),
+                'stepDays' => $stepDays,
+                'count'    => $series->count(),
+            ],
         ];
     }
 
