@@ -4,139 +4,146 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use App\Models\Ticker;
-use App\Models\TickerAnalysis;
-use Inertia\Inertia;
-use Inertia\Response;
-use Illuminate\Http\RedirectResponse;
 use Illuminate\Support\Str;
-use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Carbon;
 
+/**
+ * Controller: TickerController
+ * --------------------------------------------------------------------------
+ * Renders the Ticker Profile Page and coordinates data aggregation between
+ * Eloquent models and Blade views.
+ *
+ * Responsibilities:
+ *  - Load relevant ticker data and relationships (overview, fundamentals,
+ *    indicators, price histories, news, analysis)
+ *  - Prepare both detailed OHLCV arrays (for cards/analytics) AND lightweight
+ *    `{x,y}` series for fast ApexCharts rendering with down-sampling
+ *  - Compute high-level metrics (price, percent changes, market cap formatting)
+ */
 class TickerController extends Controller
 {
     /**
-     * Show the ticker profile page via Inertia.
+     * Display a single ticker’s profile page.
+     *
+     * @param  Request      $request
+     * @param  string       $symbol    The ticker symbol (e.g. "AAPL")
+     * @param  string|null  $slug      Optional SEO-friendly slug
+     * @return \Illuminate\View\View|\Illuminate\Http\RedirectResponse
      */
-    public function show(Request $request, string $symbol, ?string $slug = null): Response|RedirectResponse
+    public function show(Request $request, string $symbol, ?string $slug = null)
     {
-        $ticker = Ticker::whereRaw('upper(ticker) = ?', [strtoupper($symbol)])
-            ->with(['overviews' => function ($q) {
-                // eager-load the latest overview first (we'll pick the latest)
-                $q->orderByDesc('fetched_at')->limit(1);
-            }])
+        // ------------------------------------------------------------------
+        // Normalize & Retrieve Ticker
+        // ------------------------------------------------------------------
+        $symbol = strtoupper(trim($symbol));
+
+        $ticker = Ticker::query()
+            ->with([
+                'overview',
+                'fundamentals'   => fn ($q) => $q->orderByDesc('end_date')->limit(4),
+                'priceHistories' => fn ($q) => $q->orderBy('t'), // ascending for transform later
+                'indicators'     => fn ($q) => $q->orderByDesc('t')->limit(50),
+                'analysis'       => fn ($q) => $q->latest('created_at'),
+                'newsItems'      => fn ($q) => $q->orderByDesc('published_utc')->limit(10),
+            ])
+            ->bySymbol($symbol)
             ->firstOrFail();
 
-        // Canonical slug derived from DB (or fallback)
+        // ------------------------------------------------------------------
+        // Canonical Slug Enforcement (SEO-friendly route)
+        // ------------------------------------------------------------------
         $canonicalSlug = $ticker->slug ?? Str::slug($ticker->name ?? $ticker->ticker);
-
-        // Normalize and redirect only if needed
         if ($slug !== $canonicalSlug) {
             return redirect()->route('tickers.show', [
-                'symbol' => strtoupper($ticker->ticker),
+                'symbol' => $symbol,
                 'slug'   => $canonicalSlug,
-            ], 301);
+            ]);
         }
 
-        // ==========================================
-        // Fetch most recent completed + valid AI analysis (<= 24h old)
-        // ==========================================
-        $latestAnalysis = TickerAnalysis::where('ticker', strtoupper($ticker->ticker))
-            ->where('status', 'completed')
-            ->whereNotNull('response_raw')
-            ->whereRaw("(response_raw != '' AND response_raw != '[]')")
-            ->where('requested_at', '>=', now()->subDay())
-            ->orderByDesc('completed_at')
-            ->first();
+        // ------------------------------------------------------------------
+        // Detailed OHLCV arrays for 1D, 1W, 1M, 6M, 1Y, 5Y (for cards/analytics)
+        // ------------------------------------------------------------------
+        $now = Carbon::now();
+        $priceHistoryRecords = $ticker->priceHistories()
+            ->where('t', '>=', $now->copy()->subYears(5)) // cap to last 5Y for page
+            ->orderBy('t', 'asc')
+            ->get();
 
-        $analysisContent = null;
-
-        if ($latestAnalysis) {
-            $raw = $latestAnalysis->response_raw;
-
-            if (is_string($raw)) {
-                $decoded = json_decode($raw, true);
-                $response = is_array($decoded) ? $decoded : [];
-            } elseif (is_array($raw)) {
-                $response = $raw;
-            } else {
-                $response = [];
-            }
-
-            $analysisContent = $response['content']
-                ?? $response['summary']
-                ?? ($latestAnalysis->summary ?? $latestAnalysis->output ?? null);
-        }
-
-        // ==========================================
-        // Latest overview snapshot
-        // ==========================================
-        $latestOverview = $ticker->overviews->first() ?? null;
-
-        // Determine logo (prefer ticker.branding_logo_url then overview payload)
-        $logoUrl = $ticker->branding_logo_url
-            ?? optional($latestOverview)->results_raw['branding']['logo_url'] ?? null
-            ?? null;
-
-        // Friendly values
-        $formattedMarketCap = $ticker->formatted_market_cap ?? ($latestOverview?->formatted_market_cap ?? null);
-        $listDate = $ticker->list_date ? $ticker->list_date->toDateString() : ($latestOverview?->overview_date?->toDateString() ?? null);
-        $employees = $ticker->total_employees ?? ($latestOverview->results_raw['total_employees'] ?? null);
-        $phone = $ticker->phone_number ?? ($latestOverview->results_raw['phone_number'] ?? null);
-        $sic = $ticker->sic_description ?? ($latestOverview->results_raw['sic_description'] ?? null);
-
-        // Prepare quick stats (server-side) — you can add/remove entries here
-        $quickStats = [
-            [
-                'label' => 'Market Cap',
-                'value' => $formattedMarketCap ?? '—',
-            ],
-            [
-                'label' => 'Employees',
-                'value' => $employees ? number_format($employees) : '—',
-            ],
-            [
-                'label' => 'List Date',
-                'value' => $listDate ?? '—',
-            ],
-            [
-                'label' => 'SIC',
-                'value' => $sic ?? '—',
-            ],
+        $rangeConfig = [
+            '1D' => ['threshold' => $now->copy()->subDay(),     'fallback' => 1],
+            '1W' => ['threshold' => $now->copy()->subWeek(),    'fallback' => 5],
+            '1M' => ['threshold' => $now->copy()->subMonth(),   'fallback' => 22],
+            '6M' => ['threshold' => $now->copy()->subMonths(6), 'fallback' => 126],
+            '1Y' => ['threshold' => $now->copy()->subYear(),    'fallback' => 252],
+            '5Y' => ['threshold' => $now->copy()->subYears(5),  'fallback' => 1260],
         ];
 
-        // Send the enriched payload to the Vue page
-        return Inertia::render('tickers/Show', [
-            'ticker' => [
-                'id'               => $ticker->id,
-                'ticker'           => $ticker->ticker,
-                'name'             => $ticker->name,
-                'slug'             => $canonicalSlug,
-                'market'           => $ticker->market ?? null,
-                'locale'           => $ticker->locale ?? null,
-                'primary_exchange' => $ticker->primary_exchange ?? null,
-                'currency_name'    => $ticker->currency_name ?? null,
-                'type'             => $ticker->type ?? null,
-                'active'           => (bool) $ticker->active,
-                // overview fields
-                'description'      => $ticker->description ?? ($latestOverview->results_raw['description'] ?? null),
-                'homepage_url'     => $ticker->homepage_url ?? ($latestOverview->results_raw['homepage_url'] ?? null),
-                'market_cap'       => $ticker->market_cap ?? ($latestOverview->market_cap ?? null),
-                'formatted_market_cap' => $formattedMarketCap ?? null,
-                'total_employees'  => $employees,
-                'phone_number'     => $phone,
-                'list_date'        => $listDate,
-                'sic_description'  => $sic,
-                'branding_logo_url'=> $logoUrl,
-            ],
-            'quickStats' => $quickStats,
-            'user' => [
-                'authenticated' => Auth::check(),
-                'loginUrl'      => route('login', [], false),
-            ],
-            'latestAnalysis' => $latestAnalysis ? [
-                'provider'  => $latestAnalysis->provider,
-                'content'   => $analysisContent,
-                'completed' => optional($latestAnalysis->completed_at)->toIso8601String(),
-            ] : null,
+        $serializeOHLCV = function ($collection) {
+            return $collection->map(fn ($p) => [
+                'date'   => \Illuminate\Support\Carbon::parse($p->t)->toDateString(),
+                'open'   => $p->o !== null ? (float) $p->o : null,
+                'high'   => $p->h !== null ? (float) $p->h : null,
+                'low'    => $p->l !== null ? (float) $p->l : null,
+                'close'  => $p->c !== null ? (float) $p->c : null,
+                'volume' => $p->v !== null ? (int) $p->v : null,
+            ])->values();
+        };
+
+        $chartData = [];
+        foreach ($rangeConfig as $label => $config) {
+            if ($priceHistoryRecords->isEmpty()) {
+                $chartData[$label] = [];
+                continue;
+            }
+            $subset = $priceHistoryRecords->filter(fn ($r) => $r->t >= $config['threshold']);
+            if ($subset->isEmpty()) {
+                $subset = $priceHistoryRecords->take(-$config['fallback']);
+            }
+            $chartData[$label] = $serializeOHLCV($subset);
+        }
+
+        // ------------------------------------------------------------------
+        // Lightweight `{x,y}` series for ApexCharts (with down-sampling rules)
+        // - 1D, 1W, 1M, 6M: daily
+        // - YTD, 1Y: daily by default, or 3-day down-sample if needed
+        // - 5Y: 7-day down-sample
+        // ------------------------------------------------------------------
+        $favorSparseForLargeRanges = true; // enable 3-day stepping for YTD/1Y
+        $ranges = ['1D', '1W', '1M', '6M', '1Y', '5Y']; // keep Blade consistent
+
+        $chartSeries = [];
+        foreach ($ranges as $range) {
+            $series = $ticker->buildPriceSeriesForRange($range, $favorSparseForLargeRanges);
+            // Only send the light `{x,y}` array to the chart modules:
+            $chartSeries[$range] = $series['points']; // e.g., [['x' => '2025-01-01', 'y' => 123.45], ...]
+        }
+
+        // ------------------------------------------------------------------
+        // Compute High-Level Metrics (header cards, percent change, etc.)
+        // ------------------------------------------------------------------
+        $latestPrice     = $ticker->latestPrice()?->c ?? null;
+        $priceChange5d   = $ticker->percentChange(5);
+        $priceChange30d  = $ticker->percentChange(30);
+        $formattedMarket = $ticker->formattedMarketCap();
+
+        // ------------------------------------------------------------------
+        // Compile Data for View
+        // - chartData: detailed OHLCV arrays (for cards/analytics)
+        // - chartSeries: lightweight {x,y} arrays (for fast Apex charts)
+        // ------------------------------------------------------------------
+        return view('pages.tickers.show', [
+            'ticker'           => $ticker,
+            'overview'         => $ticker->overview,
+            'fundamental'      => $ticker->fundamentals->first(),
+            'chartData'        => $chartData,
+            'chartSeries'      => $chartSeries,
+            'latestIndicators' => $ticker->latestIndicators(),
+            'latestPrice'      => $latestPrice,
+            'priceChange5d'    => $priceChange5d,
+            'priceChange30d'   => $priceChange30d,
+            'formattedMarket'  => $formattedMarket,
+            'analysis'         => $ticker->analysis,
+            'newsItems'        => $ticker->newsItems,
         ]);
     }
 }

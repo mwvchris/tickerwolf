@@ -118,7 +118,7 @@
                 <div class="grow">
                     <img
                     class="h-3"
-                    src="images/payments/cc-visa-white.svg"
+                    src="/images/payments/cc-visa-white.svg"
                     alt="image"
                     />
                 </div>
@@ -140,7 +140,7 @@
                 <div class="grow">
                     <img
                     class="h-3"
-                    src="images/payments/cc-visa-white.svg"
+                    src="/images/payments/cc-visa-white.svg"
                     alt="image"
                     />
                 </div>
@@ -162,7 +162,7 @@
                 <div class="grow">
                     <img
                     class="h-3"
-                    src="images/payments/cc-visa-white.svg"
+                    src="/images/payments/cc-visa-white.svg"
                     alt="image"
                     />
                 </div>
@@ -474,7 +474,7 @@
                 <div class="flex items-center space-x-2">
                     <img
                     class="size-10"
-                    src="images/100x100.png"
+                    src="/images/100x100.png"
                     alt="image"
                     />
                     <div>
@@ -503,7 +503,7 @@
                 <div class="flex items-center space-x-2">
                     <img
                     class="size-10"
-                    src="images/100x100.png"
+                    src="/images/100x100.png"
                     alt="image"
                     />
                     <div>
@@ -553,7 +553,7 @@
                         <div class="avatar size-7">
                         <img
                             class="rounded-full"
-                            src="images/200x200.png"
+                            src="/images/200x200.png"
                             alt="avatar"
                         />
                         </div>
@@ -609,7 +609,7 @@
                     </div>
                 </div>
                 <img
-                    src="images/800x600.png"
+                    src="/images/800x600.png"
                     class="size-20 rounded-lg object-cover object-center"
                     alt="image"
                 />
@@ -631,7 +631,7 @@
                         <div class="avatar size-7">
                         <img
                             class="rounded-full"
-                            src="images/200x200.png"
+                            src="/images/200x200.png"
                             alt="avatar"
                         />
                         </div>
@@ -687,7 +687,7 @@
                     </div>
                 </div>
                 <img
-                    src="images/800x600.png"
+                    src="/images/800x600.png"
                     class="size-20 rounded-lg object-cover object-center"
                     alt="image"
                 />
@@ -709,7 +709,7 @@
                         <div class="avatar size-7">
                         <img
                             class="rounded-full"
-                            src="images/200x200.png"
+                            src="/images/200x200.png"
                             alt="avatar"
                         />
                         </div>
@@ -765,7 +765,7 @@
                     </div>
                 </div>
                 <img
-                    src="images/800x600.png"
+                    src="/images/800x600.png"
                     class="size-20 rounded-lg object-cover object-center"
                     alt="image"
                 />
@@ -883,7 +883,7 @@
             <div class="flex items-center space-x-3">
                 <img
                 class="size-10 rounded-lg object-cover object-center"
-                src="images/illustrations/lms-ui.svg"
+                src="/images/illustrations/lms-ui.svg"
                 alt="image"
                 />
                 <div>
@@ -916,7 +916,7 @@
                 <div class="avatar size-7 hover:z-10">
                     <img
                     class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                    src="images/200x200.png"
+                    src="/images/200x200.png"
                     alt="avatar"
                     />
                 </div>
@@ -930,7 +930,7 @@
                 <div class="avatar size-7 hover:z-10">
                     <img
                     class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                    src="images/200x200.png"
+                    src="/images/200x200.png"
                     alt="avatar"
                     />
                 </div>
@@ -962,7 +962,7 @@
             <div class="flex items-center space-x-3">
                 <img
                 class="size-10 rounded-lg object-cover object-center"
-                src="images/illustrations/store-ui.svg"
+                src="/images/illustrations/store-ui.svg"
                 alt="image"
                 />
                 <div>
@@ -995,7 +995,7 @@
                 <div class="avatar size-7 hover:z-10">
                     <img
                     class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                    src="images/200x200.png"
+                    src="/images/200x200.png"
                     alt="avatar"
                     />
                 </div>
@@ -1009,7 +1009,7 @@
                 <div class="avatar size-7 hover:z-10">
                     <img
                     class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                    src="images/200x200.png"
+                    src="/images/200x200.png"
                     alt="avatar"
                     />
                 </div>
@@ -1041,7 +1041,7 @@
             <div class="flex items-center space-x-3">
                 <img
                 class="size-10 rounded-lg object-cover object-center"
-                src="images/illustrations/chat-ui.svg"
+                src="/images/illustrations/chat-ui.svg"
                 alt="image"
                 />
                 <div>
@@ -1074,7 +1074,7 @@
                 <div class="avatar size-7 hover:z-10">
                     <img
                     class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                    src="images/200x200.png"
+                    src="/images/200x200.png"
                     alt="avatar"
                     />
                 </div>
@@ -1088,7 +1088,7 @@
                 <div class="avatar size-7 hover:z-10">
                     <img
                     class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                    src="images/200x200.png"
+                    src="/images/200x200.png"
                     alt="avatar"
                     />
                 </div>
@@ -1120,7 +1120,7 @@
             <div class="flex items-center space-x-3">
                 <img
                 class="size-10 rounded-lg object-cover object-center"
-                src="images/illustrations/nft.svg"
+                src="/images/illustrations/nft.svg"
                 alt="image"
                 />
                 <div>
@@ -1153,7 +1153,7 @@
                 <div class="avatar size-7 hover:z-10">
                     <img
                     class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                    src="images/200x200.png"
+                    src="/images/200x200.png"
                     alt="avatar"
                     />
                 </div>
@@ -1167,7 +1167,7 @@
                 <div class="avatar size-7 hover:z-10">
                     <img
                     class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                    src="images/200x200.png"
+                    src="/images/200x200.png"
                     alt="avatar"
                     />
                 </div>
@@ -1279,7 +1279,7 @@
                 <div class="avatar mt-2 size-20">
                     <img
                     class="mask is-squircle"
-                    src="images/200x200.png"
+                    src="/images/200x200.png"
                     alt="avatar"
                     />
                 </div>
@@ -1308,32 +1308,32 @@
                 <div class="mt-4 grid grid-cols-3 gap-3">
                     <img
                     class="rounded-lg"
-                    src="images/800x600.png"
+                    src="/images/800x600.png"
                     alt="image"
                     />
                     <img
                     class="rounded-lg"
-                    src="images/800x600.png"
+                    src="/images/800x600.png"
                     alt="image"
                     />
                     <img
                     class="rounded-lg"
-                    src="images/800x600.png"
+                    src="/images/800x600.png"
                     alt="image"
                     />
                     <img
                     class="rounded-lg"
-                    src="images/800x600.png"
+                    src="/images/800x600.png"
                     alt="image"
                     />
                     <img
                     class="rounded-lg"
-                    src="images/800x600.png"
+                    src="/images/800x600.png"
                     alt="image"
                     />
                     <img
                     class="rounded-lg"
-                    src="images/800x600.png"
+                    src="/images/800x600.png"
                     alt="image"
                     />
                 </div>
@@ -1455,7 +1455,7 @@
                         <div class="avatar size-7 hover:z-10">
                         <img
                             class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                            src="images/200x200.png"
+                            src="/images/200x200.png"
                             alt="avatar"
                         />
                         </div>
@@ -1471,7 +1471,7 @@
                         <div class="avatar size-7 hover:z-10">
                         <img
                             class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                            src="images/200x200.png"
+                            src="/images/200x200.png"
                             alt="avatar"
                         />
                         </div>
@@ -1479,7 +1479,7 @@
                         <div class="avatar size-7 hover:z-10">
                         <img
                             class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                            src="images/200x200.png"
+                            src="/images/200x200.png"
                             alt="avatar"
                         />
                         </div>
@@ -1487,7 +1487,7 @@
                         <div class="avatar size-7 hover:z-10">
                         <img
                             class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                            src="images/200x200.png"
+                            src="/images/200x200.png"
                             alt="avatar"
                         />
                         </div>

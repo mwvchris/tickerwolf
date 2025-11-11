@@ -3,45 +3,42 @@
 
 @section('title', 'TickerWolf Home')
 
-  @vite([
-      'resources/js/lineone/pages/dashboards-crm-analytics.js',
-  ])
-
 @section('content')
 
-<div class="flex items-center space-x-4 py-5 lg:py-6">
-    <h2 class="text-xl font-medium text-slate-800 dark:text-navy-50 lg:text-2xl">{{ $ticker->ticker }}</h2>
-</div>
-
 <div class="mt-4 grid grid-cols-12 gap-4 px-[var(--margin-x)] transition-all duration-[.25s] sm:mt-5 sm:gap-5 lg:mt-6 lg:gap-6">
-  <div class="col-span-12 lg:col-span-8">
-    <div class="flex items-center justify-between space-x-2">
-      <h2
-        class="text-base font-medium tracking-wide text-slate-800 line-clamp-1 dark:text-navy-100"
-      >
-        Sales Overview
-      </h2>
+
+    {{-- Main Ticker Header --}}
+    <div class="col-span-12 lg:col-span-8">
+        <div class="flex items-center justify-between space-x-2">
+        
+        {{-- Ticker Name --}}
+        <div class="flex items-center space-x-4 py-5 lg:py-6">
+            <h2 class="text-xl font-medium text-slate-800 dark:text-navy-50 lg:text-2xl">{{ $ticker->name }}</h2>
+        </div>
+
+        <h2 class="text-base font-medium tracking-wide text-slate-800 line-clamp-1 dark:text-navy-100">
+            {{ $ticker->ticker }} Overview
+        </h2>
+
+        <div class="flex items-center space-x-2">
+            {{ $ticker->primary_exchange ?? '-' }} &bull; {{ strtoupper($ticker->locale) }}
+        </div>
+        
       <div
         id="sales-tab"
         class="is-scrollbar-hidden overflow-x-auto rounded-lg bg-slate-200 text-slate-600 dark:bg-navy-800 dark:text-navy-200"
       >
         <div class="tabs-list flex p-1">
-          <button
-            data-target="#sales-recent-tab"
-            class="tab btn shrink-0 px-3 py-1 text-xs-plus font-medium"
-            data-active-class="bg-white shadow-sm dark:bg-navy-500 dark:text-navy-100"
-            data-default-class="hover:text-slate-800 focus:text-slate-800 dark:hover:text-navy-100 dark:focus:text-navy-100"
-          >
-            Last month
-          </button>
-          <button
-            data-target="#sales-all-tab"
-            class="tab btn shrink-0 px-3 py-1 text-xs-plus font-medium"
-            data-active-class="bg-white shadow-sm dark:bg-navy-500 dark:text-navy-100"
-            data-default-class="hover:text-slate-800 focus:text-slate-800 dark:hover:text-navy-100 dark:focus:text-navy-100"
-          >
-            Last year
-          </button>
+            @foreach (['1D','1W','1M','6M','1Y','5Y'] as $range)
+            <button
+              data-chart-range="{{ $range }}"
+              class="tab btn shrink-0 px-3 py-1 text-xs-plus font-medium"
+              data-active-class="bg-white shadow-sm dark:bg-navy-500 dark:text-navy-100"
+              data-default-class="hover:text-slate-800 focus:text-slate-800 dark:hover:text-navy-100 dark:focus:text-navy-100"
+            >
+              {{ $range }}
+            </button>
+            @endforeach
         </div>
       </div>
     </div>
@@ -74,7 +71,7 @@
             <p
               class="text-2xl font-semibold text-slate-700 dark:text-navy-100"
             >
-              $6,556.55
+              {{ \App\Helpers\FormatHelper::currency($latestPrice) }}
             </p>
             <button
               class="btn size-6 rounded-full p-0 hover:bg-slate-300/20 focus:bg-slate-300/20 active:bg-slate-300/25 dark:hover:bg-navy-300/20 dark:focus:bg-navy-300/20 dark:active:bg-navy-300/25"
@@ -144,9 +141,12 @@
         </button>
       </div>
 
+      {{-- Main Price Chart --}}
       <div class="ax-transparent-gridline grid w-full grid-cols-1">
-        <div id="salesOverview"></div>
+        {{--<div id="salesOverview"></div>--}}
+        <div id="price-chart" class="w-full"></div>
       </div>
+
     </div>
   </div>
   <div class="col-span-12 lg:col-span-4">
@@ -402,7 +402,7 @@
               <div class="avatar size-8 hover:z-10">
                 <img
                   class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                  src="images/200x200.png"
+                  src="/images/200x200.png"
                   alt="avatar"
                 />
               </div>
@@ -416,7 +416,7 @@
               <div class="avatar size-8 hover:z-10">
                 <img
                   class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                  src="images/200x200.png"
+                  src="/images/200x200.png"
                   alt="avatar"
                 />
               </div>
@@ -480,7 +480,7 @@
               <div class="avatar size-8 hover:z-10">
                 <img
                   class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                  src="images/200x200.png"
+                  src="/images/200x200.png"
                   alt="avatar"
                 />
               </div>
@@ -494,7 +494,7 @@
               <div class="avatar size-8 hover:z-10">
                 <img
                   class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                  src="images/200x200.png"
+                  src="/images/200x200.png"
                   alt="avatar"
                 />
               </div>
@@ -565,7 +565,7 @@
               <div class="avatar size-8 hover:z-10">
                 <img
                   class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                  src="images/200x200.png"
+                  src="/images/200x200.png"
                   alt="avatar"
                 />
               </div>
@@ -579,7 +579,7 @@
               <div class="avatar size-8 hover:z-10">
                 <img
                   class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                  src="images/200x200.png"
+                  src="/images/200x200.png"
                   alt="avatar"
                 />
               </div>
@@ -881,7 +881,7 @@
           <div class="avatar">
             <img
               class="mask is-squircle"
-              src="images/200x200.png"
+              src="/images/200x200.png"
               alt="image"
             />
           </div>
@@ -1036,19 +1036,19 @@
           <img
             data-tooltip="Award Level 1"
             class="size-6"
-            src="images/awards/award-19.svg"
+            src="/images/awards/award-19.svg"
             alt="avatar"
           />
           <img
             data-tooltip="Award Level 2"
             class="size-6"
-            src="images/awards/award-2.svg"
+            src="/images/awards/award-2.svg"
             alt="avatar"
           />
           <img
             data-tooltip="Award Level 3"
             class="size-6"
-            src="images/awards/award-5.svg"
+            src="/images/awards/award-5.svg"
             alt="avatar"
           />
         </div>
@@ -1083,7 +1083,7 @@
           <div class="avatar">
             <img
               class="mask is-squircle"
-              src="images/200x200.png"
+              src="/images/200x200.png"
               alt="image"
             />
           </div>
@@ -1233,19 +1233,19 @@
           <img
             data-tooltip="Award Level 1"
             class="size-6"
-            src="images/awards/award-1.svg"
+            src="/images/awards/award-1.svg"
             alt="avatar"
           />
           <img
             data-tooltip="Award Level 2"
             class="size-6"
-            src="images/awards/award-6.svg"
+            src="/images/awards/award-6.svg"
             alt="avatar"
           />
           <img
             data-tooltip="Award Level 3"
             class="size-6"
-            src="images/awards/award-9.svg"
+            src="/images/awards/award-9.svg"
             alt="avatar"
           />
         </div>
@@ -1280,7 +1280,7 @@
           <div class="avatar">
             <img
               class="mask is-squircle"
-              src="images/200x200.png"
+              src="/images/200x200.png"
               alt="image"
             />
           </div>
@@ -1430,13 +1430,13 @@
           <img
             data-tooltip="Award Level 2"
             class="size-6"
-            src="images/awards/award-14.svg"
+            src="/images/awards/award-14.svg"
             alt="avatar"
           />
           <img
             data-tooltip="Award Level 3"
             class="size-6"
-            src="images/awards/award-13.svg"
+            src="/images/awards/award-13.svg"
             alt="avatar"
           />
         </div>
@@ -1471,7 +1471,7 @@
           <div class="avatar">
             <img
               class="mask is-squircle"
-              src="images/200x200.png"
+              src="/images/200x200.png"
               alt="image"
             />
           </div>
@@ -1621,13 +1621,13 @@
           <img
             data-tooltip="Award Level 2"
             class="size-6"
-            src="images/awards/award-15.svg"
+            src="/images/awards/award-15.svg"
             alt="avatar"
           />
           <img
             data-tooltip="Award Level 3"
             class="size-6"
-            src="images/awards/award-13.svg"
+            src="/images/awards/award-13.svg"
             alt="avatar"
           />
         </div>
@@ -1662,7 +1662,7 @@
           <div class="avatar">
             <img
               class="mask is-squircle"
-              src="images/200x200.png"
+              src="/images/200x200.png"
               alt="image"
             />
           </div>
@@ -1807,19 +1807,19 @@
           <img
             data-tooltip="Award Level 2"
             class="size-6"
-            src="images/awards/award-15.svg"
+            src="/images/awards/award-15.svg"
             alt="avatar"
           />
           <img
             data-tooltip="Award Level 3"
             class="size-6"
-            src="images/awards/award-5.svg"
+            src="/images/awards/award-5.svg"
             alt="avatar"
           />
           <img
             data-tooltip="Award Level 3"
             class="size-6"
-            src="images/awards/award-25.svg"
+            src="/images/awards/award-25.svg"
             alt="avatar"
           />
         </div>
@@ -1854,7 +1854,7 @@
           <div class="avatar">
             <img
               class="mask is-squircle"
-              src="images/200x200.png"
+              src="/images/200x200.png"
               alt="image"
             />
           </div>
@@ -2007,19 +2007,19 @@
           <img
             data-tooltip="Award Level 2"
             class="size-6"
-            src="images/awards/award-1.svg"
+            src="/images/awards/award-1.svg"
             alt="avatar"
           />
           <img
             data-tooltip="Award Level 3"
             class="size-6"
-            src="images/awards/award-24.svg"
+            src="/images/awards/award-24.svg"
             alt="avatar"
           />
           <img
             data-tooltip="Award Level 3"
             class="size-6"
-            src="images/awards/award-30.svg"
+            src="/images/awards/award-30.svg"
             alt="avatar"
           />
         </div>
@@ -2357,7 +2357,7 @@
           <div class="avatar mt-2 size-16">
             <img
               class="mask is-squircle"
-              src="images/200x200.png"
+              src="/images/200x200.png"
               alt="avatar"
             />
           </div>
@@ -2458,7 +2458,7 @@
                 <div class="avatar size-7 hover:z-10">
                   <img
                     class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                    src="images/200x200.png"
+                    src="/images/200x200.png"
                     alt="avatar"
                   />
                 </div>
@@ -2474,7 +2474,7 @@
                 <div class="avatar size-7 hover:z-10">
                   <img
                     class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                    src="images/200x200.png"
+                    src="/images/200x200.png"
                     alt="avatar"
                   />
                 </div>
@@ -2482,7 +2482,7 @@
                 <div class="avatar size-7 hover:z-10">
                   <img
                     class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                    src="images/200x200.png"
+                    src="/images/200x200.png"
                     alt="avatar"
                   />
                 </div>
@@ -2490,7 +2490,7 @@
                 <div class="avatar size-7 hover:z-10">
                   <img
                     class="rounded-full ring-2 ring-white dark:ring-navy-700"
-                    src="images/200x200.png"
+                    src="/images/200x200.png"
                     alt="avatar"
                   />
                 </div>
@@ -2543,8 +2543,57 @@
   </div>
 </div>
 
-@endsection
-
 @push('scripts')
-  <script src="{{ asset('js/pages/dashboard.js') }}"></script>
+  @php
+    // Resolve compiled Vite modules
+    $priceChartModule = Vite::asset('resources/js/tickerwolf/charts/tickers/price/priceChart.js');
+    $showPageModule   = Vite::asset('resources/js/tickerwolf/pages/tickers/show.js');
+  @endphp
+
+  <script type="module">
+    document.addEventListener('DOMContentLoaded', async () => {
+      try {
+        // -------------------------------------------------------------------
+        // 1️⃣ Dynamically import the reusable price chart module
+        // -------------------------------------------------------------------
+        const { initPriceChart } = await import('{{ $priceChartModule }}');
+
+        // Initialize the dynamic multi-range chart
+        initPriceChart(
+          '#price-chart',
+          {
+            '1D': @json($chartSeries['1D'] ?? []),
+            '1W': @json($chartSeries['1W'] ?? []),
+            '1M': @json($chartSeries['1M'] ?? []),
+            '6M': @json($chartSeries['6M'] ?? []),
+            '1Y': @json($chartSeries['1Y'] ?? []),
+            '5Y': @json($chartSeries['5Y'] ?? []),
+          },
+          '1M' // Default active range
+        );
+
+        // -------------------------------------------------------------------
+        // 2️⃣ Import the page-level JS logic (show.js)
+        // -------------------------------------------------------------------
+        const pageModule = await import('{{ $showPageModule }}');
+
+        // If the module exports init(), call it; otherwise, log a friendly note
+        if (pageModule && typeof pageModule.init === 'function') {
+          pageModule.init();
+        } else if (pageModule && typeof pageModule.onLoad === 'function') {
+          // (Optional fallback for existing "onLoad" function)
+          pageModule.onLoad();
+        } else {
+          console.warn('[TickerWolf] show.js loaded, but no init() or onLoad() found.');
+        }
+
+        console.log('[TickerWolf] ✅ Ticker page initialized successfully.');
+
+      } catch (error) {
+        console.error('[TickerWolf] ❌ Failed to initialize show.blade.js logic:', error);
+      }
+    });
+  </script>
 @endpush
+
+@endsection

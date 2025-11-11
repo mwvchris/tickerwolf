@@ -1,4 +1,4 @@
-===== GPT DUMP GENERATED: 2025-11-10T05:30:52Z =====
+===== GPT DUMP GENERATED: 2025-11-10T06:46:40Z =====
 ===== DIRECTORY: app/Http =====
 
 app/Http/Middleware/RedirectIfAuthenticated.php
@@ -603,39 +603,10 @@ class TickerAnalysisController extends Controller
             'completed_at' => $analysis->completed_at,
         ]);
     }
-}app/Http/Controllers/Api/TickerApiController.php
+}app/Http/Controllers/TickerController.old.php
 
 
-===== FILE: app/Http/Controllers/Api/TickerApiController.php =====
-
-<?php
-
-namespace App\Http\Controllers\Api;
-
-use App\Http\Controllers\Controller;
-use Illuminate\Http\Request;
-use App\Models\Ticker;
-
-class TickerApiController extends Controller
-{
-    public function search(Request $request)
-    {
-        $q = $request->query('q', '');
-        if (empty($q)) {
-            return response()->json([]);
-        }
-
-        $results = Ticker::where('ticker', 'like', $q . '%')
-            ->orWhere('name', 'like', '%' . $q . '%')
-            ->limit(10)
-            ->get(['ticker', 'name', 'slug']);
-
-        return response()->json($results);
-    }
-}app/Http/Controllers/TickerController.php
-
-
-===== FILE: app/Http/Controllers/TickerController.php =====
+===== FILE: app/Http/Controllers/TickerController.old.php =====
 
 <?php
 
@@ -776,6 +747,114 @@ class TickerController extends Controller
                 'content'   => $analysisContent,
                 'completed' => optional($latestAnalysis->completed_at)->toIso8601String(),
             ] : null,
+        ]);
+    }
+}app/Http/Controllers/Api/TickerApiController.php
+
+
+===== FILE: app/Http/Controllers/Api/TickerApiController.php =====
+
+<?php
+
+namespace App\Http\Controllers\Api;
+
+use App\Http\Controllers\Controller;
+use Illuminate\Http\Request;
+use App\Models\Ticker;
+
+class TickerApiController extends Controller
+{
+    public function search(Request $request)
+    {
+        $q = $request->query('q', '');
+        if (empty($q)) {
+            return response()->json([]);
+        }
+
+        $results = Ticker::where('ticker', 'like', $q . '%')
+            ->orWhere('name', 'like', '%' . $q . '%')
+            ->limit(10)
+            ->get(['ticker', 'name', 'slug']);
+
+        return response()->json($results);
+    }
+}app/Http/Controllers/TickerController.php
+
+
+===== FILE: app/Http/Controllers/TickerController.php =====
+
+<?php
+
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use Illuminate\Support\Str;
+use App\Models\Ticker;
+use App\Models\TickerOverview;
+use App\Models\TickerFundamental;
+use App\Models\TickerIndicator;
+use App\Models\TickerAnalysis;
+use App\Models\TickerNewsItem;
+use App\Models\TickerPriceHistory;
+
+class TickerController extends Controller
+{
+    /**
+     * Display the ticker profile page.
+     *
+     * Route: GET /tickers/{symbol}/{slug?}
+     */
+    public function show(Request $request, string $symbol, ?string $slug = null)
+    {
+        // ------------------------------------------------------------------
+        // 1️⃣ Load the base ticker with relationships
+        // ------------------------------------------------------------------
+        $ticker = Ticker::query()
+            ->whereRaw('ticker = ?', [$symbol])
+            ->with([
+                'overview',
+                'fundamentals',
+                'indicators' => fn($q) => $q->latest('t')->limit(10),
+                'analysis' => fn($q) => $q->latest()->limit(1),
+                'newsItems' => fn($q) => $q->latest()->limit(10),
+                'priceHistories' => fn($q) => $q->latest('t')->limit(60),
+            ])
+            ->firstOrFail();
+
+        // ------------------------------------------------------------------
+        // 2️⃣ Compute or normalize key variables
+        // ------------------------------------------------------------------
+        $overview = $ticker->overview;
+        $fundamentals = $ticker->fundamentals;
+        $latestPrice = optional($ticker->priceHistories->first());
+        $indicators = $ticker->indicators->first();
+        $analysis = $ticker->analysis->first();
+        $newsItems = $ticker->newsItems;
+        $priceHistory = $ticker->priceHistories->sortBy('t');
+
+        // ------------------------------------------------------------------
+        // 3️⃣ Handle canonical slug (for SEO-friendly URLs)
+        // ------------------------------------------------------------------
+        $canonicalSlug = Str::slug($ticker->name ?? $ticker->ticker);
+        if ($slug !== $canonicalSlug) {
+            return redirect()->route('tickers.show', [
+                'symbol' => $ticker->ticker,
+                'slug' => $canonicalSlug,
+            ]);
+        }
+
+        // ------------------------------------------------------------------
+        // 4️⃣ Pass all data to Blade
+        // ------------------------------------------------------------------
+        return view('pages.tickers.show', [
+            'ticker' => $ticker->ticker,
+            'overview' => $overview,
+            'fundamentals' => $fundamentals,
+            'latestPrice' => $latestPrice,
+            'indicators' => $indicators,
+            'analysis' => $analysis,
+            'newsItems' => $newsItems,
+            'priceHistory' => $priceHistory,
         ]);
     }
 }

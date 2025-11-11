@@ -10,7 +10,7 @@
         <a href="/">
         <img
             class="size-11 transition-transform duration-500 ease-in-out hover:rotate-[360deg]"
-            src="images/app-logo.svg"
+            src="/images/app-logo.svg"
             alt="logo"
         />
         </a>
@@ -248,7 +248,7 @@
         <button id="profile-ref" class="avatar cursor-pointer size-12">
             <img
             class="rounded-full"
-            src="images/200x200.png"
+            src="/images/200x200.png"
             alt="avatar"
             />
             <span
@@ -265,7 +265,7 @@
                 <div class="avatar size-14">
                 <img
                     class="rounded-full"
-                    src="images/200x200.png"
+                    src="/images/200x200.png"
                     alt="avatar"
                 />
                 </div>
