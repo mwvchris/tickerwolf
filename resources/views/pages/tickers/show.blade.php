@@ -13,18 +13,16 @@
         
         {{-- Ticker Name --}}
         <div class="flex items-center space-x-4 py-5 lg:py-6">
-            <h2 class="text-xl font-medium text-slate-800 dark:text-navy-50 lg:text-2xl">{{ $ticker->name }}</h2>
+          <div class="avatar size-12">
+            <img src="{{ $ticker->icon_url }}" class="mask is-squircle object-cover" alt="{{ $ticker->clean_display_name }} Logo" />
+          </div>
+          <div>
+            <h2 class="text-xl font-medium text-slate-800 dark:text-navy-50 lg:text-2xl">{{ $ticker->clean_display_name }}</h2>
+            <p class="py-1text-xs text-slate-400 dark:text-navy-300">
+              ${{ $ticker->ticker }}&nbsp; &bull; &nbsp;{{ $ticker->exchange_short }}
+            </p>
+          </div>
         </div>
-
-        {{--
-        <h2 class="text-base font-medium tracking-wide text-slate-800 line-clamp-1 dark:text-navy-100">
-            {{ $ticker->ticker }} Overview
-        </h2>
-
-        <div class="flex items-center space-x-2">
-            {{ $ticker->primary_exchange ?? '-' }} &bull; {{ strtoupper($ticker->locale) }}
-        </div>
-        --}}
 
         {{-- Price Chart Tabs --}}
         <div id="price-chart-tabs" class="is-scrollbar-hidden overflow-x-auto rounded-lg bg-slate-200 text-slate-600 dark:bg-navy-800 dark:text-navy-200">
@@ -45,85 +43,94 @@
     </div>
 
     <div class="flex flex-col sm:flex-row sm:space-x-7">
-      <div
-        class="mt-4 flex shrink-0 flex-col items-center sm:items-start"
-      >
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          class="size-8 text-info"
-          fill="none"
-          viewBox="0 0 24 24"
-          stroke="currentColor"
-          stroke-width="1.5"
-        >
-          <path
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z"
-          />
-          <path
-            stroke-linecap="round"
-            stroke-linejoin="round"
-            d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z"
-          />
+      <div class="mt-2 flex shrink-0 flex-col items-center sm:items-start">
+
+        {{-- Pie Chart Icon --}}
+        <!--
+        <svg xmlns="http://www.w3.org/2000/svg" class="size-8 text-info" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z" />
+          <path stroke-linecap="round" stroke-linejoin="round" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z" />
         </svg>
-        <div class="mt-4">
+        -->
+
+        {{-- Price Snapshot --}}
+        <div class="mb-2">
           <div class="flex items-center space-x-1">
-            <p
-              class="text-2xl font-semibold text-slate-700 dark:text-navy-100"
-            >
-              {{ \App\Helpers\FormatHelper::currency($latestPrice) }}
+
+            {{-- Latest Price --}}
+            <p class="text-4xl font-semibold text-slate-700 dark:text-navy-100">
+              {{ $headerStats['lastPrice'] }}
             </p>
-            <button
-              class="btn size-6 rounded-full p-0 hover:bg-slate-300/20 focus:bg-slate-300/20 active:bg-slate-300/25 dark:hover:bg-navy-300/20 dark:focus:bg-navy-300/20 dark:active:bg-navy-300/25"
-            >
-              <svg
-                xmlns="http://www.w3.org/2000/svg"
-                class="size-4"
-                fill="none"
-                viewBox="0 0 24 24"
-                stroke="currentColor"
-                stroke-width="1.5"
-              >
-                <path
-                  stroke-linecap="round"
-                  stroke-linejoin="round"
-                  d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
-                />
+            <p class="text-xs text-slate-400 dark:text-navy-300">
+              {{ $ticker->currency }}
+            </p>
+
+            {{-- Refresh Button --}}
+            <!--
+            <button class="btn size-6 rounded-full p-0 hover:bg-slate-300/20 focus:bg-slate-300/20 active:bg-slate-300/25 dark:hover:bg-navy-300/20 dark:focus:bg-navy-300/20 dark:active:bg-navy-300/25">
+              <svg xmlns="http://www.w3.org/2000/svg" class="size-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
+                <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
               </svg>
             </button>
+            -->
+
           </div>
-          <p class="text-xs text-slate-400 dark:text-navy-300">
-            this month
+        </div>
+
+        {{-- Today Snapshot --}}
+          <div class="flex items-center">
+
+              {{-- Change Arrow --}}
+              @if (Str::startsWith($headerStats['changeAbs'], '+'))
+                  {{-- Upward change --}}
+                  <svg xmlns="http://www.w3.org/2000/svg" class="size-5 text-success" viewBox="0 0 20 20" fill="currentColor">
+                      <path fill-rule="evenodd"
+                            d="M12 7a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0V8.414l-4.293 4.293a1 1 0 01-1.414 0L8 10.414l-4.293 4.293a1 1 0 01-1.414-1.414l5-5a1 1 0 011.414 0L11 10.586 14.586 7H12z"
+                            clip-rule="evenodd" />
+                  </svg>
+              @else
+                  {{-- Downward change --}}
+                  <svg xmlns="http://www.w3.org/2000/svg" class="size-5 text-error rotate-90" viewBox="0 0 20 20" fill="currentColor">
+                      <path fill-rule="evenodd"
+                            d="M12 7a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0V8.414l-4.293 4.293a1 1 0 01-1.414 0L8 10.414l-4.293 4.293a1 1 0 01-1.414-1.414l5-5a1 1 0 011.414 0L11 10.586 14.586 7H12z"
+                            clip-rule="evenodd" />
+                  </svg>
+              @endif
+
+              {{-- Change Values %/$ --}}
+              <span class="text-lg pr-1 font-medium {{ Str::startsWith($headerStats['changeAbs'], '+') ? 'text-success' : 'text-error' }}">
+                {{ $headerStats['changePct'] }}&nbsp;1D
+              </span>
+              <span class="px-1">{{ $headerStats['changeAbs'] }}</span>
+          </div>
+
+          {{-- Close Time --}}
+          <p class="mt-1 text-xs">
+            {{ $headerStats['closeTime'] }}
           </p>
-        </div>
-        <div class="mt-3 flex items-center space-x-2">
-          <div class="ax-transparent-gridline w-28">
-            <div id="salesMonthChart"></div>
+
+          {{-- Mini Price Chart --}}
+          {{--
+          <div class="flex items-center space-x-2">
+            <div class="ax-transparent-gridline w-28">
+              <div id="salesMonthChart"></div>
+            </div>
           </div>
-          <div class="flex items-center space-x-0.5">
-            <svg
-              xmlns="http://www.w3.org/2000/svg"
-              class="size-4 text-success"
-              fill="none"
-              viewBox="0 0 24 24"
-              stroke="currentColor"
-            >
-              <path
-                stroke-linecap="round"
-                stroke-linejoin="round"
-                stroke-width="2"
-                d="M7 11l5-5m0 0l5 5m-5-5v12"
-              />
-            </svg>
-            <p class="text-sm-plus text-slate-800 dark:text-navy-100">
-              3.2%
-            </p>
+          --}}
+
+          <div class="card flex flex-col mt-4 py-2 justify-between border-4 border-transparent border-l-info px-4">
+          <p class="text-base font-medium text-slate-600 dark:text-navy-100">
+            After Hours
+          </p>
+          <p class="text-xs text-slate-400 dark:text-navy-300">
+            Design Learn Management System
+          </p>
+          <div class="badge mt-2 bg-info/10 text-info dark:bg-info/15">
+            UI/UX Design
           </div>
-        </div>
-        <button
-          class="btn mt-8 space-x-2 rounded-full border border-slate-300 px-3 text-xs-plus font-medium text-slate-700 hover:bg-slate-150 focus:bg-slate-150 active:bg-slate-150/80 dark:border-navy-450 dark:text-navy-100 dark:hover:bg-navy-500 dark:focus:bg-navy-500 dark:active:bg-navy-500/90"
-        >
+          </div>
+
+        <button class="btn mt-8 space-x-2 rounded-full border border-slate-300 px-3 text-xs-plus font-medium text-slate-700 hover:bg-slate-150 focus:bg-slate-150 active:bg-slate-150/80 dark:border-navy-450 dark:text-navy-100 dark:hover:bg-navy-500 dark:focus:bg-navy-500 dark:active:bg-navy-500/90">
           <svg
             xmlns="http://www.w3.org/2000/svg"
             class="size-4.5 text-slate-400 dark:text-navy-300"
@@ -138,7 +145,7 @@
               d="M15 13l-3 3m0 0l-3-3m3 3V8m0 13a9 9 0 110-18 9 9 0 010 18z"
             />
           </svg>
-          <span> Download Report</span>
+          <span> Add to Watchlist</span>
         </button>
       </div>
 

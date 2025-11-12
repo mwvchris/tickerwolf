@@ -6,28 +6,30 @@ use Illuminate\Http\Request;
 use App\Models\Ticker;
 use Illuminate\Support\Str;
 use Illuminate\Support\Carbon;
+use App\Helpers\FormatHelper;
 
 /**
  * Controller: TickerController
- * --------------------------------------------------------------------------
+ * -----------------------------------------------------------------------------
  * Renders the Ticker Profile Page and coordinates data aggregation between
  * Eloquent models and Blade views.
  *
  * Responsibilities:
  *  - Load relevant ticker data and relationships (overview, fundamentals,
  *    indicators, price histories, news, analysis)
- *  - Prepare both detailed OHLCV arrays (for cards/analytics) AND lightweight
- *    `{x,y}` series for fast ApexCharts rendering with down-sampling
- *  - Compute high-level metrics (price, percent changes, market cap formatting)
+ *  - Prepare both detailed OHLCV arrays AND lightweight `{x,y}` series
+ *    for ApexCharts (with optional down-sampling)
+ *  - Compute high-level header stats to match major finance portals
+ * -----------------------------------------------------------------------------
  */
 class TickerController extends Controller
 {
     /**
      * Display a single ticker’s profile page.
      *
-     * @param  Request      $request
-     * @param  string       $symbol    The ticker symbol (e.g. "AAPL")
-     * @param  string|null  $slug      Optional SEO-friendly slug
+     * @param  \Illuminate\Http\Request  $request
+     * @param  string                    $symbol  The ticker symbol (e.g. "AAPL")
+     * @param  string|null               $slug    Optional SEO-friendly slug
      * @return \Illuminate\View\View|\Illuminate\Http\RedirectResponse
      */
     public function show(Request $request, string $symbol, ?string $slug = null)
@@ -41,7 +43,7 @@ class TickerController extends Controller
             ->with([
                 'overview',
                 'fundamentals'   => fn ($q) => $q->orderByDesc('end_date')->limit(4),
-                'priceHistories' => fn ($q) => $q->orderBy('t'), // ascending for transform later
+                'priceHistories' => fn ($q) => $q->orderBy('t'),
                 'indicators'     => fn ($q) => $q->orderByDesc('t')->limit(50),
                 'analysis'       => fn ($q) => $q->latest('created_at'),
                 'newsItems'      => fn ($q) => $q->orderByDesc('published_utc')->limit(10),
@@ -65,7 +67,7 @@ class TickerController extends Controller
         // ------------------------------------------------------------------
         $now = Carbon::now();
         $priceHistoryRecords = $ticker->priceHistories()
-            ->where('t', '>=', $now->copy()->subYears(5)) // cap to last 5Y for page
+            ->where('t', '>=', $now->copy()->subYears(5))
             ->orderBy('t', 'asc')
             ->get();
 
@@ -104,44 +106,76 @@ class TickerController extends Controller
 
         // ------------------------------------------------------------------
         // Lightweight `{x,y}` series for ApexCharts (with down-sampling rules)
-        // - 1D, 1W, 1M, 6M: daily
-        // - YTD, 1Y: daily by default, or 3-day down-sample if needed
-        // - 5Y: 7-day down-sample
         // ------------------------------------------------------------------
-        $favorSparseForLargeRanges = true; // enable 3-day stepping for YTD/1Y
-        $ranges = ['1D', '1W', '1M', '6M', '1Y', '5Y']; // keep Blade consistent
+        $favorSparseForLargeRanges = true;
+        $ranges = ['1D', '1W', '1M', '6M', '1Y', '5Y'];
 
         $chartSeries = [];
         foreach ($ranges as $range) {
             $series = $ticker->buildPriceSeriesForRange($range, $favorSparseForLargeRanges);
-            // Only send the light `{x,y}` array to the chart modules:
-            $chartSeries[$range] = $series['points']; // e.g., [['x' => '2025-01-01', 'y' => 123.45], ...]
+            $chartSeries[$range] = $series['points'];
         }
 
         // ------------------------------------------------------------------
-        // Compute High-Level Metrics (header cards, percent change, etc.)
+        // Header Stats: match expectations from Google/TradingView/Perplexity
         // ------------------------------------------------------------------
-        $latestPrice     = $ticker->latestPrice()?->c ?? null;
-        $priceChange5d   = $ticker->percentChange(5);
-        $priceChange30d  = $ticker->percentChange(30);
-        $formattedMarket = $ticker->formattedMarketCap();
+        $overview = $ticker->overview; // may be null for some tickers
+
+        $headerStats = [
+            // Price & change
+            'lastPrice'     => FormatHelper::currency($ticker->last_close),
+            'changeAbs'     => FormatHelper::signedCurrencyChange($ticker->day_change_abs),
+            'changePct'     => FormatHelper::percent($ticker->day_change_pct),
+
+            // Market close & after-hours times
+            'closeTime' => optional($ticker->latestPrice()?->t, function ($timestamp) {
+                $dt = Carbon::parse($timestamp)->setTimezone('America/New_York');
+                //$emoji = $dt->hour < 16 ? '☀️' : '🌙';
+                return 'At close at ' . $dt->format('M j, g:i A T') . (isset($emoji) ? ' ' . $emoji : '');
+            }) ?? 'At close: —',
+
+            'afterHoursTime' => optional($ticker->latestPrice()?->t, function ($timestamp) {
+                $dt = Carbon::parse($timestamp)->setTimezone('America/New_York')->addHours(4);
+                //$emoji = $dt->hour >= 16 && $dt->hour <= 20 ? '🌙' : '☀️';
+                return 'After hours: ' . $dt->format('M j, g:i A T') . (isset($emoji) ? ' ' . $emoji : '');
+            }) ?? 'After hours: —',
+
+            // Day ranges & previous close
+            'prevClose'     => FormatHelper::currency($ticker->prev_close),
+            'open'          => FormatHelper::currency($ticker->day_open),
+            'dayHigh'       => FormatHelper::currency($ticker->day_high),
+            'dayLow'        => FormatHelper::currency($ticker->day_low),
+
+            // Volume (latest & avg)
+            'volume'        => FormatHelper::humanVolume($ticker->volume_latest),
+            'avgVolume'     => FormatHelper::humanVolume($ticker->avg_volume_30d),
+
+            // 52-week range
+            'high52w'       => FormatHelper::currency($ticker->high_52w),
+            'low52w'        => FormatHelper::currency($ticker->low_52w),
+
+            // Market cap & shares
+            'marketCap'     => $overview ? FormatHelper::compactCurrency($overview->market_cap ?? null) : '—',
+            'sharesOut'     => $overview ? FormatHelper::compactNumber($overview->weighted_shares_outstanding ?? null) : '—',
+
+            // Meta
+            'exchange'      => $ticker->exchange_short ?? $ticker->primary_exchange,
+            'name'          => $ticker->clean_display_name ?? $ticker->name,
+            'logoUrl'       => $ticker->logo_url,
+            'iconUrl'       => $ticker->icon_url,
+        ];
 
         // ------------------------------------------------------------------
         // Compile Data for View
-        // - chartData: detailed OHLCV arrays (for cards/analytics)
-        // - chartSeries: lightweight {x,y} arrays (for fast Apex charts)
         // ------------------------------------------------------------------
         return view('pages.tickers.show', [
             'ticker'           => $ticker,
-            'overview'         => $ticker->overview,
+            'overview'         => $overview,
             'fundamental'      => $ticker->fundamentals->first(),
             'chartData'        => $chartData,
             'chartSeries'      => $chartSeries,
             'latestIndicators' => $ticker->latestIndicators(),
-            'latestPrice'      => $latestPrice,
-            'priceChange5d'    => $priceChange5d,
-            'priceChange30d'   => $priceChange30d,
-            'formattedMarket'  => $formattedMarket,
+            'headerStats'      => $headerStats,
             'analysis'         => $ticker->analysis,
             'newsItems'        => $ticker->newsItems,
         ]);
