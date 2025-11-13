@@ -69,4 +69,4 @@ Ticker Fundamentals:
 php artisan polygon:fundamentals:ingest --timeframe=all --gte=2019-01-01 --batch=2000 --sleep=1
 
 Ticker News Items:
-
+php artisan polygon:ticker-news:ingest --batch=500 --sleep=1

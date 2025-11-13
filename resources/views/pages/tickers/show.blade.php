@@ -8,7 +8,7 @@
 <div class="mt-4 grid grid-cols-12 gap-4 px-[var(--margin-x)] transition-all duration-[.25s] sm:mt-5 sm:gap-5 lg:mt-6 lg:gap-6">
 
     {{-- Main Ticker Header --}}
-    <div class="col-span-12 lg:col-span-8">
+    <div class="col-span-12 lg:col-span-9">
         <div class="flex items-center justify-between space-x-2">
         
         {{-- Ticker Name --}}
@@ -58,7 +58,7 @@
           <div class="flex items-center space-x-1">
 
             {{-- Latest Price --}}
-            <p class="text-4xl font-semibold text-slate-700 dark:text-navy-100">
+            <p class="text-3xl font-semibold text-slate-700 dark:text-navy-100">
               {{ $headerStats['lastPrice'] }}
             </p>
             <p class="text-xs text-slate-400 dark:text-navy-300">
@@ -157,40 +157,32 @@
 
     </div>
   </div>
-  <div class="col-span-12 lg:col-span-4">
-    <div
-      class="grid grid-cols-2 gap-3 sm:grid-cols-3 sm:gap-5 lg:grid-cols-2"
-    >
+
+  {{-- Right Column Overview Cards --}}
+  <div class="col-span-12 lg:col-span-3">
+    <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 sm:gap-5 lg:grid-cols-2">
+
+    {{-- Market Cap Card --}}
       <div class="rounded-lg bg-slate-150 p-4 dark:bg-navy-700">
         <div class="flex justify-between space-x-1">
-          <p
-            class="text-xl font-semibold text-slate-700 dark:text-navy-100"
-          >
-            $67.6k
+          <p class="text-xl font-semibold text-slate-700 dark:text-navy-100">
+            {{ $headerStats['marketCap'] }}
           </p>
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            class="size-5 text-primary dark:text-accent"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            stroke-width="2"
-          >
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
-            />
+          <svg xmlns="http://www.w3.org/2000/svg" class="size-5 text-info dark:text-info" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+            <path stroke-linecap="round" stroke-linejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
           </svg>
         </div>
-        <p class="mt-1 text-xs-plus">Income</p>
+        <p class="mt-1 text-xs-plus">Market Cap</p>
       </div>
+    
+    {{-- Avg. Volume --}}
       <div class="rounded-lg bg-slate-150 p-4 dark:bg-navy-700">
+
         <div class="flex justify-between">
           <p
             class="text-xl font-semibold text-slate-700 dark:text-navy-100"
           >
-            12.6K
+            {{ $headerStats['avgVolume'] }}
           </p>
           <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -207,14 +199,16 @@
             />
           </svg>
         </div>
-        <p class="mt-1 text-xs-plus">Completed</p>
+        <p class="mt-1 text-xs-plus">Avg. Volume</p>
       </div>
+
+    {{-- 52 Week High --}}
       <div class="rounded-lg bg-slate-150 p-4 dark:bg-navy-700">
         <div class="flex justify-between">
           <p
             class="text-xl font-semibold text-slate-700 dark:text-navy-100"
           >
-            143
+            {{ $headerStats['high52w'] }}
           </p>
           <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -231,14 +225,16 @@
             />
           </svg>
         </div>
-        <p class="mt-1 text-xs-plus">Pending</p>
+        <p class="mt-1 text-xs-plus">52-Wk. High</p>
       </div>
+
+    {{-- 52 Week Low --}}
       <div class="rounded-lg bg-slate-150 p-4 dark:bg-navy-700">
         <div class="flex justify-between">
           <p
             class="text-xl font-semibold text-slate-700 dark:text-navy-100"
           >
-            651
+            {{ $headerStats['low52w'] }}
           </p>
           <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -258,55 +254,7 @@
             />
           </svg>
         </div>
-        <p class="mt-1 text-xs-plus">Dispatch</p>
-      </div>
-      <div class="rounded-lg bg-slate-150 p-4 dark:bg-navy-700">
-        <div class="flex justify-between space-x-1">
-          <p
-            class="text-xl font-semibold text-slate-700 dark:text-navy-100"
-          >
-            46k
-          </p>
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            class="size-5 text-secondary"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            stroke-width="2"
-          >
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4"
-            />
-          </svg>
-        </div>
-        <p class="mt-1 text-xs-plus">Products</p>
-      </div>
-      <div class="rounded-lg bg-slate-150 p-4 dark:bg-navy-700">
-        <div class="flex justify-between">
-          <p
-            class="text-xl font-semibold text-slate-700 dark:text-navy-100"
-          >
-            8.8k
-          </p>
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            class="size-5 text-error"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            stroke-width="2"
-          >
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z"
-            />
-          </svg>
-        </div>
-        <p class="mt-1 text-xs-plus">Customers</p>
+        <p class="mt-1 text-xs-plus">52-Wk. Low</p>
       </div>
     </div>
   </div>

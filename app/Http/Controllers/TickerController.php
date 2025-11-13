@@ -2,11 +2,11 @@
 
 namespace App\Http\Controllers;
 
-use Illuminate\Http\Request;
-use App\Models\Ticker;
-use Illuminate\Support\Str;
-use Illuminate\Support\Carbon;
 use App\Helpers\FormatHelper;
+use App\Models\Ticker;
+use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Str;
 
 /**
  * Controller: TickerController
@@ -55,6 +55,7 @@ class TickerController extends Controller
         // Canonical Slug Enforcement (SEO-friendly route)
         // ------------------------------------------------------------------
         $canonicalSlug = $ticker->slug ?? Str::slug($ticker->name ?? $ticker->ticker);
+
         if ($slug !== $canonicalSlug) {
             return redirect()->route('tickers.show', [
                 'symbol' => $symbol,
@@ -66,8 +67,9 @@ class TickerController extends Controller
         // Detailed OHLCV arrays for 1D, 1W, 1M, 6M, 1Y, 5Y (for cards/analytics)
         // ------------------------------------------------------------------
         $now = Carbon::now();
+
         $priceHistoryRecords = $ticker->priceHistories()
-            ->where('t', '>=', $now->copy()->subYears(5))
+            ->where('t', '>=', $now->copy()->subYears(5)) // cap to last 5Y for page
             ->orderBy('t', 'asc')
             ->get();
 
@@ -92,15 +94,21 @@ class TickerController extends Controller
         };
 
         $chartData = [];
+
         foreach ($rangeConfig as $label => $config) {
             if ($priceHistoryRecords->isEmpty()) {
                 $chartData[$label] = [];
                 continue;
             }
-            $subset = $priceHistoryRecords->filter(fn ($r) => $r->t >= $config['threshold']);
+
+            $subset = $priceHistoryRecords->filter(
+                fn ($r) => $r->t >= $config['threshold']
+            );
+
             if ($subset->isEmpty()) {
                 $subset = $priceHistoryRecords->take(-$config['fallback']);
             }
+
             $chartData[$label] = $serializeOHLCV($subset);
         }
 
@@ -108,61 +116,76 @@ class TickerController extends Controller
         // Lightweight `{x,y}` series for ApexCharts (with down-sampling rules)
         // ------------------------------------------------------------------
         $favorSparseForLargeRanges = true;
-        $ranges = ['1D', '1W', '1M', '6M', '1Y', '5Y'];
+        $ranges                    = ['1D', '1W', '1M', '6M', '1Y', '5Y'];
 
         $chartSeries = [];
+
         foreach ($ranges as $range) {
-            $series = $ticker->buildPriceSeriesForRange($range, $favorSparseForLargeRanges);
+            $series              = $ticker->buildPriceSeriesForRange($range, $favorSparseForLargeRanges);
             $chartSeries[$range] = $series['points'];
         }
 
         // ------------------------------------------------------------------
-        // Header Stats: match expectations from Google/TradingView/Perplexity
+        // Header Stats: regular vs. extended session (Option C)
         // ------------------------------------------------------------------
-        $overview = $ticker->overview; // may be null for some tickers
+        $overview        = $ticker->overview;
+        $regularSession  = $ticker->regularSessionStats();
+        $extendedSession = $ticker->extendedSessionStats(); // currently synthetic timestamp
 
         $headerStats = [
-            // Price & change
-            'lastPrice'     => FormatHelper::currency($ticker->last_close),
-            'changeAbs'     => FormatHelper::signedCurrencyChange($ticker->day_change_abs),
-            'changePct'     => FormatHelper::percent($ticker->day_change_pct),
+            // Regular session block (close)
+            'regular' => [
+                'priceRaw'    => $ticker->last_close,
+                'price'       => FormatHelper::currency($ticker->last_close),
+                'changeAbsRaw'=> $ticker->day_change_abs,
+                'changeAbs'   => FormatHelper::signedCurrencyChange($ticker->day_change_abs),
+                'changePctRaw'=> $ticker->day_change_pct,
+                'changePct'   => FormatHelper::percent($ticker->day_change_pct),
+                'timestamp'   => $regularSession['timestamp'] ?? null,
+                'label'       => $regularSession['label'] ?? 'At close: —',
+            ],
 
-            // Market close & after-hours times
-            'closeTime' => optional($ticker->latestPrice()?->t, function ($timestamp) {
-                $dt = Carbon::parse($timestamp)->setTimezone('America/New_York');
-                //$emoji = $dt->hour < 16 ? '☀️' : '🌙';
-                return 'At close at ' . $dt->format('M j, g:i A T') . (isset($emoji) ? ' ' . $emoji : '');
-            }) ?? 'At close: —',
-
-            'afterHoursTime' => optional($ticker->latestPrice()?->t, function ($timestamp) {
-                $dt = Carbon::parse($timestamp)->setTimezone('America/New_York')->addHours(4);
-                //$emoji = $dt->hour >= 16 && $dt->hour <= 20 ? '🌙' : '☀️';
-                return 'After hours: ' . $dt->format('M j, g:i A T') . (isset($emoji) ? ' ' . $emoji : '');
-            }) ?? 'After hours: —',
+            // Extended session block (pre-market / after hours)
+            // For now we only provide the label & timestamp; when you have
+            // extended prices you can wire them into `priceRaw` + changes.
+            'extended' => [
+                'priceRaw'     => null,
+                'price'        => '—',
+                'changeAbsRaw' => null,
+                'changeAbs'    => '—',
+                'changePctRaw' => null,
+                'changePct'    => '—',
+                'timestamp'    => $extendedSession['timestamp'] ?? null,
+                'label'        => $extendedSession['label'] ?? 'After hours: —',
+            ],
 
             // Day ranges & previous close
-            'prevClose'     => FormatHelper::currency($ticker->prev_close),
-            'open'          => FormatHelper::currency($ticker->day_open),
-            'dayHigh'       => FormatHelper::currency($ticker->day_high),
-            'dayLow'        => FormatHelper::currency($ticker->day_low),
+            'prevClose'  => FormatHelper::currency($ticker->prev_close),
+            'open'       => FormatHelper::currency($ticker->day_open),
+            'dayHigh'    => FormatHelper::currency($ticker->day_high),
+            'dayLow'     => FormatHelper::currency($ticker->day_low),
 
             // Volume (latest & avg)
-            'volume'        => FormatHelper::humanVolume($ticker->volume_latest),
-            'avgVolume'     => FormatHelper::humanVolume($ticker->avg_volume_30d),
+            'volume'     => FormatHelper::humanVolume($ticker->volume_latest),
+            'avgVolume'  => FormatHelper::humanVolume($ticker->avg_volume_30d),
 
             // 52-week range
-            'high52w'       => FormatHelper::currency($ticker->high_52w),
-            'low52w'        => FormatHelper::currency($ticker->low_52w),
+            'high52w'    => FormatHelper::currency($ticker->high_52w),
+            'low52w'     => FormatHelper::currency($ticker->low_52w),
 
             // Market cap & shares
-            'marketCap'     => $overview ? FormatHelper::compactCurrency($overview->market_cap ?? null) : '—',
-            'sharesOut'     => $overview ? FormatHelper::compactNumber($overview->weighted_shares_outstanding ?? null) : '—',
+            'marketCap'  => $overview
+                ? FormatHelper::compactCurrency($overview->market_cap ?? null)
+                : '—',
+            'sharesOut'  => $overview
+                ? FormatHelper::compactNumber($overview->weighted_shares_outstanding ?? null)
+                : '—',
 
             // Meta
-            'exchange'      => $ticker->exchange_short ?? $ticker->primary_exchange,
-            'name'          => $ticker->clean_display_name ?? $ticker->name,
-            'logoUrl'       => $ticker->logo_url,
-            'iconUrl'       => $ticker->icon_url,
+            'exchange'   => $ticker->exchange_short ?? $ticker->primary_exchange,
+            'name'       => $ticker->clean_display_name ?? $ticker->name,
+            'logoUrl'    => $ticker->logo_url,
+            'iconUrl'    => $ticker->icon_url,
         ];
 
         // ------------------------------------------------------------------

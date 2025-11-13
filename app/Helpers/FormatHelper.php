@@ -4,9 +4,6 @@ namespace App\Helpers;
 
 /**
  * Formatting helpers for financial numbers, percentages, volumes, etc.
- *
- * These utilities centralize UI formatting logic so controllers/models can
- * return clean primitives while Blade focuses purely on presentation.
  */
 class FormatHelper
 {
@@ -16,36 +13,33 @@ class FormatHelper
      * @param  float|null  $value
      * @param  string      $symbol
      * @return string
-     *
-     * @example
-     * {{ \App\Helpers\FormatHelper::currency($ticker->last_close) }}
      */
     public static function currency(?float $value, string $symbol = '$'): string
     {
         if ($value === null) {
             return '—';
         }
+
         return $symbol . number_format($value, 2, '.', ',');
     }
 
     /**
-     * Compact currency, e.g., 8_170_000_000 -> "$8.17B".
+     * Format a signed currency change, e.g., -1.23 -> "-$1.23", 1.23 -> "+$1.23".
      *
-     * @param  float|int|null  $value
-     * @param  string          $symbol
+     * @param  float|null  $value
+     * @param  string      $symbol
      * @return string
-     *
-     * @example
-     * {{ \App\Helpers\FormatHelper::compactCurrency($overview->market_cap) }}
      */
-    public static function compactCurrency($value, string $symbol = '$'): string
+    public static function signedCurrencyChange(?float $value, string $symbol = '$'): string
     {
-        if ($value === null) return '—';
-        $abs = abs((float) $value);
-        if ($abs >= 1_000_000_000) return $symbol . number_format($value / 1_000_000_000, 2) . 'B';
-        if ($abs >= 1_000_000)     return $symbol . number_format($value / 1_000_000, 2) . 'M';
-        if ($abs >= 1_000)         return $symbol . number_format($value / 1_000, 2) . 'K';
-        return $symbol . number_format($value, 2);
+        if ($value === null) {
+            return '—';
+        }
+
+        $sign = $value > 0 ? '+' : ($value < 0 ? '-' : '');
+        $abs  = abs($value);
+
+        return $sign . $symbol . number_format($abs, 2, '.', ',');
     }
 
     /**
@@ -53,32 +47,16 @@ class FormatHelper
      *
      * @param  float|null  $value
      * @return string
-     *
-     * @example
-     * {{ \App\Helpers\FormatHelper::percent($ticker->day_change_pct) }}
      */
     public static function percent(?float $value): string
     {
-        if ($value === null) return '—';
-        $sign = $value >= 0 ? '+' : '';
-        return $sign . number_format($value, 2) . '%';
-    }
+        if ($value === null) {
+            return '—';
+        }
 
-    /**
-     * Signed currency change with prefix, e.g., +$1.23 / -$0.98.
-     *
-     * @param  float|null  $value
-     * @param  string      $symbol
-     * @return string
-     *
-     * @example
-     * {{ \App\Helpers\FormatHelper::signedCurrencyChange($ticker->day_change_abs) }}
-     */
-    public static function signedCurrencyChange(?float $value, string $symbol = '$'): string
-    {
-        if ($value === null) return '—';
-        $sign = $value >= 0 ? '+' : '-';
-        return $sign . $symbol . number_format(abs($value), 2);
+        $sign = $value >= 0 ? '+' : '';
+
+        return $sign . number_format($value, 2) . '%';
     }
 
     /**
@@ -86,36 +64,93 @@ class FormatHelper
      *
      * @param  float|int|null  $value
      * @return string
-     *
-     * @example
-     * {{ \App\Helpers\FormatHelper::humanVolume($ticker->volume_latest) }}
      */
     public static function humanVolume($value): string
     {
-        if ($value === null) return '—';
-        $value = (float) $value;
-        if ($value >= 1_000_000_000) return number_format($value / 1_000_000_000, 1) . 'B';
-        if ($value >= 1_000_000)     return number_format($value / 1_000_000, 1) . 'M';
-        if ($value >= 1_000)         return number_format($value / 1_000, 1) . 'K';
-        return number_format($value, 0);
+        if ($value === null) {
+            return '—';
+        }
+
+        if ($value >= 1_000_000_000_000) {
+            return number_format($value / 1_000_000_000_000, 1) . 'T';
+        }
+
+        if ($value >= 1_000_000_000) {
+            return number_format($value / 1_000_000_000, 1) . 'B';
+        }
+
+        if ($value >= 1_000_000) {
+            return number_format($value / 1_000_000, 1) . 'M';
+        }
+
+        if ($value >= 1_000) {
+            return number_format($value / 1_000, 1) . 'K';
+        }
+
+        return (string) $value;
     }
 
     /**
-     * Generic compact number, e.g., 217700000 -> "217.7M".
+     * Compact big currency values like 8_170_000_000 -> "$8.17B".
+     *
+     * @param  float|int|null  $value
+     * @param  string          $symbol
+     * @return string
+     */
+    public static function compactCurrency($value, string $symbol = '$'): string
+    {
+        if ($value === null) {
+            return '—';
+        }
+
+        if ($value >= 1_000_000_000_000) {
+            return $symbol . number_format($value / 1_000_000_000_000, 2) . 'T';
+        }
+        
+
+        if ($value >= 1_000_000_000) {
+            return $symbol . number_format($value / 1_000_000_000, 2) . 'B';
+        }
+
+        if ($value >= 1_000_000) {
+            return $symbol . number_format($value / 1_000_000, 2) . 'M';
+        }
+
+        if ($value >= 1_000) {
+            return $symbol . number_format($value / 1_000, 2) . 'K';
+        }
+
+        return $symbol . number_format($value, 0);
+    }
+
+    /**
+     * Compact pure numbers like 217_700_000 -> "217.7M".
      *
      * @param  float|int|null  $value
      * @return string
-     *
-     * @example
-     * {{ \App\Helpers\FormatHelper::compactNumber($overview->shares_outstanding) }}
      */
     public static function compactNumber($value): string
     {
-        if ($value === null) return '—';
-        $value = (float) $value;
-        if ($value >= 1_000_000_000) return number_format($value / 1_000_000_000, 1) . 'B';
-        if ($value >= 1_000_000)     return number_format($value / 1_000_000, 1) . 'M';
-        if ($value >= 1_000)         return number_format($value / 1_000, 1) . 'K';
+        if ($value === null) {
+            return '—';
+        }
+
+        if ($value >= 1_000_000_000_000) {
+            return number_format($value / 1_000_000_000_000, 1) . 'T';
+        }
+
+        if ($value >= 1_000_000_000) {
+            return number_format($value / 1_000_000_000, 1) . 'B';
+        }
+
+        if ($value >= 1_000_000) {
+            return number_format($value / 1_000_000, 1) . 'M';
+        }
+
+        if ($value >= 1_000) {
+            return number_format($value / 1_000, 1) . 'K';
+        }
+
         return number_format($value, 0);
     }
 }

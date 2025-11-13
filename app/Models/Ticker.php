@@ -19,17 +19,22 @@ use Illuminate\Support\Str;
  *  - Relationships to market data (prices, indicators, fundamentals, news, analysis)
  *  - Formatting helpers (percent change, market cap, currency)
  *  - Chart helpers for building series and down-sampling large ranges
- *  - Daily header stats accessors (open, high, low, prevClose, volume, 52-wk range, etc.)
+ *  - Daily/header stats accessors (open, high, low, prevClose, volume, 52-wk range, etc.)
+ *  - Market session helpers (regular vs. extended) for header labels
  * -----------------------------------------------------------------------------
  */
 class Ticker extends Model
 {
     use HasFactory;
 
-    /** Table */
+    /** @var string */
     protected $table = 'tickers';
 
-    /** Mass assignable attributes */
+    /**
+     * Mass assignable attributes.
+     *
+     * @var array<int, string>
+     */
     protected $fillable = [
         // --- Core fields from Polygon.io /v3/reference/tickers ---
         'ticker',
@@ -69,7 +74,11 @@ class Ticker extends Model
         'address_json',
     ];
 
-    /** Casts for clean data types */
+    /**
+     * Attribute casting.
+     *
+     * @var array<string, string>
+     */
     protected $casts = [
         'active'                         => 'boolean',
         'raw'                            => 'array',
@@ -83,20 +92,52 @@ class Ticker extends Model
         'address_json'                   => 'array',
     ];
 
+    /** @var bool */
     public $timestamps = true;
 
     /* ----------------------------------------------------------------------
      | Relationships
      | ---------------------------------------------------------------------- */
 
-    public function overviews()      { return $this->hasMany(TickerOverview::class, 'ticker_id'); }
-    public function overview()       { return $this->hasOne(TickerOverview::class, 'ticker_id')->latestOfMany(); }
-    public function fundamentals()   { return $this->hasMany(TickerFundamental::class, 'ticker_id'); }
-    public function priceHistories() { return $this->hasMany(TickerPriceHistory::class, 'ticker_id'); }
-    public function indicators()     { return $this->hasMany(TickerIndicator::class, 'ticker_id'); }
-    public function analyses()       { return $this->hasMany(TickerAnalysis::class, 'ticker', 'ticker'); }
-    public function analysis()       { return $this->hasOne(TickerAnalysis::class, 'ticker', 'ticker')->latestOfMany(); }
-    public function newsItems()      { return $this->hasMany(TickerNewsItem::class, 'ticker_id'); }
+    public function overviews()
+    {
+        return $this->hasMany(TickerOverview::class, 'ticker_id');
+    }
+
+    public function overview()
+    {
+        return $this->hasOne(TickerOverview::class, 'ticker_id')->latestOfMany();
+    }
+
+    public function fundamentals()
+    {
+        return $this->hasMany(TickerFundamental::class, 'ticker_id');
+    }
+
+    public function priceHistories()
+    {
+        return $this->hasMany(TickerPriceHistory::class, 'ticker_id');
+    }
+
+    public function indicators()
+    {
+        return $this->hasMany(TickerIndicator::class, 'ticker_id');
+    }
+
+    public function analyses()
+    {
+        return $this->hasMany(TickerAnalysis::class, 'ticker', 'ticker');
+    }
+
+    public function analysis()
+    {
+        return $this->hasOne(TickerAnalysis::class, 'ticker', 'ticker')->latestOfMany();
+    }
+
+    public function newsItems()
+    {
+        return $this->hasMany(TickerNewsItem::class, 'ticker_id');
+    }
 
     /* ----------------------------------------------------------------------
      | Derived Accessors & Helpers (display)
@@ -128,9 +169,13 @@ class Ticker extends Model
     public function getLocationAttribute(): ?string
     {
         $a = $this->address_json;
-        if (!$a || !is_array($a)) return null;
+        if (! $a || ! is_array($a)) {
+            return null;
+        }
+
         $city  = $a['city']  ?? null;
         $state = $a['state'] ?? null;
+
         return $city && $state ? "{$city}, {$state}" : ($city ?? $state ?? null);
     }
 
@@ -175,7 +220,8 @@ class Ticker extends Model
             ->limit(2)
             ->get();
 
-        return $rows->get(1); // index 1 == previous
+        // index 0 == latest, 1 == previous
+        return $rows->get(1);
     }
 
     /**
@@ -204,13 +250,19 @@ class Ticker extends Model
     public function getLogoUrlAttribute(): ?string
     {
         $url = $this->branding_logo_url;
-        if (!$url) return null;
+        if (! $url) {
+            return null;
+        }
 
-        if (str_contains($url, 'apiKey=')) return $url;
+        if (str_contains($url, 'apiKey=')) {
+            return $url;
+        }
 
         if (app()->environment('local') && Config::get('services.polygon.key')) {
-            $url .= (str_contains($url, '?') ? '&' : '?') . 'apiKey=' . Config::get('services.polygon.key');
+            $url .= (str_contains($url, '?') ? '&' : '?')
+                . 'apiKey=' . Config::get('services.polygon.key');
         }
+
         return $url;
     }
 
@@ -227,13 +279,19 @@ class Ticker extends Model
     public function getIconUrlAttribute(): ?string
     {
         $url = $this->branding_icon_url;
-        if (!$url) return null;
+        if (! $url) {
+            return null;
+        }
 
-        if (str_contains($url, 'apiKey=')) return $url;
+        if (str_contains($url, 'apiKey=')) {
+            return $url;
+        }
 
         if (app()->environment('local') && Config::get('services.polygon.key')) {
-            $url .= (str_contains($url, '?') ? '&' : '?') . 'apiKey=' . Config::get('services.polygon.key');
+            $url .= (str_contains($url, '?') ? '&' : '?')
+                . 'apiKey=' . Config::get('services.polygon.key');
         }
+
         return $url;
     }
 
@@ -244,13 +302,18 @@ class Ticker extends Model
      * @return string|null
      *
      * @example
-     * <h1 class="text-xl font-semibold">{{ $ticker->clean_base_name ?? $ticker->name }}</h1>
+     * <h1 class="text-xl font-semibold">
+     *   {{ $ticker->clean_base_name ?? $ticker->name }}
+     * </h1>
      */
     public function getCleanBaseNameAttribute(): ?string
     {
         $name = trim($this->name ?? '');
-        if ($name === '') return null;
+        if ($name === '') {
+            return null;
+        }
 
+        // Remove known suffixes but leave identifiers like "Series F" or "Class A"
         $patterns = [
             '/\b(common|ordinary)\s+stock\b/i',
             '/\b(preferred|redeemable|depositary|depository)\s+shares?\b/i',
@@ -267,6 +330,8 @@ class Ticker extends Model
         $cleaned = preg_replace('/\s{2,}/', ' ', $cleaned);
         $cleaned = trim($cleaned, " \t\n\r\0\x0B-");
         $cleaned = preg_replace('/[,\.\-]+$/', '', $cleaned);
+
+        // Normalize punctuation spacing and capitalization
         $cleaned = preg_replace('/\s*,\s*/', ', ', $cleaned);
         $cleaned = preg_replace('/\s*\.\s*/', '. ', $cleaned);
         $cleaned = preg_replace('/\s{2,}/', ' ', $cleaned);
@@ -280,34 +345,47 @@ class Ticker extends Model
      * @return string|null
      *
      * @example
-     * <h1 class="text-xl font-semibold">{{ $ticker->clean_display_name ?? $ticker->name }}</h1>
+     * <h1 class="text-xl font-semibold">
+     *   {{ $ticker->clean_display_name ?? $ticker->name }}
+     * </h1>
      */
     public function getCleanDisplayNameAttribute(): ?string
     {
         $name = trim($this->name ?? '');
-        if ($name === '') return null;
+        if ($name === '') {
+            return null;
+        }
 
         $base = $this->clean_base_name ?? $name;
 
+        // Attempt to extract unique identifiers (Series, Class, etc.)
         $matches = [];
         preg_match('/(Series\s+[A-Z0-9]+|Class\s+[A-Z0-9]+)/i', $name, $matches);
         $suffix = $matches[1] ?? null;
 
+        // Detect preferred or warrant instruments
         $isPreferred  = stripos($name, 'preferred') !== false;
         $isWarrant    = stripos($name, 'warrant') !== false;
         $isDepositary = stripos($name, 'depositary') !== false;
 
         $descriptor = '';
-        if     ($isPreferred)  $descriptor = 'Preferred';
-        elseif ($isWarrant)    $descriptor = 'Warrant';
-        elseif ($isDepositary) $descriptor = 'Depositary Shares';
+        if ($isPreferred) {
+            $descriptor = 'Preferred';
+        } elseif ($isWarrant) {
+            $descriptor = 'Warrant';
+        } elseif ($isDepositary) {
+            $descriptor = 'Depositary Shares';
+        }
 
+        // Compose readable short display version
         $display = $base;
         if ($suffix || $descriptor) {
             $display .= ' – ' . trim(($suffix ?? '') . ' ' . ($descriptor ?? ''));
         }
 
+        // Clean up double spaces and punctuation
         $display = preg_replace('/\s{2,}/', ' ', $display);
+
         return trim($display, " \t\n\r\0\x0B-");
     }
 
@@ -321,63 +399,82 @@ class Ticker extends Model
      * @return string|null
      *
      * @example
-     * <span class="text-slate-400">{{ $ticker->exchange_name ?? $ticker->primary_exchange }}</span>
+     * <span class="text-slate-400">
+     *   {{ $ticker->exchange_name ?? $ticker->primary_exchange }}
+     * </span>
      */
     public function getExchangeNameAttribute(): ?string
     {
         $code = strtoupper(trim($this->primary_exchange ?? ''));
-        if ($code === '') return null;
+        if ($code === '') {
+            return null;
+        }
 
         $map = [
-            // 🇺🇸 U.S.
-            'XNYS' => 'New York Stock Exchange',
-            'XNAS' => 'NASDAQ Stock Market',
-            'XASE' => 'NYSE American',
-            'ARCX' => 'NYSE Arca',
-            'BATS' => 'Cboe BZX Exchange',
-            'OTC' => 'OTC Markets',
+            // 🇺🇸 U.S. Exchanges
+            'XNYS'     => 'New York Stock Exchange',
+            'XNAS'     => 'NASDAQ Stock Market',
+            'XASE'     => 'NYSE American',
+            'ARCX'     => 'NYSE Arca',
+            'BATS'     => 'Cboe BZX Exchange',
+            'OTC'      => 'OTC Markets',
             'OTC LINK' => 'OTC Markets',
-            'OTCM' => 'OTC Markets',
-            'OTCBB' => 'OTC Bulletin Board',
-            // 🇨🇦
-            'XTSE' => 'Toronto Stock Exchange',
-            'XTSX' => 'TSX Venture Exchange',
-            'CSE'  => 'Canadian Securities Exchange',
-            // 🇬🇧 / 🇪🇺
-            'XLON' => 'London Stock Exchange',
-            'IOB'  => 'LSE – International Order Book',
-            'XETR' => 'Deutsche Börse',
-            'XFRA' => 'Frankfurt Stock Exchange',
-            'XBER' => 'Berlin Stock Exchange',
-            'XMUN' => 'Munich Stock Exchange',
-            'XPAR' => 'Euronext Paris',
-            // 🇯🇵
-            'XTKS' => 'Tokyo Stock Exchange',
-            'XJAS' => 'JASDAQ',
-            // 🇭🇰
-            'XHKG' => 'Hong Kong Stock Exchange',
-            // 🇮🇳
-            'XBOM' => 'Bombay Stock Exchange',
-            'XNSE' => 'National Stock Exchange of India',
-            // 🇦🇺
-            'XASX' => 'Australian Securities Exchange',
-            // 🇨🇭
-            'XSWX' => 'SIX Swiss Exchange',
-            // 🇸🇬
-            'XSES' => 'Singapore Exchange',
-            // 🇨🇳
-            'XSHG' => 'Shanghai Stock Exchange',
-            'XSHE' => 'Shenzhen Stock Exchange',
-            // 🇰🇷
-            'XKRX' => 'Korea Exchange',
-            // 🇧🇷
-            'BVMF' => 'B3 – Brasil Bolsa Balcão',
-            // 🇮🇹
-            'XMIL' => 'Borsa Italiana',
+            'OTCM'     => 'OTC Markets',
+            'OTCBB'    => 'OTC Bulletin Board',
+
+            // 🇨🇦 Canada
+            'XTSE'     => 'Toronto Stock Exchange',
+            'XTSX'     => 'TSX Venture Exchange',
+            'CSE'      => 'Canadian Securities Exchange',
+
+            // 🇬🇧 United Kingdom / 🇪🇺 Europe
+            'XLON'     => 'London Stock Exchange',
+            'IOB'      => 'LSE – International Order Book',
+            'XETR'     => 'Deutsche Börse (XETRA)',
+            'XFRA'     => 'Frankfurt Stock Exchange',
+            'XBER'     => 'Berlin Stock Exchange',
+            'XMUN'     => 'Munich Stock Exchange',
+            'XPAR'     => 'Euronext Paris',
+
+            // 🇯🇵 Japan
+            'XTKS'     => 'Tokyo Stock Exchange',
+            'XJAS'     => 'JASDAQ',
+
+            // 🇭🇰 Hong Kong
+            'XHKG'     => 'Hong Kong Stock Exchange',
+
+            // 🇮🇳 India
+            'XBOM'     => 'Bombay Stock Exchange',
+            'XNSE'     => 'National Stock Exchange of India',
+
+            // 🇦🇺 Australia
+            'XASX'     => 'Australian Securities Exchange',
+
+            // 🇨🇭 Switzerland
+            'XSWX'     => 'SIX Swiss Exchange',
+
+            // 🇸🇬 Singapore
+            'XSES'     => 'Singapore Exchange',
+
+            // 🇨🇳 China
+            'XSHG'     => 'Shanghai Stock Exchange',
+            'XSHE'     => 'Shenzhen Stock Exchange',
+
+            // 🇰🇷 South Korea
+            'XKRX'     => 'Korea Exchange',
+
+            // 🇧🇷 Brazil
+            'BVMF'     => 'B3 – Brasil Bolsa Balcão',
+
+            // 🇮🇹 Italy
+            'XMIL'     => 'Borsa Italiana',
         ];
 
         $normalized = preg_replace('/[^A-Z0-9 ]/', '', $code);
-        return $map[$normalized] ?? $map[str_replace(['.', '-', '_'], '', $normalized)] ?? $code;
+
+        return $map[$normalized]
+            ?? $map[str_replace(['.', '-', '_'], '', $normalized)]
+            ?? $code;
     }
 
     /**
@@ -391,28 +488,38 @@ class Ticker extends Model
     public function getExchangeShortAttribute(): ?string
     {
         $code = strtoupper(trim($this->primary_exchange ?? ''));
-        if ($code === '') return null;
+        if ($code === '') {
+            return null;
+        }
 
         $map = [
-            'XNYS' => 'NYSE',
-            'XNAS' => 'NASDAQ',
-            'XASE' => 'AMEX',
-            'ARCX' => 'ARCA',
-            'BATS' => 'CBOE',
-            'OTC'  => 'OTC',
+            'XNYS'     => 'NYSE',
+            'XNAS'     => 'NASDAQ',
+            'XASE'     => 'AMEX',
+            'ARCX'     => 'ARCA',
+            'BATS'     => 'CBOE',
+            'OTC'      => 'OTC',
             'OTC LINK' => 'OTC',
+
+            // Canada
             'XTSE' => 'TSX',
             'XTSX' => 'TSXV',
             'CSE'  => 'CSE',
+
+            // UK / EU
             'XLON' => 'LSE',
             'XETR' => 'XETRA',
             'XFRA' => 'FWB',
             'XPAR' => 'EURONEXT',
+
+            // Asia-Pacific
             'XTKS' => 'TSE',
             'XHKG' => 'HKEX',
             'XASX' => 'ASX',
             'XNSE' => 'NSE',
             'XBOM' => 'BSE',
+
+            // Other
             'XSWX' => 'SIX',
             'XSES' => 'SGX',
             'XSHG' => 'SSE',
@@ -423,22 +530,27 @@ class Ticker extends Model
         ];
 
         $normalized = preg_replace('/[^A-Z0-9 ]/', '', $code);
-        return $map[$normalized] ?? $map[str_replace(['.', '-', '_'], '', $normalized)] ?? $code;
+
+        return $map[$normalized]
+            ?? $map[str_replace(['.', '-', '_'], '', $normalized)]
+            ?? $code;
     }
 
     /**
-     * Flag indicating a U.S. exchange.
+     * Flag indicating whether this is a U.S. exchange.
      *
      * @return bool
      *
      * @example
-     * @if($ticker->is_us_exchange)
+     * @if ($ticker->is_us_exchange)
      *   <span class="badge badge-success">US</span>
      * @endif
      */
     public function getIsUsExchangeAttribute(): bool
     {
-        return in_array($this->exchange_short, ['NYSE','NASDAQ','AMEX','ARCA','CBOE','OTC'], true);
+        return in_array($this->exchange_short, [
+            'NYSE', 'NASDAQ', 'AMEX', 'ARCA', 'CBOE', 'OTC',
+        ], true);
     }
 
     /* ----------------------------------------------------------------------
@@ -446,7 +558,7 @@ class Ticker extends Model
      | ---------------------------------------------------------------------- */
 
     /**
-     * Today's Open price (from the latest daily row's "o").
+     * Today's open price (from latest row's "o").
      *
      * @return float|null
      *
@@ -459,7 +571,7 @@ class Ticker extends Model
     }
 
     /**
-     * Today's High price (from the latest daily row's "h").
+     * Today's high price (from latest row's "h").
      *
      * @return float|null
      *
@@ -472,7 +584,7 @@ class Ticker extends Model
     }
 
     /**
-     * Today's Low price (from the latest daily row's "l").
+     * Today's low price (from latest row's "l").
      *
      * @return float|null
      *
@@ -485,7 +597,7 @@ class Ticker extends Model
     }
 
     /**
-     * Previous Close (yesterday's "c"), used for day change.
+     * Previous close (yesterday's "c"), used for day change.
      *
      * @return float|null
      *
@@ -498,7 +610,7 @@ class Ticker extends Model
     }
 
     /**
-     * Latest Close (today's "c").
+     * Latest close (today's "c").
      *
      * @return float|null
      *
@@ -513,7 +625,7 @@ class Ticker extends Model
     }
 
     /**
-     * Day change absolute (lastClose - prevClose).
+     * Day change absolute (last_close - prev_close).
      *
      * @return float|null
      *
@@ -524,17 +636,21 @@ class Ticker extends Model
     {
         $last = $this->last_close;
         $prev = $this->prev_close;
-        if ($last === null || $prev === null) return null;
+
+        if ($last === null || $prev === null) {
+            return null;
+        }
+
         return $last - $prev;
     }
 
     /**
-     * Day change percent vs previous close.
+     * Day change percent vs. previous close.
      *
      * @return float|null
      *
      * @example
-     * <span class="{{ $ticker->day_change_pct >= 0 ? 'text-emerald-500' : 'text-rose-500' }}">
+     * <span class="{{ ($ticker->day_change_pct ?? 0) >= 0 ? 'text-emerald-500' : 'text-rose-500' }}">
      *   {{ \App\Helpers\FormatHelper::percent($ticker->day_change_pct) }}
      * </span>
      */
@@ -542,7 +658,11 @@ class Ticker extends Model
     {
         $last = $this->last_close;
         $prev = $this->prev_close;
-        if ($last === null || $prev === null || $prev == 0.0) return null;
+
+        if ($last === null || $prev === null || $prev == 0.0) {
+            return null;
+        }
+
         return (($last - $prev) / $prev) * 100;
     }
 
@@ -557,13 +677,13 @@ class Ticker extends Model
     public function getVolumeLatestAttribute(): ?int
     {
         $v = $this->priceHistories()->latest('t')->value('v');
+
         return $v !== null ? (int) $v : null;
     }
 
     /**
-     * Average daily volume over N trading days (default 30).
+     * Average daily volume over the last 30 trading days.
      *
-     * @param  int  $days
      * @return float|null
      *
      * @example
@@ -588,12 +708,15 @@ class Ticker extends Model
             ->limit($days)
             ->pluck('v');
 
-        if ($rows->count() === 0) return null;
+        if ($rows->count() === 0) {
+            return null;
+        }
+
         return (float) ($rows->sum() / $rows->count());
     }
 
     /**
-     * 52-week high (max 'h' in the last ~252 trading days).
+     * 52-week high (max "h" over last ~252 trading days).
      *
      * @return float|null
      *
@@ -609,7 +732,7 @@ class Ticker extends Model
     }
 
     /**
-     * 52-week low (min 'l' in the last ~252 trading days).
+     * 52-week low (min "l" over last ~252 trading days).
      *
      * @return float|null
      *
@@ -622,6 +745,93 @@ class Ticker extends Model
             ->orderBy('t', 'desc')
             ->limit(252)
             ->min('l');
+    }
+
+    /* ----------------------------------------------------------------------
+     | Market Session Helpers (Option C)
+     | ----------------------------------------------------------------------
+     | Regular session: used for “At close” label.
+     | Extended session: used for “After hours / Pre-market” label.
+     | For now we synthesize extended timestamp as “close + 3h” so the UI
+     | wiring is ready; later you can plug in true intraday feeds.
+     | ---------------------------------------------------------------------- */
+
+    /**
+     * Get the timezone used for U.S. market session labels.
+     *
+     * @return \DateTimeZone
+     */
+    protected function marketTimezone(): \DateTimeZone
+    {
+        // You can later make this exchange-specific if you support
+        // non-US exchanges with local session times.
+        return new \DateTimeZone('America/New_York');
+    }
+
+    /**
+     * Return structured info for the regular session close time.
+     *
+     * @return array<string, mixed>|null
+     *
+     * @example
+     * @php($regular = $ticker->regularSessionStats())
+     * <span class="text-xs text-slate-500">
+     *   {{ $regular['label'] ?? 'At close: —' }}
+     * </span>
+     */
+    public function regularSessionStats(): ?array
+    {
+        $latest = $this->latestPrice();
+        if (! $latest || ! $latest->t) {
+            return null;
+        }
+
+        $dt = Carbon::parse($latest->t)->setTimezone($this->marketTimezone());
+
+        return [
+            'timestamp' => $dt,
+            'label'     => sprintf(
+                'At close: %s',
+                $dt->format('M j, g:i:s A T')
+            ),
+        ];
+    }
+
+    /**
+     * Return structured info for an extended session snapshot.
+     *
+     * For now we synthesize a plausible timestamp (“close + 3h”) so the UI
+     * can be wired in; when you have real pre-market/after-hours prices,
+     * you can source both price & timestamp from those feeds.
+     *
+     * @return array<string, mixed>|null
+     *
+     * @example
+     * @php($extended = $ticker->extendedSessionStats())
+     * @if($extended)
+     *   <span class="text-xs text-slate-500">
+     *     {{ $extended['label'] }}
+     *   </span>
+     * @endif
+     */
+    public function extendedSessionStats(): ?array
+    {
+        $latest = $this->latestPrice();
+        if (! $latest || ! $latest->t) {
+            return null;
+        }
+
+        $dt = Carbon::parse($latest->t)
+            ->setTimezone($this->marketTimezone())
+            ->addHours(3); // synthetic placeholder
+
+        return [
+            'timestamp' => $dt,
+            'label'     => sprintf(
+                'After hours: %s',
+                $dt->format('M j, g:i:s A T')
+            ),
+        ];
     }
 
     /* ----------------------------------------------------------------------
@@ -640,12 +850,16 @@ class Ticker extends Model
     public function percentChange(int $days): ?float
     {
         $latest = $this->latestPrice()?->c;
+
         $past = $this->priceHistories()
             ->where('t', '<=', now()->subDays($days))
             ->orderByDesc('t')
             ->value('c');
 
-        if ($latest === null || $past === null || $past == 0) return null;
+        if ($latest === null || $past === null || $past == 0) {
+            return null;
+        }
+
         return (($latest - $past) / $past) * 100;
     }
 
@@ -660,9 +874,17 @@ class Ticker extends Model
     public function formattedMarketCap(): string
     {
         $value = $this->overview?->market_cap ?? null;
-        if ($value === null) return '—';
-        if ($value >= 1_000_000_000) return '$' . number_format($value / 1_000_000_000, 2) . ' B';
-        if ($value >= 1_000_000)     return '$' . number_format($value / 1_000_000, 2) . ' M';
+
+        if ($value === null) {
+            return '—';
+        }
+        if ($value >= 1_000_000_000) {
+            return '$' . number_format($value / 1_000_000_000, 2) . ' B';
+        }
+        if ($value >= 1_000_000) {
+            return '$' . number_format($value / 1_000_000, 2) . ' M';
+        }
+
         return '$' . number_format($value, 0);
     }
 
@@ -677,13 +899,17 @@ class Ticker extends Model
      */
     public function formatCurrency(?float $value): string
     {
-        if ($value === null) return '—';
+        if ($value === null) {
+            return '—';
+        }
+
         $symbol = $this->currency_symbol ?: '$';
+
         return $symbol . number_format($value, 2);
     }
 
     /**
-     * Compact metrics summary (useful for cards).
+     * Compact metrics summary (useful for JSON cards, debugging, etc.).
      *
      * @return array<string, mixed>
      *
@@ -705,17 +931,21 @@ class Ticker extends Model
 
     /* ----------------------------------------------------------------------
      | Chart Helpers (aggregation + down-sampling)
-     | ----------------------------------------------------------------------
-     | We centralize series building here so controllers/blades stay thin.
-     | Returned data is light and ready for JSON to feed ApexCharts.
-     */
+     | ---------------------------------------------------------------------- */
 
     /**
      * Get daily OHLCV between $start and $end (inclusive), ascending by time.
      *
      * @param  \DateTimeInterface|string|null  $start
      * @param  \DateTimeInterface|string|null  $end
-     * @return \Illuminate\Support\Collection<int, array{t:string,o:?float,h:?float,l:?float,c:?float,v:?int}>
+     * @return \Illuminate\Support\Collection<int, array{
+     *     t:string,
+     *     o:?float,
+     *     h:?float,
+     *     l:?float,
+     *     c:?float,
+     *     v:?int
+     * }>
      */
     public function ohlcvBetween($start, $end = null)
     {
@@ -723,13 +953,19 @@ class Ticker extends Model
         $end   = $end   ? Carbon::parse($end)   : null;
 
         $q = $this->priceHistories()->where('resolution', '1d');
-        if ($start) $q->where('t', '>=', $start);
-        if ($end)   $q->where('t', '<=', $end);
+
+        if ($start) {
+            $q->where('t', '>=', $start);
+        }
+        if ($end) {
+            $q->where('t', '<=', $end);
+        }
 
         return $q->orderBy('t', 'asc')
             ->get(['t', 'o', 'h', 'l', 'c', 'v'])
             ->map(function ($row) {
                 $date = Carbon::parse($row->t)->toDateString(); // YYYY-MM-DD
+
                 return [
                     't' => $date,
                     'o' => $row->o !== null ? (float) $row->o : null,
@@ -760,6 +996,7 @@ class Ticker extends Model
         $step = max(1, (int) round($stepDays));
 
         $out = collect();
+
         foreach ($series->values() as $i => $row) {
             if ($i === 0 || $i % $step === 0 || $i === $count - 1) {
                 $out->push($row);
@@ -774,7 +1011,10 @@ class Ticker extends Model
      *
      * @param  string  $range
      * @param  bool    $favorSparseForLargeRanges
-     * @return array{points: array<int, array{x:string,y:?float}>, meta: array<string, mixed>}
+     * @return array{
+     *     points: array<int, array{x:string,y:?float}>,
+     *     meta: array<string, mixed>
+     * }
      *
      * @example
      * {{-- Controller already prepares $chartSeries[...] --}}
@@ -782,43 +1022,50 @@ class Ticker extends Model
      */
     public function buildPriceSeriesForRange(string $range, bool $favorSparseForLargeRanges = true): array
     {
-        $now = Carbon::now();
-        $start = null;
+        $now      = Carbon::now();
+        $start    = null;
         $stepDays = 1;
 
         switch (strtoupper($range)) {
             case '1D':
-                $start = $now->copy()->subDays(1);
+                $start    = $now->copy()->subDays(1);
                 $stepDays = 1;
                 break;
+
             case '5D':
             case '1W':
-                $start = $now->copy()->subDays(7);
+                $start    = $now->copy()->subDays(7);
                 $stepDays = 1;
                 break;
+
             case '1M':
-                $start = $now->copy()->subDays(30);
+                $start    = $now->copy()->subDays(30);
                 $stepDays = 1;
                 break;
+
             case '6M':
-                $start = $now->copy()->subMonthsNoOverflow(6);
+                $start    = $now->copy()->subMonthsNoOverflow(6);
                 $stepDays = 1;
                 break;
+
             case 'YTD':
-                $start = Carbon::create($now->year, 1, 1, 0, 0, 0);
+                $start    = Carbon::create($now->year, 1, 1, 0, 0, 0);
                 $stepDays = $favorSparseForLargeRanges ? 3 : 1;
                 break;
+
             case '1Y':
-                $start = $now->copy()->subYear();
+                $start    = $now->copy()->subYear();
                 $stepDays = $favorSparseForLargeRanges ? 3 : 1;
                 break;
+
             case '5Y':
-                $start = $now->copy()->subYears(5);
+                $start    = $now->copy()->subYears(5);
                 $stepDays = 5;
                 break;
+
             case 'MAX':
             default:
-                $start = null; // all history
+                $start    = null; // all history
                 $stepDays = 7;
                 break;
         }
@@ -843,7 +1090,10 @@ class Ticker extends Model
      | Scopes
      | ---------------------------------------------------------------------- */
 
-    public function scopeActive($query) { return $query->where('active', true); }
+    public function scopeActive($query)
+    {
+        return $query->where('active', true);
+    }
 
     public function scopeBySymbol($query, string $symbol)
     {
