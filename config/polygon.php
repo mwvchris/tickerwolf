@@ -7,22 +7,22 @@ return [
     | Polygon REST API Configuration
     |--------------------------------------------------------------------------
     |
-    | Core Polygon.io credentials and endpoints for all upstream data requests.
-    | These values are pulled from your .env file.
+    | Core Polygon.io REST endpoints and credentials for all upstream data
+    | requests. Values are sourced directly from your .env file.
     |
     */
 
-    'rest_api_key'       => env('POLYGON_API_KEY'),
-    'rest_api_endpoint'  => env('POLYGON_API_ENDPOINT', 'https://api.polygon.io'),
+    'rest_api_key'      => env('POLYGON_API_KEY'),
+    'rest_api_endpoint' => env('POLYGON_API_ENDPOINT', 'https://api.polygon.io'),
 
     /*
     |--------------------------------------------------------------------------
     | Polygon Amazon S3 Flatfile Configuration
     |--------------------------------------------------------------------------
     |
-    | Used for paid accounts that have access to bulk flatfile downloads.
-    | These values specify the AWS S3 credentials and endpoints required
-    | for historical data synchronization.
+    | These settings apply only to Polygon paid tiers that support bulk S3
+    | flatfile downloads. If enabled, they allow accelerated ingestion of
+    | historical OHLCV and reference datasets.
     |
     */
 
@@ -38,13 +38,9 @@ return [
     | Default Price History Ingestion Parameters
     |--------------------------------------------------------------------------
     |
-    | These values define the baseline date range and resolution used for
-    | both initial ingestion and automated re-ingest operations triggered
-    | by the integrity validation command.
-    |
-    | The integrity scan command (v2.6.1+) references these values to ensure
-    | all historical price data stays consistent and aligned across both
-    | ingestion and remediation workflows.
+    | These values serve as defaults for daily OHLCV ingestion via the
+    | polygon:ticker-price-histories:ingest command. They also support
+    | remediation jobs such as integrity scans and backfills.
     |
     | Corresponding .env variables:
     |   POLYGON_PRICE_HISTORY_MIN_DATE=2020-01-01
@@ -53,30 +49,82 @@ return [
     |
     */
 
-    // Minimum date boundary for ingestion (baseline dataset start)
     'price_history_min_date' => env('POLYGON_PRICE_HISTORY_MIN_DATE', '2020-01-01'),
 
-    // Default time aggregation unit ("day", "minute", etc.)
+    // “day”, “minute”, “hour”
     'default_timespan' => env('POLYGON_DEFAULT_TIMESPAN', 'day'),
 
-    // Default multiplier (1 = 1/day, 5 = 5/day for custom aggregates)
+    // 1 = 1/day, 5 = 5/day, etc.
     'default_multiplier' => env('POLYGON_DEFAULT_MULTIPLIER', 1),
 
-    // Maximum allowed date (typically "today", but can be pinned for testing)
+    // Useful for testing or pinning to a specific date
     'price_history_max_date' => env('POLYGON_PRICE_HISTORY_MAX_DATE', now()->toDateString()),
+
+    /*
+    |--------------------------------------------------------------------------
+    | Intraday (1-Minute) Real-Time / Delayed Price Configuration
+    |--------------------------------------------------------------------------
+    |
+    | These settings support the new intraday price subsystem built around:
+    |   • PolygonRealtimePriceService
+    |   • polygon:intraday-prices:prefetch scheduler
+    |
+    | The goal is to maintain a warm Redis cache of 1-minute price snapshots
+    | with minimal API load and to serve fast, near-real-time prices across
+    | the entire TickerWolf UI.
+    |
+    | Your current Polygon tier provides 15-minute delayed intraday data.
+    | These configuration values abstract this away so the service layer can
+    | handle it automatically.
+    |
+    | Corresponding .env overrides:
+    |   POLYGON_INTRADAY_TIMESPAN=minute
+    |   POLYGON_INTRADAY_MULTIPLIER=1
+    |   POLYGON_INTRADAY_CACHE_TTL=900
+    |   POLYGON_INTRADAY_REDIS_PREFIX=intraday
+    |   POLYGON_INTRADAY_DELAY_MINUTES=15
+    |   POLYGON_INTRADAY_MAX_AGE_MINUTES=1440
+    |   POLYGON_MARKET_TIMEZONE=America/New_York
+    |
+    */
+
+    // Polygon aggregate resolution for intraday
+    'intraday_timespan'   => env('POLYGON_INTRADAY_TIMESPAN', 'minute'),
+
+    // Almost always “1” for 1-minute bars
+    'intraday_multiplier' => env('POLYGON_INTRADAY_MULTIPLIER', 1),
+
+    // TTL for Redis-cached intraday snapshots (defaults to 15 min)
+    'intraday_cache_ttl'  => env('POLYGON_INTRADAY_CACHE_TTL', 900),
+
+    // Key namespace in Redis: intraday:{TICKER}:{DATE}
+    'intraday_redis_prefix' => env('POLYGON_INTRADAY_REDIS_PREFIX', 'intraday'),
+
+    // Market timezone (used for session classification)
+    'market_timezone' => env('POLYGON_MARKET_TIMEZONE', 'America/New_York'),
+
+    // Your plan includes 15-min delayed data — this handles offsets
+    'intraday_delay_minutes' => env('POLYGON_INTRADAY_DELAY_MINUTES', 15),
+
+    // How far back to request intraday data (in minutes)
+    // Default: 1440 = 24 hours
+    'intraday_max_age_minutes' => env('POLYGON_INTRADAY_MAX_AGE_MINUTES', 1440),
 
     /*
     |--------------------------------------------------------------------------
     | Request and Retry Settings
     |--------------------------------------------------------------------------
     |
-    | Centralized rate-limit handling and retry tuning for ingestion and probe
-    | services. These can later be referenced by PolygonProbe or batch jobs.
+    | Centralized connection + retry tuning for ingestion services.
+    | These govern HTTP client behavior across:
+    |   • PolygonPriceHistoryService
+    |   • PolygonRealtimePriceService
+    |   • Retry middleware
     |
     */
 
-    'request_timeout' => env('POLYGON_REQUEST_TIMEOUT', 10), // seconds
+    'request_timeout' => env('POLYGON_REQUEST_TIMEOUT', 10),
     'max_retries'     => env('POLYGON_MAX_RETRIES', 3),
-    'retry_backoff'   => env('POLYGON_RETRY_BACKOFF', 0.5), // exponential base delay (s)
+    'retry_backoff'   => env('POLYGON_RETRY_BACKOFF', 0.5),
 
 ];

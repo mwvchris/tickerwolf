@@ -44,6 +44,9 @@ class ArtisanServiceProvider extends ServiceProvider
             \App\Console\Commands\ComputeCorrelationMatrix::class,
             \App\Console\Commands\TickersReviewMissingDataCommand::class,
             \App\Console\Commands\Diagnostics\TickersDataAuditCommand::class,
+            \App\Console\Commands\PolygonPrefetchIntradayPrices::class,
+            \App\Console\Commands\TickersPurgeOldIntraday::class,
+            \App\Console\Commands\TickersRefreshAll::class,
         ]);
     }
 }

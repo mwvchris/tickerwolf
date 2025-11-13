@@ -16,7 +16,7 @@ class PolygonTickerOverviewsSchedule
             ->timezone('America/Los_Angeles')
             ->dailyAt('20:00')
             ->withoutOverlapping()
-            ->sendOutputTo(storage_path(env('LOG_POLYGON_TICKER_OVERVIEWS_CRON', 'logs/polygon/ticker_overviews_cron.log')));
+            ->sendOutputTo(storage_path(env('LOG_POLYGON_TICKER_OVERVIEWS_CRON', 'logs/polygon/cron/ticker_overviews_cron.log')));
 
         // Retry any failed tickers afterward (e.g., 8:45 PM PST)
         $schedule->command('polygon:ticker-overviews:retry-failed --clear')

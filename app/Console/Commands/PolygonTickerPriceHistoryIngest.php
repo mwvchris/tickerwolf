@@ -9,33 +9,36 @@ use App\Models\Ticker;
 use App\Jobs\IngestTickerPriceHistoryJob;
 use App\Services\BatchMonitorService;
 use Illuminate\Support\Facades\Schema;
+use Illuminate\Support\Carbon;
 use Throwable;
 
 /**
  * ============================================================================
- *  polygon:ticker-price-histories:ingest  (v2.6.4 — Symbol-Aware Queued Ingest)
+ *  polygon:ticker-price-histories:ingest  
+ *  (v3.0 — Smart Missing-Date Queue Ingest + Symbol-Aware Case Handling)
  * ============================================================================
  *
  * 🔧 Purpose:
- *   Dispatches asynchronous (queued) Polygon.io price-history ingestion jobs
- *   for all tickers or a single ticker specified via --symbol.
- *   Provides resilient batch orchestration with progress tracking,
- *   error logging, and configurable time-range controls.
+ *   Dispatch asynchronous (queued) Polygon.io price-history ingestion jobs
+ *   for all tickers or a specific ticker via --symbol.  
+ *   NOW includes automatic “only ingest missing dates per ticker”.
  *
  * 🧠 Behavior:
  * ----------------------------------------------------------------------------
  *   • Fetches all tickers (or one via --symbol).
- *   • Divides them into job batches and dispatches to the database queue.
- *   • Uses configuration defaults for date range and resolution.
- *   • Optionally throttles between batches to respect rate limits.
- *   • Integrates with BatchMonitorService for centralized tracking.
+ *   • Determines per-ticker start date automatically IF --from is omitted:
+ *         → latest stored 't' for given resolution + 1 day
+ *   • Falls back to polygon.price_history_min_date if no historical price exists.
+ *   • If user passes --from manually, uses that globally exactly as before.
+ *   • Skips tickers whose latest stored date already extends past --to.
+ *   • Dispatches queue jobs in batches with optional throttling.
+ *   • Integrates with BatchMonitorService for tracking.
  *
- * ⚙️ Config Integration:
+ * ⚙️ Config Integration (config/polygon.php):
  * ----------------------------------------------------------------------------
- *   Reads from config/polygon.php:
- *     - price_history_min_date → default historical floor
- *     - default_timespan       → “day”, “minute”, etc.
- *     - default_multiplier     → Polygon aggregates multiplier
+ *     price_history_min_date
+ *     default_timespan
+ *     default_multiplier
  *
  * 📦 Command Signature:
  * ----------------------------------------------------------------------------
@@ -48,39 +51,26 @@ use Throwable;
  *       --batch=500
  *       --sleep=5
  *
- * 💾 Logging & Diagnostics:
+ * 🚀 New in v3.0:
  * ----------------------------------------------------------------------------
- *   • Logs per-batch dispatch events to storage/logs/ingest.log.
- *   • Prints console progress bar + total summary.
- *   • Reports batch count, tickers processed, and error traces if any.
+ *   • Automatic per-ticker missing-date detection (HUGE performance savings)
+ *   • Case-sensitive symbol handling retained
+ *   • Massive reduction of unnecessary Polygon API calls
  *
- * 🚀 New in v2.6.4:
- * ----------------------------------------------------------------------------
- *   • Removes forced uppercasing of ticker symbols (case-sensitive API fix).
- *   • Ensures compatibility with Polygon tickers containing mixed case
- *     (e.g., ABRpD, ATHpA, etc.).
- *   • Adds inline comments explaining symbol casing rationale.
- *   • Retains all existing queue orchestration, logging, and schema advisory.
- *
- * 🧩 Related Components:
- * ----------------------------------------------------------------------------
- *   • App\Jobs\IngestTickerPriceHistoryJob
- *   • App\Services\BatchMonitorService
- *   • config/polygon.php
  * ============================================================================
  */
 class PolygonTickerPriceHistoryIngest extends Command
 {
     protected $signature = 'polygon:ticker-price-histories:ingest
-                            {--symbol= : Optional single ticker symbol to ingest (e.g. AAPL or ABRpD)}
+                            {--symbol= : Optional single ticker symbol to ingest (case-sensitive)}
                             {--resolution=1d : Resolution (1d, 1m, 5m, etc.)}
-                            {--from= : Start date (YYYY-MM-DD), defaults to polygon.price_history_min_date}
+                            {--from= : Global start date. If omitted, missing-date logic applies.}
                             {--to= : End date (YYYY-MM-DD), defaults to today}
                             {--limit=0 : Limit total tickers processed (0 = all)}
                             {--batch=500 : Number of tickers per job batch}
-                            {--sleep=5 : Seconds to sleep before dispatching next batch}';
+                            {--sleep=5 : Seconds to sleep between batches}';
 
-    protected $description = 'Queue Polygon.io price-history ingestion jobs for all or specific tickers with configurable range and batching.';
+    protected $description = 'Queue Polygon.io price-history ingestion jobs for all or specific tickers with smart missing-date detection.';
 
     public function handle(): int
     {
@@ -88,31 +78,24 @@ class PolygonTickerPriceHistoryIngest extends Command
         |--------------------------------------------------------------------------
         | 1️⃣ Load Options & Config Defaults
         |--------------------------------------------------------------------------
-        |
-        |  🔎 IMPORTANT CHANGE:
-        |  Polygon’s aggregates API is *case-sensitive* for some tickers
-        |  (especially preferred shares, units, and SPACs).
-        |
-        |  Previously, we used strtoupper() to normalize all symbols,
-        |  which caused valid tickers like "ABRpD" or "ATHpA" to fail.
-        |
-        |  Fix: We now preserve the symbol’s exact case from the DB
-        |  or from the --symbol argument as provided.
         */
-        $symbol     = trim($this->option('symbol') ?? '');  // ✅ Case preserved — do NOT uppercase.
+        $symbol = trim($this->option('symbol') ?? '');     // Case-sensitive — DO NOT uppercase.
         $resolution = $this->option('resolution') ?? config('polygon.default_timespan', '1d');
-        $from       = $this->option('from') ?? config('polygon.price_history_min_date', '2020-01-01');
 
-        $toOption   = $this->option('to');
-        $to         = $toOption ?: now()->toDateString();
+        $fromOption = $this->option('from');
+        $from       = $fromOption ?? config('polygon.price_history_min_date', '2020-01-01');
+        $fromWasExplicit = $fromOption !== null;
 
-        $limit      = (int) $this->option('limit', 0);
-        $batchSize  = (int) $this->option('batch', 500);
-        $sleep      = (int) $this->option('sleep', 5);
+        $toOption = $this->option('to');
+        $to       = $toOption ?: now()->toDateString();
+
+        $limit     = (int) $this->option('limit', 0);
+        $batchSize = (int) $this->option('batch', 500);
+        $sleep     = (int) $this->option('sleep', 5);
 
         $logger = Log::channel('ingest');
 
-        $logger->info('📥 Polygon ingestion command started', [
+        $logger->info('📥 Polygon price-history ingest started', [
             'symbol'     => $symbol ?: 'ALL',
             'resolution' => $resolution,
             'from'       => $from,
@@ -120,27 +103,28 @@ class PolygonTickerPriceHistoryIngest extends Command
             'limit'      => $limit,
             'batchSize'  => $batchSize,
             'sleep'      => $sleep,
+            'autoFrom'   => !$fromWasExplicit,
         ]);
 
         $this->info("📈 Preparing Polygon ticker price ingestion...");
         $this->line("   Symbol     : " . ($symbol ?: 'ALL TICKERS'));
-        $this->line("   Range      : {$from} → {$to}");
         $this->line("   Resolution : {$resolution}");
+        $this->line("   Global From: {$from}" . ($fromWasExplicit ? " (explicit)" : " (auto-mode)"));
+        $this->line("   To         : {$to}");
         $this->line("   Batch Size : {$batchSize}");
         $this->newLine();
 
         /*
         |--------------------------------------------------------------------------
-        | 2️⃣ Build Ticker Query
+        | 2️⃣ Build Ticker Query (case-sensitive)
         |--------------------------------------------------------------------------
-        |
-        |  If a --symbol was passed, match it *exactly* (case-sensitive)
-        |  because Polygon tickers like ABRpD ≠ ABRPD.
         */
         $query = Ticker::orderBy('id')->select('id', 'ticker');
+
         if ($symbol) {
-            $query->where('ticker', $symbol);  // case-sensitive match
+            $query->where('ticker', $symbol);
         }
+
         if ($limit > 0) {
             $query->limit($limit);
         }
@@ -153,7 +137,7 @@ class PolygonTickerPriceHistoryIngest extends Command
 
         /*
         |--------------------------------------------------------------------------
-        | 3️⃣ Initialize Batch Monitor & Progress Bar
+        | 3️⃣ Initialize Batch Monitor + Progress Bar
         |--------------------------------------------------------------------------
         */
         BatchMonitorService::createBatch('PolygonTickerPriceHistories', $total);
@@ -166,15 +150,62 @@ class PolygonTickerPriceHistoryIngest extends Command
 
         /*
         |--------------------------------------------------------------------------
-        | 4️⃣ Chunk & Dispatch Jobs
+        | 4️⃣ Chunk & Dispatch Jobs (per-ticker missing-date logic)
         |--------------------------------------------------------------------------
         */
         $query->chunk($batchSize, function ($tickers) use (
-            $resolution, $from, $to, $sleep, $bar, $logger, &$batchIndex
+            $resolution, $from, $to, $sleep, $bar, $logger, $fromWasExplicit, &$batchIndex
         ) {
             $jobs = [];
+
             foreach ($tickers as $ticker) {
-                $jobs[] = new IngestTickerPriceHistoryJob($ticker, $from, $to, $resolution);
+
+                /*
+                 * 🔎 Missing-Date Logic:
+                 * ----------------------
+                 * If user passed --from manually → use it globally.
+                 * Otherwise → auto-detect last stored date, then effectiveFrom = (lastDate + 1 day).
+                 */
+                if ($fromWasExplicit) {
+                    $effectiveFrom = $from;
+                } else {
+                    $latestT = $ticker->priceHistories()
+                        ->where('resolution', $resolution)
+                        ->max('t');
+
+                    if ($latestT) {
+                        $effectiveFrom = Carbon::parse($latestT)->addDay()->toDateString();
+                    } else {
+                        $effectiveFrom = $from; // fallback global min date
+                    }
+                }
+
+                // 🛑 Already fully up-to-date? Skip job dispatching.
+                if ($effectiveFrom > $to) {
+                    $logger->info('⏭ Skipping up-to-date ticker', [
+                        'ticker' => $ticker->ticker,
+                        'resolution' => $resolution,
+                        'nextFrom' => $effectiveFrom,
+                        'to' => $to,
+                    ]);
+                    $bar->advance();
+                    continue;
+                }
+
+                $logger->info('📡 Queueing price history ingest job', [
+                    'ticker' => $ticker->ticker,
+                    'resolution' => $resolution,
+                    'from' => $effectiveFrom,
+                    'to' => $to,
+                ]);
+
+                $jobs[] = new IngestTickerPriceHistoryJob(
+                    $ticker,
+                    $effectiveFrom,
+                    $to,
+                    $resolution
+                );
+
                 $bar->advance();
             }
 
@@ -182,6 +213,11 @@ class PolygonTickerPriceHistoryIngest extends Command
                 return;
             }
 
+            /*
+            |--------------------------------------------------------------------------
+            | Dispatch this chunk as a batch
+            |--------------------------------------------------------------------------
+            */
             try {
                 $batch = Bus::batch($jobs)
                     ->name("PolygonTickerPriceHistoriesIngest (Batch #{$batchIndex})")
@@ -189,24 +225,22 @@ class PolygonTickerPriceHistoryIngest extends Command
                     ->onQueue('default')
                     ->dispatch();
 
-                $jobCount = count($jobs);
                 $logger->info('✅ Dispatched ingestion batch', [
                     'batch_index' => $batchIndex,
                     'batch_id'    => $batch->id ?? null,
-                    'job_count'   => $jobCount,
-                    'from'        => $from,
-                    'to'          => $to,
-                    'resolution'  => $resolution,
+                    'job_count'   => count($jobs),
                 ]);
 
                 $this->newLine();
-                $this->info("✅ Dispatched batch #{$batchIndex} ({$jobCount} jobs)");
+                $this->info("✅ Dispatched batch #{$batchIndex} (" . count($jobs) . " jobs)");
+
                 $batchIndex++;
 
                 if ($sleep > 0) {
                     $this->info("⏳ Sleeping {$sleep}s before next batch...");
                     sleep($sleep);
                 }
+
             } catch (Throwable $e) {
                 $logger->error('❌ Failed to dispatch ingestion batch', [
                     'batch_index' => $batchIndex,
@@ -227,7 +261,7 @@ class PolygonTickerPriceHistoryIngest extends Command
         $this->newLine(2);
 
         $this->info("🎯 All batches dispatched successfully.");
-        $logger->info('🏁 Polygon ingestion complete', [
+        $logger->info('🏁 Polygon price-history ingestion complete', [
             'symbol'    => $symbol ?: 'ALL',
             'total'     => $total,
             'batches'   => $batchIndex - 1,
@@ -239,10 +273,10 @@ class PolygonTickerPriceHistoryIngest extends Command
         | ℹ️ Schema Advisory (job_batches)
         |--------------------------------------------------------------------------
         */
-        if (! Schema::hasColumn('job_batches', 'processed_jobs')) {
-            $this->warn("⚠️ Note: The 'job_batches' table appears outdated. Run:");
+        if (!Schema::hasColumn('job_batches', 'processed_jobs')) {
+            $this->warn("⚠️ 'job_batches' table appears outdated. Run:");
             $this->line("   php artisan queue:batches-table && php artisan migrate");
-            $this->line("   (This adds 'processed_jobs' for accurate queue metrics.)");
+            $this->line("   This adds 'processed_jobs' for accurate queue metrics.");
             $this->newLine();
         }
 

@@ -1,4 +1,4 @@
-===== GPT DUMP GENERATED: 2025-11-10T06:46:40Z =====
+===== GPT DUMP GENERATED: 2025-11-13T22:06:49Z =====
 ===== DIRECTORY: app/Providers =====
 
 app/Providers/AppServiceProvider.php
@@ -249,6 +249,9 @@ class ArtisanServiceProvider extends ServiceProvider
             \App\Console\Commands\ComputeCorrelationMatrix::class,
             \App\Console\Commands\TickersReviewMissingDataCommand::class,
             \App\Console\Commands\Diagnostics\TickersDataAuditCommand::class,
+            \App\Console\Commands\PolygonPrefetchIntradayPrices::class,
+            \App\Console\Commands\TickersPurgeOldIntraday::class,
+            \App\Console\Commands\TickersRefreshAll::class,
         ]);
     }
 }

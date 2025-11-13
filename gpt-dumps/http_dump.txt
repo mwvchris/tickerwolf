@@ -1,4 +1,4 @@
-===== GPT DUMP GENERATED: 2025-11-10T06:46:40Z =====
+===== GPT DUMP GENERATED: 2025-11-13T22:06:49Z =====
 ===== DIRECTORY: app/Http =====
 
 app/Http/Middleware/RedirectIfAuthenticated.php
@@ -603,152 +603,6 @@ class TickerAnalysisController extends Controller
             'completed_at' => $analysis->completed_at,
         ]);
     }
-}app/Http/Controllers/TickerController.old.php
-
-
-===== FILE: app/Http/Controllers/TickerController.old.php =====
-
-<?php
-
-namespace App\Http\Controllers;
-
-use Illuminate\Http\Request;
-use App\Models\Ticker;
-use App\Models\TickerAnalysis;
-use Inertia\Inertia;
-use Inertia\Response;
-use Illuminate\Http\RedirectResponse;
-use Illuminate\Support\Str;
-use Illuminate\Support\Facades\Auth;
-
-class TickerController extends Controller
-{
-    /**
-     * Show the ticker profile page via Inertia.
-     */
-    public function show(Request $request, string $symbol, ?string $slug = null): Response|RedirectResponse
-    {
-        $ticker = Ticker::whereRaw('upper(ticker) = ?', [strtoupper($symbol)])
-            ->with(['overviews' => function ($q) {
-                // eager-load the latest overview first (we'll pick the latest)
-                $q->orderByDesc('fetched_at')->limit(1);
-            }])
-            ->firstOrFail();
-
-        // Canonical slug derived from DB (or fallback)
-        $canonicalSlug = $ticker->slug ?? Str::slug($ticker->name ?? $ticker->ticker);
-
-        // Normalize and redirect only if needed
-        if ($slug !== $canonicalSlug) {
-            return redirect()->route('tickers.show', [
-                'symbol' => strtoupper($ticker->ticker),
-                'slug'   => $canonicalSlug,
-            ], 301);
-        }
-
-        // ==========================================
-        // Fetch most recent completed + valid AI analysis (<= 24h old)
-        // ==========================================
-        $latestAnalysis = TickerAnalysis::where('ticker', strtoupper($ticker->ticker))
-            ->where('status', 'completed')
-            ->whereNotNull('response_raw')
-            ->whereRaw("(response_raw != '' AND response_raw != '[]')")
-            ->where('requested_at', '>=', now()->subDay())
-            ->orderByDesc('completed_at')
-            ->first();
-
-        $analysisContent = null;
-
-        if ($latestAnalysis) {
-            $raw = $latestAnalysis->response_raw;
-
-            if (is_string($raw)) {
-                $decoded = json_decode($raw, true);
-                $response = is_array($decoded) ? $decoded : [];
-            } elseif (is_array($raw)) {
-                $response = $raw;
-            } else {
-                $response = [];
-            }
-
-            $analysisContent = $response['content']
-                ?? $response['summary']
-                ?? ($latestAnalysis->summary ?? $latestAnalysis->output ?? null);
-        }
-
-        // ==========================================
-        // Latest overview snapshot
-        // ==========================================
-        $latestOverview = $ticker->overviews->first() ?? null;
-
-        // Determine logo (prefer ticker.branding_logo_url then overview payload)
-        $logoUrl = $ticker->branding_logo_url
-            ?? optional($latestOverview)->results_raw['branding']['logo_url'] ?? null
-            ?? null;
-
-        // Friendly values
-        $formattedMarketCap = $ticker->formatted_market_cap ?? ($latestOverview?->formatted_market_cap ?? null);
-        $listDate = $ticker->list_date ? $ticker->list_date->toDateString() : ($latestOverview?->overview_date?->toDateString() ?? null);
-        $employees = $ticker->total_employees ?? ($latestOverview->results_raw['total_employees'] ?? null);
-        $phone = $ticker->phone_number ?? ($latestOverview->results_raw['phone_number'] ?? null);
-        $sic = $ticker->sic_description ?? ($latestOverview->results_raw['sic_description'] ?? null);
-
-        // Prepare quick stats (server-side) — you can add/remove entries here
-        $quickStats = [
-            [
-                'label' => 'Market Cap',
-                'value' => $formattedMarketCap ?? '—',
-            ],
-            [
-                'label' => 'Employees',
-                'value' => $employees ? number_format($employees) : '—',
-            ],
-            [
-                'label' => 'List Date',
-                'value' => $listDate ?? '—',
-            ],
-            [
-                'label' => 'SIC',
-                'value' => $sic ?? '—',
-            ],
-        ];
-
-        // Send the enriched payload to the Vue page
-        return Inertia::render('tickers/Show', [
-            'ticker' => [
-                'id'               => $ticker->id,
-                'ticker'           => $ticker->ticker,
-                'name'             => $ticker->name,
-                'slug'             => $canonicalSlug,
-                'market'           => $ticker->market ?? null,
-                'locale'           => $ticker->locale ?? null,
-                'primary_exchange' => $ticker->primary_exchange ?? null,
-                'currency_name'    => $ticker->currency_name ?? null,
-                'type'             => $ticker->type ?? null,
-                'active'           => (bool) $ticker->active,
-                // overview fields
-                'description'      => $ticker->description ?? ($latestOverview->results_raw['description'] ?? null),
-                'homepage_url'     => $ticker->homepage_url ?? ($latestOverview->results_raw['homepage_url'] ?? null),
-                'market_cap'       => $ticker->market_cap ?? ($latestOverview->market_cap ?? null),
-                'formatted_market_cap' => $formattedMarketCap ?? null,
-                'total_employees'  => $employees,
-                'phone_number'     => $phone,
-                'list_date'        => $listDate,
-                'sic_description'  => $sic,
-                'branding_logo_url'=> $logoUrl,
-            ],
-            'quickStats' => $quickStats,
-            'user' => [
-                'authenticated' => Auth::check(),
-                'loginUrl'      => route('login', [], false),
-            ],
-            'latestAnalysis' => $latestAnalysis ? [
-                'provider'  => $latestAnalysis->provider,
-                'content'   => $analysisContent,
-                'completed' => optional($latestAnalysis->completed_at)->toIso8601String(),
-            ] : null,
-        ]);
-    }
 }app/Http/Controllers/Api/TickerApiController.php
 
 
@@ -788,73 +642,213 @@ class TickerApiController extends Controller
 namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
-use Illuminate\Support\Str;
 use App\Models\Ticker;
-use App\Models\TickerOverview;
-use App\Models\TickerFundamental;
-use App\Models\TickerIndicator;
-use App\Models\TickerAnalysis;
-use App\Models\TickerNewsItem;
-use App\Models\TickerPriceHistory;
+use Illuminate\Support\Str;
+use Illuminate\Support\Carbon;
+use App\Helpers\FormatHelper;
+use App\Services\PolygonRealtimePriceService;
 
+/**
+ * Controller: TickerController
+ * -----------------------------------------------------------------------------
+ * Renders the Ticker Profile Page and coordinates data aggregation between
+ * Eloquent models and Blade views.
+ *
+ * Responsibilities:
+ *  - Load relevant ticker data and relationships (overview, fundamentals,
+ *    indicators, price histories, news, analysis)
+ *  - Prepare both detailed OHLCV arrays AND lightweight `{x,y}` series
+ *    for ApexCharts (with optional down-sampling)
+ *  - Compute high-level header stats to match major finance portals
+ *  - Enrich with intraday (1-minute delayed) snapshots from Redis/Polygon
+ * -----------------------------------------------------------------------------
+ */
 class TickerController extends Controller
 {
     /**
-     * Display the ticker profile page.
+     * Display a single ticker’s profile page.
      *
-     * Route: GET /tickers/{symbol}/{slug?}
+     * @param  \Illuminate\Http\Request              $request
+     * @param  string                                $symbol   The ticker symbol (e.g. "AAPL")
+     * @param  string|null                           $slug     Optional SEO-friendly slug
+     * @param  \App\Services\PolygonRealtimePriceService  $realtimeService
+     * @return \Illuminate\View\View|\Illuminate\Http\RedirectResponse
      */
-    public function show(Request $request, string $symbol, ?string $slug = null)
-    {
+    public function show(
+        Request $request,
+        string $symbol,
+        ?string $slug = null,
+        PolygonRealtimePriceService $realtimeService
+    ) {
         // ------------------------------------------------------------------
-        // 1️⃣ Load the base ticker with relationships
+        // Normalize & Retrieve Ticker
         // ------------------------------------------------------------------
+        $symbol = strtoupper(trim($symbol));
+
         $ticker = Ticker::query()
-            ->whereRaw('ticker = ?', [$symbol])
             ->with([
                 'overview',
-                'fundamentals',
-                'indicators' => fn($q) => $q->latest('t')->limit(10),
-                'analysis' => fn($q) => $q->latest()->limit(1),
-                'newsItems' => fn($q) => $q->latest()->limit(10),
-                'priceHistories' => fn($q) => $q->latest('t')->limit(60),
+                'fundamentals'   => fn ($q) => $q->orderByDesc('end_date')->limit(4),
+                'priceHistories' => fn ($q) => $q->orderBy('t'),
+                'indicators'     => fn ($q) => $q->orderByDesc('t')->limit(50),
+                'analysis'       => fn ($q) => $q->latest('created_at'),
+                'newsItems'      => fn ($q) => $q->orderByDesc('published_utc')->limit(10),
             ])
+            ->bySymbol($symbol)
             ->firstOrFail();
 
         // ------------------------------------------------------------------
-        // 2️⃣ Compute or normalize key variables
+        // Canonical Slug Enforcement (SEO-friendly route)
         // ------------------------------------------------------------------
-        $overview = $ticker->overview;
-        $fundamentals = $ticker->fundamentals;
-        $latestPrice = optional($ticker->priceHistories->first());
-        $indicators = $ticker->indicators->first();
-        $analysis = $ticker->analysis->first();
-        $newsItems = $ticker->newsItems;
-        $priceHistory = $ticker->priceHistories->sortBy('t');
-
-        // ------------------------------------------------------------------
-        // 3️⃣ Handle canonical slug (for SEO-friendly URLs)
-        // ------------------------------------------------------------------
-        $canonicalSlug = Str::slug($ticker->name ?? $ticker->ticker);
+        $canonicalSlug = $ticker->slug ?? Str::slug($ticker->name ?? $ticker->ticker);
         if ($slug !== $canonicalSlug) {
             return redirect()->route('tickers.show', [
-                'symbol' => $ticker->ticker,
-                'slug' => $canonicalSlug,
+                'symbol' => $symbol,
+                'slug'   => $canonicalSlug,
             ]);
         }
 
         // ------------------------------------------------------------------
-        // 4️⃣ Pass all data to Blade
+        // Detailed OHLCV arrays for 1D, 1W, 1M, 6M, 1Y, 5Y (for cards/analytics)
+        // ------------------------------------------------------------------
+        $now = Carbon::now();
+        $priceHistoryRecords = $ticker->priceHistories()
+            ->where('t', '>=', $now->copy()->subYears(5))
+            ->orderBy('t', 'asc')
+            ->get();
+
+        $rangeConfig = [
+            '1D' => ['threshold' => $now->copy()->subDay(),     'fallback' => 1],
+            '1W' => ['threshold' => $now->copy()->subWeek(),    'fallback' => 5],
+            '1M' => ['threshold' => $now->copy()->subMonth(),   'fallback' => 22],
+            '6M' => ['threshold' => $now->copy()->subMonths(6), 'fallback' => 126],
+            '1Y' => ['threshold' => $now->copy()->subYear(),    'fallback' => 252],
+            '5Y' => ['threshold' => $now->copy()->subYears(5),  'fallback' => 1260],
+        ];
+
+        $serializeOHLCV = function ($collection) {
+            return $collection->map(fn ($p) => [
+                'date'   => \Illuminate\Support\Carbon::parse($p->t)->toDateString(),
+                'open'   => $p->o !== null ? (float) $p->o : null,
+                'high'   => $p->h !== null ? (float) $p->h : null,
+                'low'    => $p->l !== null ? (float) $p->l : null,
+                'close'  => $p->c !== null ? (float) $p->c : null,
+                'volume' => $p->v !== null ? (int) $p->v : null,
+            ])->values();
+        };
+
+        $chartData = [];
+        foreach ($rangeConfig as $label => $config) {
+            if ($priceHistoryRecords->isEmpty()) {
+                $chartData[$label] = [];
+                continue;
+            }
+            $subset = $priceHistoryRecords->filter(fn ($r) => $r->t >= $config['threshold']);
+            if ($subset->isEmpty()) {
+                $subset = $priceHistoryRecords->take(-$config['fallback']);
+            }
+            $chartData[$label] = $serializeOHLCV($subset);
+        }
+
+        // ------------------------------------------------------------------
+        // Lightweight `{x,y}` series for ApexCharts (with down-sampling rules)
+        // ------------------------------------------------------------------
+        $favorSparseForLargeRanges = true;
+        $ranges = ['1D', '1W', '1M', '6M', '1Y', '5Y'];
+
+        $chartSeries = [];
+        foreach ($ranges as $range) {
+            $series = $ticker->buildPriceSeriesForRange($range, $favorSparseForLargeRanges);
+            $chartSeries[$range] = $series['points'];
+        }
+
+        // ------------------------------------------------------------------
+        // Intraday (1-minute) snapshot via Redis/Polygon
+        // ------------------------------------------------------------------
+        $intradaySnapshot = $realtimeService->getIntradaySnapshotForTicker($ticker);
+
+        // Close time label from the latest *daily* bar (TickerPriceHistory)
+        $latestDaily   = $ticker->latestPrice();
+        $closeTimeLabel = $latestDaily
+            ? Carbon::parse($latestDaily->t)
+                ->setTimezone(config('polygon.market_timezone', 'America/New_York'))
+                ->format('M j, g:i A T')
+            : null;
+
+        // Intraday session labels from snapshot (only if Polygon returned bars)
+        $intradaySessionLabel = $intradaySnapshot['session_label']      ?? null;
+        $intradayTimeLabel    = $intradaySnapshot['session_time_human'] ?? null;
+        $intradaySessionCode  = $intradaySnapshot['session']            ?? null;
+
+        // ------------------------------------------------------------------
+        // Header Stats: match expectations from Google/TradingView/Perplexity
+        // ------------------------------------------------------------------
+        $overview = $ticker->overview; // may be null for some tickers
+
+        $headerStats = [
+            // Price & daily change (based on EOD daily data)
+            'lastPrice'     => FormatHelper::currency($ticker->last_close),
+            'changeAbs'     => FormatHelper::signedCurrencyChange($ticker->day_change_abs),
+            'changePct'     => FormatHelper::percent($ticker->day_change_pct),
+
+            // Close-time metadata (EOD, daily-level)
+            // Example: "At close: Nov 12, 4:00 PM ET"
+            'closeTimeLabel' => $closeTimeLabel
+                ? 'At close: ' . $closeTimeLabel
+                : 'At close: —',
+
+            // Intraday / After-hours / Pre-market metadata
+            // Example: "After hours: Nov 12, 7:45 PM ET"
+            'intradaySessionCode'  => $intradaySessionCode,
+            'intradaySessionLabel' => $intradaySessionLabel,        // "Pre-market", "After hours", etc.
+            'intradayTimeLabel'    => $intradayTimeLabel            // "Nov 12, 7:45 PM ET"
+                ? ($intradaySessionLabel . ': ' . $intradayTimeLabel)
+                : null,
+
+            // Intraday price & change (when available)
+            'intradayLastPrice' => $intradaySnapshot['last_price'] ?? null,
+            'intradayChangeAbs' => $intradaySnapshot['change_abs'] ?? null,
+            'intradayChangePct' => $intradaySnapshot['change_pct'] ?? null,
+
+            // Day ranges & previous close
+            'prevClose'     => FormatHelper::currency($ticker->prev_close),
+            'open'          => FormatHelper::currency($ticker->day_open),
+            'dayHigh'       => FormatHelper::currency($ticker->day_high),
+            'dayLow'        => FormatHelper::currency($ticker->day_low),
+
+            // Volume (latest & avg)
+            'volume'        => FormatHelper::humanVolume($ticker->volume_latest),
+            'avgVolume'     => FormatHelper::humanVolume($ticker->avg_volume_30d),
+
+            // 52-week range
+            'high52w'       => FormatHelper::currency($ticker->high_52w),
+            'low52w'        => FormatHelper::currency($ticker->low_52w),
+
+            // Market cap & shares
+            'marketCap'     => $overview ? FormatHelper::compactCurrency($overview->market_cap ?? null) : '—',
+            'sharesOut'     => $overview ? FormatHelper::compactNumber($overview->weighted_shares_outstanding ?? null) : '—',
+
+            // Meta
+            'exchange'      => $ticker->exchange_short ?? $ticker->primary_exchange,
+            'name'          => $ticker->clean_display_name ?? $ticker->name,
+            'logoUrl'       => $ticker->logo_url,
+            'iconUrl'       => $ticker->icon_url,
+        ];
+
+        // ------------------------------------------------------------------
+        // Compile Data for View
         // ------------------------------------------------------------------
         return view('pages.tickers.show', [
-            'ticker' => $ticker->ticker,
-            'overview' => $overview,
-            'fundamentals' => $fundamentals,
-            'latestPrice' => $latestPrice,
-            'indicators' => $indicators,
-            'analysis' => $analysis,
-            'newsItems' => $newsItems,
-            'priceHistory' => $priceHistory,
+            'ticker'           => $ticker,
+            'overview'         => $overview,
+            'fundamental'      => $ticker->fundamentals->first(),
+            'chartData'        => $chartData,
+            'chartSeries'      => $chartSeries,
+            'latestIndicators' => $ticker->latestIndicators(),
+            'headerStats'      => $headerStats,
+            'intradaySnapshot' => $intradaySnapshot, // optional if you want more detail in Blade
+            'analysis'         => $ticker->analysis,
+            'newsItems'        => $ticker->newsItems,
         ]);
     }
 }

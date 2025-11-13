@@ -47,6 +47,33 @@ php artisan monitor:batches --refresh=5
 
 ------------------------------------------------------------------
 
+OR RUN MASTER 'DATA REFRESH' COMMAND:
+
+1.) # Before you run heavy pipelines (like your umbrella command), always run
+    # the below command. It tells Laravel to signal PHP workers to reboot gracefully
+    # after finishing their current job.
+
+    php artisan queue:restart
+
+
+2.) # Make sure queue worker is running:
+
+    php artisan queue:work --queue=default --max-jobs=1 --tries=3 --timeout=180
+    php artisan queue:work --queue=default --max-jobs=1 --tries=3 --timeout=180
+
+    Why?
+        •	--max-jobs=1 → auto restart every job
+        •	--max-time=300 → auto restart every 5 minutes
+        •	prevents memory accumulation
+        •	avoids OOM-kill entirely
+
+3.) # Then in another terminal:
+
+    php artisan tickers:refresh-all --fast
+
+
+------------------------------------------------------------------
+
 Tickers:
 php artisan polygon:tickers:ingest --market=stocks
 
@@ -54,10 +81,10 @@ Ticker Slugs:
 php artisan tickers:generate-slugs
 
 Ticker Overviews:
-php artisan polygon:ticker-overviews:ingest --batch=500 --sleep=2
+php artisan polygon:ticker-overviews:ingest --batch=500 --sleep=1
 
 Ticker Price Histories:
-php artisan polygon:ticker-price-histories:ingest --resolution=1d --from=2019-01-01 --sleep=2
+php artisan polygon:ticker-price-histories:ingest --resolution=1d --from=2019-01-01 --sleep=1
 
 Ticker Incidators/Snapshots:
 php artisan tickers:compute-indicators --from=2019-01-01 --to=2030-01-01 --batch=3000 --sleep=1 --include-inactive

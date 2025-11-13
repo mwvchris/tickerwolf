@@ -4,76 +4,153 @@ use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Console\Scheduling\Schedule;
 use Illuminate\Support\Facades\Log;
-use App\Schedules\PolygonTickerOverviewsSchedule;
 
 /*
 |--------------------------------------------------------------------------
 | Console Routes
 |--------------------------------------------------------------------------
 |
-| This file defines your application's custom Artisan commands and schedules.
-| It replaces the old app/Console/Kernel.php from pre-Laravel 11 versions.
+| Defines custom Artisan commands + the full application scheduler.
+| Replaces the old app/Console/Kernel.php in Laravel 11+ / 12.
 |
 */
 
 // -------------------------------------------------------------------------
-// Simple Example Command
+// Example Command
 // -------------------------------------------------------------------------
 Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());
 })->purpose('Display an inspiring quote');
 
 // -------------------------------------------------------------------------
-// Application Schedule Registration
+// Scheduling Registration
 // -------------------------------------------------------------------------
 app()->afterResolving(Schedule::class, function (Schedule $schedule) {
 
     /*
     |--------------------------------------------------------------------------
-    | Polygon: Ticker Overview Ingestion
+    | 1️⃣ Intraday Prefetch to Redis (1-min, 15-min delayed)
     |--------------------------------------------------------------------------
-    | Runs nightly at 8 PM Pacific to pull the latest ticker overview data.
+    | Runs every minute during US market hours.
     */
-    $schedule->command('polygon:ticker-overviews:ingest')
+    $schedule->command('polygon:intraday-prices:prefetch')
+        ->timezone('America/New_York')
+        ->weekdays()
+        ->between('09:25', '20:05')
+        ->everyMinute()
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path(env(
+            'LOG_POLYGON_INTRADAY_PRICES_CRON',
+            'logs/polygon/cron/intraday_prices_cron.log'
+        )));
+
+    /*
+    |--------------------------------------------------------------------------
+    | 2️⃣ Polygon: Ticker Universe
+    |--------------------------------------------------------------------------
+    */
+    $schedule->command('polygon:tickers:ingest --market=stocks')
+        ->timezone('America/Los_Angeles')
+        ->dailyAt('19:30')
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/polygon/cron/tickers_cron.log'));
+
+    /*
+    |--------------------------------------------------------------------------
+    | 3️⃣ Ticker Slugs (SEO)
+    |--------------------------------------------------------------------------
+    */
+    $schedule->command('tickers:generate-slugs')
+        ->timezone('America/Los_Angeles')
+        ->dailyAt('19:45')
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/polygon/cron/tickers_cron.log'));
+
+    /*
+    |--------------------------------------------------------------------------
+    | 4️⃣ Polygon: Ticker Overviews
+    |--------------------------------------------------------------------------
+    */
+    $schedule->command('polygon:ticker-overviews:ingest --batch=1000 --sleep=5')
+        ->timezone('America/Los_Angeles')
         ->dailyAt('20:00')
-        ->timezone('America/Los_Angeles')
         ->withoutOverlapping()
-        ->appendOutputTo(storage_path('logs/polygon/ticker_overviews_cron.log'));
-
+        ->appendOutputTo(storage_path('logs/polygon/cron/ticker_overviews_cron.log'));
 
     /*
     |--------------------------------------------------------------------------
-    | Polygon: Ticker Price History Ingestion
+    | 5️⃣ Polygon: Fundamentals (heavier job)
     |--------------------------------------------------------------------------
-    | Runs nightly at 9 PM Pacific to update price history data for all tickers.
     */
-    $schedule->command('polygon:ticker-price-histories:ingest --limit=1000')
-        ->dailyAt('21:00')
+    $schedule->command('polygon:fundamentals:ingest --timeframe=all --gte=2019-01-01 --batch=2000 --sleep=1')
         ->timezone('America/Los_Angeles')
+        ->dailyAt('20:45')
         ->withoutOverlapping()
-        ->appendOutputTo(storage_path('logs/polygon/ticker_price_histories_cron.log'));
-
+        ->appendOutputTo(storage_path('logs/polygon/cron/fundamentals_cron.log'));
 
     /*
     |--------------------------------------------------------------------------
-    | Polygon: Batch Cleanup
+    | 6️⃣ Polygon: Price History (smart missing-date ingest)
     |--------------------------------------------------------------------------
-    | Cleans up completed or failed job batches older than 30 days.
-    | Keeps the job_batches table lean and prevents log bloat.
+    */
+    $schedule->command('polygon:ticker-price-histories:ingest --resolution=1d --sleep=1')
+        ->timezone('America/Los_Angeles')
+        ->dailyAt('21:30')
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/polygon/cron/ticker_price_histories_cron.log'));
+
+    /*
+    |--------------------------------------------------------------------------
+    | 7️⃣ Indicators (SMA/EMA/RSI/etc)
+    |--------------------------------------------------------------------------
+    */
+    $schedule->command('tickers:compute-indicators --from=2019-01-01 --to=2030-01-01 --batch=3000 --sleep=1 --include-inactive')
+        ->timezone('America/Los_Angeles')
+        ->dailyAt('22:30')
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/polygon/cron/indicators_cron.log'));
+
+    /*
+    |--------------------------------------------------------------------------
+    | 8️⃣ Ticker Snapshots / Metrics
+    |--------------------------------------------------------------------------
+    */
+    $schedule->command('tickers:build-snapshots --from=2019-01-01 --to=2030-01-01 --batch=500 --sleep=1 --include-inactive')
+        ->timezone('America/Los_Angeles')
+        ->dailyAt('23:00')
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/polygon/cron/snapshots_cron.log'));
+
+    /*
+    |--------------------------------------------------------------------------
+    | 9️⃣ Polygon: News Ingestion
+    |--------------------------------------------------------------------------
+    */
+    $schedule->command('polygon:ticker-news:ingest --batch=500 --sleep=1')
+        ->timezone('America/Los_Angeles')
+        ->dailyAt('23:30')
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/polygon/cron/news_cron.log'));
+
+    /*
+    |--------------------------------------------------------------------------
+    | 🔟 Intraday DB Purge (rolling retention)
+    |--------------------------------------------------------------------------
+    */
+    $schedule->command('tickers:purge-old-intraday --days=8')
+        ->timezone('America/Los_Angeles')
+        ->dailyAt('00:30')
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/polygon/cron/intraday_purge_cron.log'));
+
+    /*
+    |--------------------------------------------------------------------------
+    | 1️⃣1️⃣ Polygon: Batch Cleanup (existing)
+    |--------------------------------------------------------------------------
     */
     $schedule->command('polygon:batches:cleanup --completed --days=30')
-        ->dailyAt('23:59')
         ->timezone('America/Los_Angeles')
+        ->dailyAt('23:59')
         ->onSuccess(fn () => Log::info('Polygon batch cleanup ran successfully.'))
-        ->appendOutputTo(storage_path('logs/polygon/batch_cleanup_cron.log'));
-
-
-    /*
-    |--------------------------------------------------------------------------
-    | Optional: Additional Polygon Schedules
-    |--------------------------------------------------------------------------
-    | Load modular schedules (if you have additional scheduling logic in classes)
-    | such as App\Schedules\PolygonTickerOverviewsSchedule.
-    */
-    // (new PolygonTickerOverviewsSchedule())($schedule);
+        ->appendOutputTo(storage_path('logs/polygon/cron/batch_cleanup_cron.log'));
 });

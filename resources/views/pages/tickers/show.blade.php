@@ -54,6 +54,42 @@
         -->
 
         {{-- Price Snapshot --}}
+
+{{-- Close price row --}}
+<div class="flex items-end gap-2">
+  <span class="text-3xl font-semibold">
+    {{ $headerStats['lastPrice'] }}
+  </span>
+  <span class="text-sm text-slate-500">
+    {{ $headerStats['closeTimeLabel'] }}
+  </span>
+</div>
+
+{{-- After hours / pre-market row (only if session != regular/closed) --}}
+@if(in_array($headerStats['intradaySessionCode'], ['pre', 'after'], true))
+  <div class="mt-1 flex items-center gap-2 text-xs-plus">
+    <span class="font-medium">
+      {{ $headerStats['intradaySessionLabel'] }}
+    </span>
+    @if($headerStats['intradayLastPrice'] !== null)
+      <span>
+        {{ \App\Helpers\FormatHelper::currency($headerStats['intradayLastPrice']) }}
+      </span>
+    @endif
+    @if($headerStats['intradayChangeAbs'] !== null)
+      <span class="{{ $headerStats['intradayChangeAbs'] >= 0 ? 'text-emerald-500' : 'text-rose-500' }}">
+        {{ \App\Helpers\FormatHelper::signedCurrencyChange($headerStats['intradayChangeAbs']) }}
+        ({{ \App\Helpers\FormatHelper::percent($headerStats['intradayChangePct']) }})
+      </span>
+    @endif
+    @if($headerStats['intradayTimeLabel'])
+      <span class="text-slate-500">
+        {{ $headerStats['intradayTimeLabel'] }}
+      </span>
+    @endif
+  </div>
+@endif
+
         <div class="mb-2">
           <div class="flex items-center space-x-1">
 
@@ -106,7 +142,7 @@
 
           {{-- Close Time --}}
           <p class="mt-1 text-xs">
-            {{ $headerStats['closeTime'] }}
+            {{-- $headerStats['closeTime'] --}}
           </p>
 
           {{-- Mini Price Chart --}}
