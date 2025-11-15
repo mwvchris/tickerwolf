@@ -45,6 +45,19 @@ php artisan queue:work --queue=default --tries=3 --timeout=180
 
 php artisan monitor:batches --refresh=5
 
+-- OR ---
+
+In One Fell-Swoop
+
+# Dry-ish run with prompts
+php artisan system:optimize-environment
+
+# Queue-only cleanup (e.g. before a heavy re-ingest)
+php artisan system:optimize-environment --queues-only
+
+# Full reset, scripted
+php artisan system:optimize-environment --force
+
 ------------------------------------------------------------------
 
 OR RUN MASTER 'DATA REFRESH' COMMAND:
@@ -55,24 +68,41 @@ OR RUN MASTER 'DATA REFRESH' COMMAND:
 
     php artisan queue:restart
 
+2.) # Then in another terminal:
 
-2.) # Make sure queue worker is running:
+    php artisan tickers:refresh-all --dev (main stuff for dev)
 
-    php artisan queue:work --queue=default --max-jobs=1 --tries=3 --timeout=180
-    php artisan queue:work --queue=default --max-jobs=1 --tries=3 --timeout=180
+    php artisan tickers:refresh-all --fast (all/heavy)
+    
+    •	Nightly pipeline (already wired):
+        tickers:refresh-all --daily via scheduler.
 
-    Why?
-        •	--max-jobs=1 → auto restart every job
-        •	--max-time=300 → auto restart every 5 minutes
-        •	prevents memory accumulation
-        •	avoids OOM-kill entirely
-
-3.) # Then in another terminal:
-
-    php artisan tickers:refresh-all --fast
+	•	Weekly fundamentals blast (already wired):
+        tickers:refresh-all --weekly via scheduler.
 
 
 ------------------------------------------------------------------
+
+TO CHECK OUR SCHEDULER:
+php artisan schedule:list
+
+***********************
+ REDIS
+***********************
+
+Intraday Snapshots (persisting to Redis):
+php artisan polygon:intraday-prices:prefetch --force
+
+For a single ticker:
+php artisan polygon:intraday-prices:prefetch --symbol=APLD --force
+
+Verify:
+docker exec -it tickerwolf-redis redis-cli
+KEYS tw:rt:snap:APLD*
+
+***********************
+ Mariadb/Mysql
+***********************
 
 Tickers:
 php artisan polygon:tickers:ingest --market=stocks
@@ -84,7 +114,7 @@ Ticker Overviews:
 php artisan polygon:ticker-overviews:ingest --batch=500 --sleep=1
 
 Ticker Price Histories:
-php artisan polygon:ticker-price-histories:ingest --resolution=1d --from=2019-01-01 --sleep=1
+php artisan polygon:ticker-price-histories:ingest --batch=150 --fast --sleep=0
 
 Ticker Incidators/Snapshots:
 php artisan tickers:compute-indicators --from=2019-01-01 --to=2030-01-01 --batch=3000 --sleep=1 --include-inactive

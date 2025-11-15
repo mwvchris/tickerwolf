@@ -2,284 +2,352 @@
 
 namespace App\Console\Commands;
 
+use App\Jobs\IngestTickerPriceHistoryJob;
+use App\Models\Ticker;
 use Illuminate\Console\Command;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Log;
-use App\Models\Ticker;
-use App\Jobs\IngestTickerPriceHistoryJob;
-use App\Services\BatchMonitorService;
-use Illuminate\Support\Facades\Schema;
-use Illuminate\Support\Carbon;
 use Throwable;
 
 /**
  * ============================================================================
- *  polygon:ticker-price-histories:ingest  
- *  (v3.0 — Smart Missing-Date Queue Ingest + Symbol-Aware Case Handling)
+ *  polygon:ticker-price-histories:ingest
+ *  v3.0.0 — Multi-Ticker, Multi-Resolution (1d + 1h) Aggressive Batching
  * ============================================================================
  *
- * 🔧 Purpose:
- *   Dispatch asynchronous (queued) Polygon.io price-history ingestion jobs
- *   for all tickers or a specific ticker via --symbol.  
- *   NOW includes automatic “only ingest missing dates per ticker”.
- *
- * 🧠 Behavior:
+ * 🔧 Purpose
  * ----------------------------------------------------------------------------
- *   • Fetches all tickers (or one via --symbol).
- *   • Determines per-ticker start date automatically IF --from is omitted:
- *         → latest stored 't' for given resolution + 1 day
- *   • Falls back to polygon.price_history_min_date if no historical price exists.
- *   • If user passes --from manually, uses that globally exactly as before.
- *   • Skips tickers whose latest stored date already extends past --to.
- *   • Dispatches queue jobs in batches with optional throttling.
- *   • Integrates with BatchMonitorService for tracking.
+ * Dispatches queue jobs to ingest Polygon.io price history for the current
+ * ticker universe. This version is optimized for SPEED and LOW JOB COUNT:
  *
- * ⚙️ Config Integration (config/polygon.php):
+ *   • Each queue job processes MANY tickers (default: 100 per job, but we
+ *     actually inherit your old --batch value, e.g. 500, for max throughput).
+ *   • Each job fetches BOTH 1d and 1h bars for its ticker group in a single
+ *     execution (the job-level logic lives in IngestTickerPriceHistoryJob).
+ *   • Per-ticker auto-from logic is handled inside the job, using the DB to
+ *     find the latest existing bar and backfilling with a small redundancy.
+ *
+ * 🧠 High-Level Behavior
  * ----------------------------------------------------------------------------
- *     price_history_min_date
- *     default_timespan
- *     default_multiplier
+ *  1. Select active Polygon tickers (or a single symbol).
+ *  2. Stream them via cursor() so we never load all into memory at once.
+ *  3. Group tickers into multi-ticker jobs (size = --batch).
+ *  4. Each job:
+ *      • Fetches 1d and 1h bars (auto-from aware).
+ *      • Upserts bars into ticker_price_histories in bulk.
+ *  5. All jobs are dispatched as a single Bus batch on the "database" queue.
  *
- * 📦 Command Signature:
+ * ⚡ Aggressive Defaults (Preset A)
  * ----------------------------------------------------------------------------
- *   php artisan polygon:ticker-price-histories:ingest
- *       --symbol=AAPL
- *       --resolution=1d
- *       --from=2020-01-01
- *       --to=2025-10-31
- *       --limit=1000
- *       --batch=500
- *       --sleep=5
+ *  • Jobs are multi-ticker (100+ tickers per job is normal).
+ *  • 1d auto-from lookback: ~45 days (handled in the job).
+ *  • 1h auto-from lookback: ~7 days (handled in the job).
+ *  • 1h retention purge: 168 hours (handled in the job).
  *
- * 🚀 New in v3.0:
+ * These are aggressively tuned for your Docker setup, but everything is still
+ * overrideable via flags if needed.
+ *
+ * 📦 Typical Usage
  * ----------------------------------------------------------------------------
- *   • Automatic per-ticker missing-date detection (HUGE performance savings)
- *   • Case-sensitive symbol handling retained
- *   • Massive reduction of unnecessary Polygon API calls
+ *  # Nightly full-universe ingest (1d + 1h)
+ *  php artisan polygon:ticker-price-histories:ingest
  *
+ *  # Limit to first 500 tickers
+ *  php artisan polygon:ticker-price-histories:ingest --limit=500
+ *
+ *  # Single symbol ad-hoc ingest
+ *  php artisan polygon:ticker-price-histories:ingest AAPL
+ *
+ *  # tickers:refresh-all will continue to call this, passing --batch=500, etc.
+ *
+ * 🧩 Related
+ * ----------------------------------------------------------------------------
+ *  • App\Jobs\IngestTickerPriceHistoryJob         (multi-ticker, 1d + 1h)
+ *  • App\Services\PolygonTickerPriceHistoryService (low-level API + upserts)
+ *  • tickers:refresh-all umbrella command
+ *  • docker "tickerwolf-queue" worker
  * ============================================================================
  */
 class PolygonTickerPriceHistoryIngest extends Command
 {
+    /**
+     * The name and signature of the console command.
+     *
+     * NOTE:
+     *  - We keep the old options (symbol, resolution, limit, batch, sleep, etc.)
+     *    for backwards compatibility with tickers:refresh-all.
+     *  - Internally we now ALWAYS treat this as a multi-resolution ingest:
+     *    IngestTickerPriceHistoryJob will handle both 1d and 1h.
+     */
     protected $signature = 'polygon:ticker-price-histories:ingest
-                            {--symbol= : Optional single ticker symbol to ingest (case-sensitive)}
-                            {--resolution=1d : Resolution (1d, 1m, 5m, etc.)}
-                            {--from= : Global start date. If omitted, missing-date logic applies.}
-                            {--to= : End date (YYYY-MM-DD), defaults to today}
+                            {symbol=ALL : Ticker symbol (e.g. AAPL) or ALL for full universe}
+                            {--resolution=both : 1d, 1h, or both (jobs treat "both" as default)}
                             {--limit=0 : Limit total tickers processed (0 = all)}
-                            {--batch=500 : Number of tickers per job batch}
-                            {--sleep=5 : Seconds to sleep between batches}';
+                            {--batch=100 : Tickers per queue job (multi-ticker job size)}
+                            {--from=2020-01-01 : Global baseline from-date (auto-from aware)}
+                            {--to= : Global to-date (default: today)}
+                            {--window-days=45 : Daily auto-from lookback window (days)}
+                            {--redundancy-days=2 : Redundant daily overlap (days)}
+                            {--redundancy-hours=3 : Redundant intraday overlap (hours)}
+                            {--retention-hours=168 : Hourly retention window for purge}
+                            {--sleep=0 : Seconds to sleep between Bus batch dispatch}
+                            {--fast : Apply aggressive preset A overrides}
+                            {--dev : Dev mode (auto-limit universe for testing)}';
 
-    protected $description = 'Queue Polygon.io price-history ingestion jobs for all or specific tickers with smart missing-date detection.';
+    /**
+     * The console command description.
+     */
+    protected $description = 'Ingest Polygon.io ticker price histories (1d + 1h) in aggressive multi-ticker batches.';
 
+    /**
+     * Execute the console command.
+     *
+     * @return int
+     */
     public function handle(): int
     {
-        /*
-        |--------------------------------------------------------------------------
-        | 1️⃣ Load Options & Config Defaults
-        |--------------------------------------------------------------------------
-        */
-        $symbol = trim($this->option('symbol') ?? '');     // Case-sensitive — DO NOT uppercase.
-        $resolution = $this->option('resolution') ?? config('polygon.default_timespan', '1d');
+        // ---------------------------------------------------------------------
+        // 1️⃣ Resolve options & presets
+        // ---------------------------------------------------------------------
+        $symbol         = strtoupper($this->argument('symbol') ?? 'ALL');
+        $resolutionMode = strtolower($this->option('resolution') ?? 'both'); // "1d", "1h", or "both"
+        $limit          = (int) $this->option('limit');
+        $tickersPerJob  = max(1, (int) $this->option('batch'));
+        $sleep          = max(0, (int) $this->option('sleep'));
 
-        $fromOption = $this->option('from');
-        $from       = $fromOption ?? config('polygon.price_history_min_date', '2020-01-01');
-        $fromWasExplicit = $fromOption !== null;
+        $globalFrom     = $this->option('from') ?: '2020-01-01';
+        $toDate         = $this->option('to') ?: Carbon::today()->toDateString();
 
-        $toOption = $this->option('to');
-        $to       = $toOption ?: now()->toDateString();
+        $windowDays     = max(1, (int) $this->option('window-days'));
+        $redundancyDays = max(0, (int) $this->option('redundancy-days'));
+        $redundancyHours = max(0, (int) $this->option('redundancy-hours'));
+        $retentionHours = max(0, (int) $this->option('retention-hours'));
 
-        $limit     = (int) $this->option('limit', 0);
-        $batchSize = (int) $this->option('batch', 500);
-        $sleep     = (int) $this->option('sleep', 5);
+        $fastMode       = (bool) $this->option('fast');
+        $devMode        = (bool) $this->option('dev');
+
+        // Apply aggressive preset A (can be tweaked here if needed)
+        if ($fastMode) {
+            // If someone passes --fast, we bump a few knobs even harder.
+            $tickersPerJob  = max($tickersPerJob, 150);  // at least 150 per job
+            $windowDays     = max($windowDays, 45);
+            $redundancyDays = max($redundancyDays, 2);
+            $redundancyHours = max($redundancyHours, 3);
+        }
+
+        // Dev mode: auto-limit universe if no explicit limit provided
+        if ($devMode && $limit === 0) {
+            $limit = 250;
+        }
 
         $logger = Log::channel('ingest');
 
         $logger->info('📥 Polygon price-history ingest started', [
-            'symbol'     => $symbol ?: 'ALL',
-            'resolution' => $resolution,
-            'from'       => $from,
-            'to'         => $to,
-            'limit'      => $limit,
-            'batchSize'  => $batchSize,
-            'sleep'      => $sleep,
-            'autoFrom'   => !$fromWasExplicit,
+            'symbol'          => $symbol,
+            'resolution'      => $resolutionMode,
+            'global_from'     => $globalFrom,
+            'to'              => $toDate,
+            'limit'           => $limit,
+            'tickersPerJob'   => $tickersPerJob,
+            'sleep'           => $sleep,
+            'window_days'     => $windowDays,
+            'redundancyDays'  => $redundancyDays,
+            'redundancyHours' => $redundancyHours,
+            'retentionHours'  => $retentionHours,
+            'autoFromMode'    => true,
+            'fastMode'        => $fastMode,
+            'devMode'         => $devMode,
         ]);
 
-        $this->info("📈 Preparing Polygon ticker price ingestion...");
-        $this->line("   Symbol     : " . ($symbol ?: 'ALL TICKERS'));
-        $this->line("   Resolution : {$resolution}");
-        $this->line("   Global From: {$from}" . ($fromWasExplicit ? " (explicit)" : " (auto-mode)"));
-        $this->line("   To         : {$to}");
-        $this->line("   Batch Size : {$batchSize}");
+        $this->info('📈 Preparing Polygon ticker price ingestion...');
+        $this->line('   Symbol         : ' . ($symbol === 'ALL' ? 'ALL TICKERS' : $symbol));
+        $this->line('   Resolution     : ' . $resolutionMode . ' (jobs will treat "both" as 1d + 1h)');
+        $this->line('   Global From    : ' . $globalFrom . ' (auto-from baseline)');
+        $this->line('   To             : ' . $toDate);
+        $this->line('   Tickers/Job    : ' . $tickersPerJob . ' (multi-ticker jobs)');
+        $this->line('   Window Size    : ' . $windowDays . ' day(s) (daily auto-from)');
+        $this->line('   Redundancy     : ' . $redundancyDays . ' day(s), ' . $redundancyHours . ' hour(s)');
+        $this->line('   1h Retention   : ' . $retentionHours . ' hour(s)');
+        $this->line('   Mode           : ' . ($fastMode ? 'FAST/Aggressive' : 'Normal') . ($devMode ? ' + DEV' : ''));
         $this->newLine();
 
-        /*
-        |--------------------------------------------------------------------------
-        | 2️⃣ Build Ticker Query (case-sensitive)
-        |--------------------------------------------------------------------------
-        */
-        $query = Ticker::orderBy('id')->select('id', 'ticker');
+        // ---------------------------------------------------------------------
+        // 2️⃣ Build ticker universe query
+        // ---------------------------------------------------------------------
+        $tickerQuery = Ticker::query()
+            ->where('is_active_polygon', true)
+            ->orderBy('id')
+            ->select(['id', 'ticker', 'type']);
 
-        if ($symbol) {
-            $query->where('ticker', $symbol);
+        if ($symbol !== 'ALL') {
+            $tickerQuery->whereRaw('UPPER(ticker) = ?', [$symbol]);
         }
 
         if ($limit > 0) {
-            $query->limit($limit);
+            $tickerQuery->limit($limit);
         }
 
-        $total = $query->count();
+        $total = (clone $tickerQuery)->count();
+
         if ($total === 0) {
-            $this->warn("⚠️ No tickers found for ingestion (symbol={$symbol}).");
+            $this->warn('⚠️ No tickers found for price history ingestion.');
+            $logger->warning('⚠️ No tickers found for price history ingestion.', [
+                'symbol' => $symbol,
+                'limit'  => $limit,
+            ]);
+
             return Command::SUCCESS;
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | 3️⃣ Initialize Batch Monitor + Progress Bar
-        |--------------------------------------------------------------------------
-        */
-        BatchMonitorService::createBatch('PolygonTickerPriceHistories', $total);
+        $this->info("🔢 Found {$total} ticker(s) to process.");
+        $this->newLine();
 
+        // ---------------------------------------------------------------------
+        // 3️⃣ Stream tickers & assemble multi-ticker jobs
+        // ---------------------------------------------------------------------
         $bar = $this->output->createProgressBar($total);
-        $bar->setFormat("   🟢 Progress: %current%/%max% [%bar%] %percent:3s%%");
+        $bar->setFormat('   🟢 Tickers: %current%/%max% [%bar%] %percent:3s%%');
         $bar->start();
 
-        $batchIndex = 1;
+        $jobs              = [];
+        $tickerBuffer      = [];
+        $dispatchedTickers = 0;
 
-        /*
-        |--------------------------------------------------------------------------
-        | 4️⃣ Chunk & Dispatch Jobs (per-ticker missing-date logic)
-        |--------------------------------------------------------------------------
-        */
-        $query->chunk($batchSize, function ($tickers) use (
-            $resolution, $from, $to, $sleep, $bar, $logger, $fromWasExplicit, &$batchIndex
-        ) {
-            $jobs = [];
+        foreach ($tickerQuery->cursor() as $ticker) {
+            $tickerBuffer[] = [
+                'id'     => $ticker->id,
+                'ticker' => $ticker->ticker,
+                'type'   => $ticker->type,
+            ];
 
-            foreach ($tickers as $ticker) {
-
-                /*
-                 * 🔎 Missing-Date Logic:
-                 * ----------------------
-                 * If user passed --from manually → use it globally.
-                 * Otherwise → auto-detect last stored date, then effectiveFrom = (lastDate + 1 day).
-                 */
-                if ($fromWasExplicit) {
-                    $effectiveFrom = $from;
-                } else {
-                    $latestT = $ticker->priceHistories()
-                        ->where('resolution', $resolution)
-                        ->max('t');
-
-                    if ($latestT) {
-                        $effectiveFrom = Carbon::parse($latestT)->addDay()->toDateString();
-                    } else {
-                        $effectiveFrom = $from; // fallback global min date
-                    }
-                }
-
-                // 🛑 Already fully up-to-date? Skip job dispatching.
-                if ($effectiveFrom > $to) {
-                    $logger->info('⏭ Skipping up-to-date ticker', [
-                        'ticker' => $ticker->ticker,
-                        'resolution' => $resolution,
-                        'nextFrom' => $effectiveFrom,
-                        'to' => $to,
-                    ]);
-                    $bar->advance();
-                    continue;
-                }
-
-                $logger->info('📡 Queueing price history ingest job', [
-                    'ticker' => $ticker->ticker,
-                    'resolution' => $resolution,
-                    'from' => $effectiveFrom,
-                    'to' => $to,
-                ]);
-
-                $jobs[] = new IngestTickerPriceHistoryJob(
-                    $ticker,
-                    $effectiveFrom,
-                    $to,
-                    $resolution
+            // When the buffer reaches the target size, turn it into one job.
+            if (count($tickerBuffer) >= $tickersPerJob) {
+                $jobs[] = $this->makeJobFromBuffer(
+                    $tickerBuffer,
+                    $resolutionMode,
+                    $globalFrom,
+                    $toDate,
+                    $windowDays,
+                    $redundancyDays,
+                    $redundancyHours,
+                    $retentionHours
                 );
 
-                $bar->advance();
+                $dispatchedTickers += count($tickerBuffer);
+                $bar->advance(count($tickerBuffer));
+
+                $tickerBuffer = [];
             }
+        }
 
-            if (empty($jobs)) {
-                return;
-            }
+        // Flush remaining tickers into a final job
+        if (!empty($tickerBuffer)) {
+            $jobs[] = $this->makeJobFromBuffer(
+                $tickerBuffer,
+                $resolutionMode,
+                $globalFrom,
+                $toDate,
+                $windowDays,
+                $redundancyDays,
+                $redundancyHours,
+                $retentionHours
+            );
 
-            /*
-            |--------------------------------------------------------------------------
-            | Dispatch this chunk as a batch
-            |--------------------------------------------------------------------------
-            */
-            try {
-                $batch = Bus::batch($jobs)
-                    ->name("PolygonTickerPriceHistoriesIngest (Batch #{$batchIndex})")
-                    ->onConnection('database')
-                    ->onQueue('default')
-                    ->dispatch();
+            $dispatchedTickers += count($tickerBuffer);
+            $bar->advance(count($tickerBuffer));
 
-                $logger->info('✅ Dispatched ingestion batch', [
-                    'batch_index' => $batchIndex,
-                    'batch_id'    => $batch->id ?? null,
-                    'job_count'   => count($jobs),
-                ]);
+            $tickerBuffer = [];
+        }
 
-                $this->newLine();
-                $this->info("✅ Dispatched batch #{$batchIndex} (" . count($jobs) . " jobs)");
-
-                $batchIndex++;
-
-                if ($sleep > 0) {
-                    $this->info("⏳ Sleeping {$sleep}s before next batch...");
-                    sleep($sleep);
-                }
-
-            } catch (Throwable $e) {
-                $logger->error('❌ Failed to dispatch ingestion batch', [
-                    'batch_index' => $batchIndex,
-                    'error'       => $e->getMessage(),
-                    'trace'       => substr($e->getTraceAsString(), 0, 400),
-                ]);
-
-                $this->error("❌ Batch #{$batchIndex} failed: {$e->getMessage()}");
-            }
-        });
-
-        /*
-        |--------------------------------------------------------------------------
-        | 5️⃣ Finalize & Report
-        |--------------------------------------------------------------------------
-        */
         $bar->finish();
         $this->newLine(2);
 
-        $this->info("🎯 All batches dispatched successfully.");
-        $logger->info('🏁 Polygon price-history ingestion complete', [
-            'symbol'    => $symbol ?: 'ALL',
-            'total'     => $total,
-            'batches'   => $batchIndex - 1,
-            'completed' => now()->toIso8601String(),
-        ]);
+        if (empty($jobs)) {
+            $this->warn('⚠️ No jobs were created (unexpected).');
+            $logger->warning('⚠️ No jobs created in PolygonTickerPriceHistoryIngest.', [
+                'total_tickers' => $total,
+            ]);
 
-        /*
-        |--------------------------------------------------------------------------
-        | ℹ️ Schema Advisory (job_batches)
-        |--------------------------------------------------------------------------
-        */
-        if (!Schema::hasColumn('job_batches', 'processed_jobs')) {
-            $this->warn("⚠️ 'job_batches' table appears outdated. Run:");
-            $this->line("   php artisan queue:batches-table && php artisan migrate");
-            $this->line("   This adds 'processed_jobs' for accurate queue metrics.");
-            $this->newLine();
+            return Command::SUCCESS;
         }
 
+        // ---------------------------------------------------------------------
+        // 4️⃣ Dispatch as a single Bus batch (for monitoring)
+        // ---------------------------------------------------------------------
+        try {
+            $batch = Bus::batch($jobs)
+                ->name('PolygonTickerPriceHistoryIngest (multi-ticker 1d+1h)')
+                ->onConnection('database')
+                ->onQueue('default')
+                ->dispatch();
+
+            $logger->info('✅ Dispatched Polygon price-history Bus batch', [
+                'batch_id'          => $batch->id ?? null,
+                'job_count'         => count($jobs),
+                'total_tickers'     => $total,
+                'dispatched_tickers'=> $dispatchedTickers,
+                'tickers_per_job'   => $tickersPerJob,
+                'resolution_mode'   => $resolutionMode,
+            ]);
+
+            $this->info('✅ Dispatched Polygon price-history Bus batch:');
+            $this->line('   Jobs dispatched : ' . count($jobs));
+            $this->line('   Tickers targeted : ' . $total);
+            $this->line('   Tickers buffered : ' . $dispatchedTickers);
+            $this->line('   Batch ID         : ' . ($batch->id ?? 'n/a'));
+            $this->newLine();
+        } catch (Throwable $e) {
+            $logger->error('❌ Failed to dispatch Polygon price-history Bus batch', [
+                'error' => $e->getMessage(),
+                'trace' => substr($e->getTraceAsString(), 0, 500),
+            ]);
+
+            $this->error('❌ Failed to dispatch Polygon price-history Bus batch: ' . $e->getMessage());
+            return Command::FAILURE;
+        }
+
+        $this->info('🎯 All multi-ticker price-history jobs dispatched (1d + 1h).');
         return Command::SUCCESS;
+    }
+
+    /**
+     * Build a single multi-ticker price-history job from a buffer of tickers.
+     *
+     * @param  array<int, array{id:int,ticker:string,type:?string}>  $buffer
+     * @param  string  $resolutionMode  "1d", "1h", or "both"
+     * @param  string  $globalFrom
+     * @param  string  $toDate
+     * @param  int     $windowDays
+     * @param  int     $redundancyDays
+     * @param  int     $redundancyHours
+     * @param  int     $retentionHours
+     * @return \App\Jobs\IngestTickerPriceHistoryJob
+     */
+    protected function makeJobFromBuffer(
+        array $buffer,
+        string $resolutionMode,
+        string $globalFrom,
+        string $toDate,
+        int $windowDays,
+        int $redundancyDays,
+        int $redundancyHours,
+        int $retentionHours
+    ): IngestTickerPriceHistoryJob {
+        // NOTE: The job will:
+        //  - Loop these tickers
+        //  - Compute per-ticker auto-from for 1d and 1h
+        //  - Fetch data via PolygonTickerPriceHistoryService
+        //  - Upsert into ticker_price_histories in bulk
+        return new IngestTickerPriceHistoryJob(
+            $buffer,
+            $resolutionMode,
+            $globalFrom,
+            $toDate,
+            $windowDays,
+            $redundancyDays,
+            $redundancyHours,
+            $retentionHours
+        );
     }
 }

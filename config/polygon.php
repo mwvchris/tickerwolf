@@ -49,6 +49,8 @@ return [
     |
     */
 
+    'price_history_window_days' => env('POLYGON_PRICE_HISTORY_WINDOW_DAYS', 10),
+
     'price_history_min_date' => env('POLYGON_PRICE_HISTORY_MIN_DATE', '2020-01-01'),
 
     // “day”, “minute”, “hour”

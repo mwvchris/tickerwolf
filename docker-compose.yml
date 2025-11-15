@@ -1,7 +1,8 @@
-version: "3.8"
-
 services:
 
+  # ------------------------------------------------------
+  # PHP FPM – main application runtime
+  # ------------------------------------------------------
   php:
     build:
       context: ./
@@ -23,6 +24,9 @@ services:
       - mariadb
       - redis
 
+  # ------------------------------------------------------
+  # Laravel Scheduler – runs schedule:run every 60 seconds
+  # ------------------------------------------------------
   scheduler:
     build:
       context: ./
@@ -41,13 +45,20 @@ services:
       - ./docker/php/php-ini-overrides.ini:/usr/local/etc/php/conf.d/99-overrides.ini
       - ./docker/php/xdebug.ini:/usr/local/etc/php/conf.d/docker-php-ext-xdebug.ini
     depends_on:
-      - php
-      - mariadb
-      - redis
+      php:
+        condition: service_started
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_started
+
+    # ALPINE-SAFE (single line)
     command: >
       sh -c "while true; do php artisan schedule:run --verbose --no-interaction; sleep 60; done"
 
-  # 👇 NEW: dedicated queue worker using a simple in-container supervisor loop
+  # ------------------------------------------------------
+  # Dedicated Queue Worker (Supervisor model)
+  # ------------------------------------------------------
   queue:
     build:
       context: ./
@@ -59,6 +70,17 @@ services:
     environment:
       - COMPOSER_MEMORY_LIMIT=-1
       - PHP_MEMORY_LIMIT=2G
+
+      - QUEUE_WORKER_QUEUE=${QUEUE_WORKER_QUEUE:-default}
+      - QUEUE_WORKER_SLEEP=${QUEUE_WORKER_SLEEP:-3}
+      - QUEUE_WORKER_BACKOFF=${QUEUE_WORKER_BACKOFF:-5}
+
+      # Safe defaults for large multi-ticker jobs
+      - QUEUE_WORKER_MAX_JOBS=${QUEUE_WORKER_MAX_JOBS:-10}
+      - QUEUE_WORKER_MAX_TIME=${QUEUE_WORKER_MAX_TIME:-900}     # 15 minutes
+      - QUEUE_WORKER_TRIES=${QUEUE_WORKER_TRIES:-3}
+      - QUEUE_WORKER_TIMEOUT=${QUEUE_WORKER_TIMEOUT:-300}       # 5 minutes
+
     volumes:
       - ./:/www/websites/tickerwolf.ai
       - ./storage:/www/websites/tickerwolf.ai/storage:rw
@@ -72,13 +94,14 @@ services:
         condition: service_started
       php:
         condition: service_started
-    command: >
-      sh -c "while true; do
-        php artisan queue:work --queue=default --sleep=1 --backoff=5 --max-jobs=25 --max-time=240 --tries=3 --timeout=120;
-        echo 'queue:work exited with code $?';
-        sleep 5;
-      done"
 
+    # ⭐ ALPINE-SAFE — SINGLE-LINE queue worker command
+    command: >
+      sh -c "while true; do php artisan queue:work --queue=${QUEUE_WORKER_QUEUE:-default} --sleep=${QUEUE_WORKER_SLEEP:-3} --backoff=${QUEUE_WORKER_BACKOFF:-5} --max-jobs=${QUEUE_WORKER_MAX_JOBS:-10} --max-time=${QUEUE_WORKER_MAX_TIME:-900} --tries=${QUEUE_WORKER_TRIES:-3} --timeout=${QUEUE_WORKER_TIMEOUT:-300} --memory=2048; EXIT_CODE=$?; echo \"queue:work exited with code $EXIT_CODE\"; sleep 5; done"
+
+  # ------------------------------------------------------
+  # Redis – caching & intraday data storage
+  # ------------------------------------------------------
   redis:
     image: redis:alpine
     container_name: tickerwolf-redis
@@ -89,6 +112,9 @@ services:
     ports:
       - "6379:6379"
 
+  # ------------------------------------------------------
+  # MariaDB – high-volume OHLCV + fundamentals store
+  # ------------------------------------------------------
   mariadb:
     image: mariadb:10.11
     container_name: tickerwolf-mariadb
@@ -113,6 +139,9 @@ services:
       timeout: 5s
       retries: 20
 
+  # ------------------------------------------------------
+  # NGINX – serves the Laravel app
+  # ------------------------------------------------------
   nginx:
     image: nginx:alpine
     container_name: tickerwolf-nginx
@@ -129,6 +158,9 @@ services:
     ports:
       - "80:80"
 
+  # ------------------------------------------------------
+  # Vite – hot reloading (Vue + Inertia)
+  # ------------------------------------------------------
   vite:
     image: node:22-alpine
     container_name: tickerwolf-vite

@@ -10,64 +10,176 @@ use App\Jobs\IngestTickerNewsJob;
 use App\Services\BatchMonitorService;
 use Throwable;
 
+/**
+ * ============================================================================
+ *  polygon:ticker-news:ingest
+ *  (v2.0 — Batched, Monitored, Incremental-Aware News Ingestion)
+ * ============================================================================
+ *
+ *  Queue Polygon/Massive.io news ingestion jobs for:
+ *    • A single ticker (via argument) → one job
+ *    • The active ticker universe     → many jobs, chunked into Bus::batch-es
+ *
+ *  The per-ticker incremental behavior (“fetch only newer articles”) lives in:
+ *      • IngestTickerNewsJob
+ *      • PolygonTickerNewsService
+ *
+ *  THIS COMMAND decides:
+ *      • which tickers get jobs
+ *      • how many recent articles to request (--limit)
+ *      • batching strategy (--batch, --sleep)
+ *      • queue + BatchMonitor + logging
+ *
+ * ============================================================================
+ */
 class PolygonTickerNewsIngest extends Command
 {
-    protected $signature = 'polygon:ticker-news:ingest 
-                            {ticker? : Optional specific ticker symbol} 
-                            {--limit=50 : Max news items per ticker} 
-                            {--batch=200 : Number of tickers per batch}
-                            {--sleep=5 : Seconds to pause between batch dispatches}';
+    /**
+     * Artisan signature.
+     */
+    protected $signature = 'polygon:ticker-news:ingest
+                            {ticker? : Optional specific, case-sensitive ticker symbol}
+                            {--limit=200 : Approximate max news items per ticker this run}
+                            {--batch=400 : Number of tickers per Bus::batch dispatch}
+                            {--sleep=2 : Seconds to pause between batch dispatches}';
 
-    protected $description = 'Queue and batch ingest of latest news items for one or all tickers from Polygon.io';
+    /**
+     * Description.
+     */
+    protected $description = 'Queue and batch ingest of latest / incremental news items for one or all tickers from Polygon/Massive.io';
 
-    public function handle(): int
+    /**
+     * 🔒 Ensure limit is always a safe, serializable scalar.
+     */
+    protected function sanitizeLimit($limit): int
     {
-        $ticker = $this->argument('ticker');
-        $limit = (int) $this->option('limit');
-        $batchSize = (int) $this->option('batch');
-        $sleep = (int) $this->option('sleep');
-
-        if ($ticker) {
-            return $this->handleSingleTicker($ticker, $limit);
-        }
-
-        return $this->handleBatchIngestion($limit, $batchSize, $sleep);
+        return is_numeric($limit) ? (int)$limit : 200;
     }
 
-    protected function handleSingleTicker(string $ticker, int $limit): int
+    /**
+     * Entry point.
+     */
+    public function handle(): int
     {
-        $this->info("📰 Queuing news ingestion for {$ticker}...");
-        $tickerModel = Ticker::where('ticker', $ticker)->first();
+        $tickerArg = $this->argument('ticker');
+        $ticker    = $tickerArg !== null ? trim($tickerArg) : null;
 
-        if (! $tickerModel) {
-            $this->error("Ticker {$ticker} not found.");
+        // Ensure limit is always scalar
+        $limit     = $this->sanitizeLimit($this->option('limit'));
+        $batchSize = (int)$this->option('batch');
+        $sleep     = (int)$this->option('sleep');
+
+        if ($batchSize <= 0) $batchSize = 400;
+        if ($sleep < 0) $sleep = 0;
+
+        $logger = Log::channel('ingest');
+
+        $logger->info('📰 polygon:ticker-news:ingest starting', [
+            'ticker'     => $ticker ?? 'ALL_ACTIVE',
+            'limit'      => $limit,
+            'batch_size' => $batchSize,
+            'sleep'      => $sleep,
+        ]);
+
+        if (!empty($ticker)) {
+            return $this->handleSingleTicker($ticker, $limit, $logger);
+        }
+
+        return $this->handleBatchIngestion($limit, $batchSize, $sleep, $logger);
+    }
+
+    /**
+     * Handle single-ticker mode (no Bus::batch needed).
+     */
+    protected function handleSingleTicker(string $ticker, int $limit, $logger): int
+    {
+        $symbol = trim($ticker);
+
+        $this->info("📰 Queuing news ingestion for [{$symbol}]...");
+        $logger->info('📰 Queuing news ingestion for single ticker', [
+            'ticker' => $symbol,
+            'limit'  => $limit,
+        ]);
+
+        $tickerModel = Ticker::where('ticker', $symbol)->first();
+
+        if (!$tickerModel) {
+            $this->error("❌ Ticker {$symbol} not found.");
+            $logger->warning('⚠️ Ticker not found for news ingest', ['ticker' => $symbol]);
             return self::FAILURE;
         }
 
-        IngestTickerNewsJob::dispatch($tickerModel->id, $limit)->onQueue('default');
-        $this->info("✅ Dispatched news job for {$ticker}");
-        return self::SUCCESS;
+        try {
+            IngestTickerNewsJob::dispatch($tickerModel->id, $limit)
+                ->onConnection('database')
+                ->onQueue('default');
+
+            $this->info("✅ Dispatched news job for {$symbol}");
+            $logger->info('✅ Dispatched news job for single ticker', [
+                'ticker_id' => $tickerModel->id,
+                'ticker'    => $symbol,
+                'limit'     => $limit,
+            ]);
+
+            return self::SUCCESS;
+
+        } catch (Throwable $e) {
+            $this->error("❌ Failed to dispatch news job for {$symbol}: {$e->getMessage()}");
+
+            $logger->error('❌ Exception while dispatching single-ticker news job', [
+                'ticker' => $symbol,
+                'limit'  => $limit,
+                'error'  => $e->getMessage(),
+            ]);
+
+            return self::FAILURE;
+        }
     }
 
-    protected function handleBatchIngestion(int $limit, int $batchSize, int $sleep): int
+    /**
+     * Handle full-universe ingestion.
+     */
+    protected function handleBatchIngestion(int $limit, int $batchSize, int $sleep, $logger): int
     {
-        $tickers = Ticker::select('id', 'ticker')->where('active', true)->orderBy('id')->cursor();
+        $this->info("🔎 Selecting active tickers for news ingestion...");
 
-        if ($tickers->count() === 0) {
-            $this->warn('No active tickers found.');
+        $baseQuery = Ticker::query()
+            ->select('id', 'ticker')
+            ->where('active', true)
+            ->orderBy('id');
+
+        // IMPORTANT: cursor() does not support ->count()
+        $totalTickers = (clone $baseQuery)->count();
+
+        if ($totalTickers === 0) {
+            $this->warn('⚠️ No active tickers found. Nothing to ingest.');
+            $logger->warning('⚠️ No active tickers found for news ingestion');
             return self::SUCCESS;
         }
 
         $this->info("🧱 Dispatching ticker news ingestion batches (batch size: {$batchSize})...");
-        $logger = Log::channel('ingest');
+        $this->line("   Total active tickers : {$totalTickers}");
+        $this->line("   Limit per ticker     : {$limit}");
+        $this->newLine();
 
-        $chunk = [];
-        $batchNumber = 0;
-        $total = 0;
+        $logger->info('🧱 Dispatching ticker news ingestion batches', [
+            'total_tickers' => $totalTickers,
+            'batch_size'    => $batchSize,
+            'limit'         => $limit,
+            'sleep'         => $sleep,
+        ]);
 
-        foreach ($tickers as $t) {
-            $chunk[] = new IngestTickerNewsJob($t->id, $limit);
-            $total++;
+        // Top-level batch monitor for UX
+        BatchMonitorService::createBatch('PolygonTickerNews', $totalTickers);
+
+        $chunk         = [];
+        $batchNumber   = 0;
+        $queuedTickers = 0;
+
+        foreach ($baseQuery->cursor() as $ticker) {
+            // Only scalars passed into jobs → serialization-safe
+            $chunk[] = new IngestTickerNewsJob((int)$ticker->id, (int)$limit);
+            $queuedTickers++;
 
             if (count($chunk) >= $batchSize) {
                 $batchNumber++;
@@ -76,33 +188,60 @@ class PolygonTickerNewsIngest extends Command
             }
         }
 
-        if (! empty($chunk)) {
+        // Flush remaining jobs (last partial batch)
+        if (!empty($chunk)) {
             $batchNumber++;
             $this->dispatchChunk($chunk, $batchNumber, $sleep, $logger);
         }
 
-        $this->info("✅ Queued {$total} tickers across {$batchNumber} batches.");
+        $this->info("✅ Queued {$queuedTickers} tickers across {$batchNumber} batches.");
+        $logger->info('🏁 polygon:ticker-news:ingest batch enqueue complete', [
+            'queued_tickers' => $queuedTickers,
+            'batches'        => $batchNumber,
+            'limit'          => $limit,
+        ]);
+
         return self::SUCCESS;
     }
 
+    /**
+     * Dispatch one Bus::batch of jobs.
+     *
+     * @param array<IngestTickerNewsJob> $jobs
+     */
     protected function dispatchChunk(array $jobs, int $batchNumber, int $sleep, $logger): void
     {
+        if (empty($jobs)) return;
+
+        $jobCount = count($jobs);
+
         try {
+            $logger->info('📦 Dispatching PolygonNews batch', [
+                'batch_number' => $batchNumber,
+                'jobs'         => $jobCount,
+            ]);
+
             $batch = Bus::batch($jobs)
                 ->name("PolygonNews Batch #{$batchNumber}")
                 ->onConnection('database')
                 ->onQueue('default')
-                ->then(fn() => Log::info("✅ PolygonNews Batch #{$batchNumber} complete"))
-                ->catch(fn(Throwable $e) => Log::error("❌ PolygonNews Batch #{$batchNumber} failed: {$e->getMessage()}"))
                 ->dispatch();
 
-            BatchMonitorService::createBatch("PolygonNews Batch #{$batchNumber}", count($jobs));
+            $this->info("✅ Dispatched news batch #{$batchNumber} ({$batch->totalJobs} jobs)");
 
-            $this->info("✅ Dispatched batch #{$batchNumber} ({$batch->totalJobs} jobs)");
-            sleep($sleep);
+            if ($sleep > 0) {
+                $this->info("⏳ Sleeping {$sleep}s before next news batch...");
+                sleep($sleep);
+            }
+
         } catch (Throwable $e) {
-            $logger->error("Error dispatching batch #{$batchNumber}: {$e->getMessage()}");
-            $this->error("❌ Failed to dispatch batch #{$batchNumber}: {$e->getMessage()}");
+            $this->error("❌ Failed to dispatch news batch #{$batchNumber}: {$e->getMessage()}");
+
+            $logger->error('❌ Exception while dispatching PolygonNews batch', [
+                'batch_number' => $batchNumber,
+                'jobs'         => $jobCount,
+                'error'        => $e->getMessage(),
+            ]);
         }
     }
 }

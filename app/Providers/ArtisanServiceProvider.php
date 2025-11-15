@@ -47,6 +47,8 @@ class ArtisanServiceProvider extends ServiceProvider
             \App\Console\Commands\PolygonPrefetchIntradayPrices::class,
             \App\Console\Commands\TickersPurgeOldIntraday::class,
             \App\Console\Commands\TickersRefreshAll::class,
+            \App\Console\Commands\OptimizeEnvironment::class,
+            \App\Console\Commands\QueueSupervisor::class,
         ]);
     }
 }

@@ -124,6 +124,11 @@ class TickerController extends Controller
         }
 
         // ------------------------------------------------------------------
+        // Override 1W series with raw hourly bars
+        // ------------------------------------------------------------------
+        $chartSeries['1W'] = $ticker->hourlyPriceSeriesForOneWeek();
+
+        // ------------------------------------------------------------------
         // Intraday (1-minute) snapshot via Redis/Polygon
         // ------------------------------------------------------------------
         $intradaySnapshot = $realtimeService->getIntradaySnapshotForTicker($ticker);
@@ -140,6 +145,29 @@ class TickerController extends Controller
         $intradaySessionLabel = $intradaySnapshot['session_label']      ?? null;
         $intradayTimeLabel    = $intradaySnapshot['session_time_human'] ?? null;
         $intradaySessionCode  = $intradaySnapshot['session']            ?? null;
+
+        // ------------------------------------------------------------------
+        // 1D Chart: use intraday (Redis) if available, otherwise
+        //          fall back to last 24 hours of hourly bars.
+        // ------------------------------------------------------------------
+        $intradaySeries = $ticker->buildIntradaySeries($intradaySnapshot);
+
+        if (empty($intradaySeries)) {
+            // Fallback: use last 24 hours of hourly bars
+            $intradaySeries = $ticker->priceHistories()
+                ->where('resolution', '1h')
+                ->where('t', '>=', now()->subHours(24))
+                ->orderBy('t')
+                ->get()
+                ->map(fn ($p) => [
+                    'x' => \Illuminate\Support\Carbon::parse($p->t)->toIso8601String(),
+                    'y' => (float) $p->c,
+                ])
+                ->values()
+                ->all();
+        }
+        // Set final 1D dataset
+        $chartSeries['1D'] = $intradaySeries;
 
         // ------------------------------------------------------------------
         // Header Stats: match expectations from Google/TradingView/Perplexity

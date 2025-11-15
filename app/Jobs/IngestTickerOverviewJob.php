@@ -14,36 +14,60 @@ use Illuminate\Support\Facades\Log;
 use Throwable;
 
 /**
- * Job: IngestTickerOverviewJob
+ * ============================================================================
+ *  IngestTickerOverviewJob  (v2.1 — Hardened & Time-Aware)
+ * ============================================================================
  *
- * Processes a batch of ticker symbols by fetching their overview data
- * from Polygon.io and upserting into the local DB.
- *
- * Note: This job is dispatched in batches by PolygonTickerOverviewsIngest.
- * Each instance should only contain scalar ticker symbols (strings) to
- * ensure serialization into the database queue works properly.
+ *  ✔ Ensures all tickers are STRINGS before serialization
+ *  ✔ Completely prevents "Array to string conversion" errors
+ *  ✔ Safe JSON logging for debugging without breaking workers
+ *  ✔ Validates Polygon response shape at runtime
+ *  ✔ Ensures the service receives only scalar ticker symbols
+ *  ✔ Fully compatible with database queue serialization
+ *  ✔ Adds basic timing info to understand per-job runtime
+ * ============================================================================
  */
 class IngestTickerOverviewJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels, Batchable;
 
     /**
-     * @var array List of ticker symbols (strings only)
+     * @var array<string> Guaranteed list of clean string tickers
      */
-    protected $tickers;
+    protected array $tickers;
 
     /**
-     * @param array $tickers Plain array of ticker symbols, e.g. ['AAPL','MSFT']
+     * Maximum attempts for this job.
+     *
+     * (We keep this modest; flakey tickers will eventually give up.)
+     */
+    public int $tries = 3;
+
+    /**
+     * @param  array  $tickers  An array of raw items (strings, models, objects, etc.).
+     *                          All values are normalized to simple strings here.
      */
     public function __construct(array $tickers)
     {
-        // Convert possible Eloquent models or objects to strings for safe serialization
-        $this->tickers = array_map(function ($t) {
+        $clean = [];
+
+        foreach ($tickers as $t) {
             if (is_object($t) && isset($t->ticker)) {
-                return $t->ticker;
+                $clean[] = (string) $t->ticker;
+            } elseif (is_string($t)) {
+                $clean[] = $t;
+            } elseif (is_scalar($t)) {
+                $clean[] = (string) $t;
+            } else {
+                // ❗ Any non-scalar / non-string / non-model value is discarded to avoid crashes.
+                Log::channel('ingest')->warning('⚠️ Dropping non-scalar ticker in job payload', [
+                    'received_type' => gettype($t),
+                    'value_preview' => is_array($t) ? array_slice($t, 0, 5) : $t,
+                ]);
             }
-            return (string) $t;
-        }, $tickers);
+        }
+
+        $this->tickers = array_values($clean);
     }
 
     /**
@@ -51,47 +75,74 @@ class IngestTickerOverviewJob implements ShouldQueue
      */
     public function handle(): void
     {
-        $service = App::make(PolygonTickerOverviewService::class);
-        $batchId = $this->batchId ?? 'n/a';
-        $total = count($this->tickers);
+        $service  = App::make(PolygonTickerOverviewService::class);
+        $batchId  = $this->batchId ?? 'n/a';
+        $total    = count($this->tickers);
+        $started  = microtime(true);
 
-        Log::channel('ingest')->info("🚀 Processing ticker overview batch", [
+        Log::channel('ingest')->info("🚀 Starting ticker overview batch", [
             'batch_id' => $batchId,
-            'total_tickers' => $total,
-            'tickers_sample' => array_slice($this->tickers, 0, 5),
+            'count'    => $total,
+            'sample'   => array_slice($this->tickers, 0, 5),
         ]);
 
-        $processed = $succeeded = $failed = 0;
+        $processed = 0;
+        $succeeded = 0;
+        $failed    = 0;
 
         foreach ($this->tickers as $ticker) {
+            // ⛑ Safety guard: ensure scalar string before service call
+            if (! is_string($ticker) || trim($ticker) === '') {
+                $failed++;
+                Log::channel('ingest')->error("❌ Invalid ticker value encountered", [
+                    'batch_id'   => $batchId,
+                    'ticker_raw' => $ticker,
+                ]);
+                $processed++;
+                continue;
+            }
+
             try {
-                $service->fetchAndUpsertOverview($ticker);
+                $result = $service->fetchAndUpsertOverview($ticker);
+
+                // OPTIONAL: Validate service return shape to prevent upstream failures
+                if (is_array($result) && isset($result['error'])) {
+                    throw new \Exception("Polygon service reported error: " . json_encode($result['error']));
+                }
+
                 $succeeded++;
             } catch (Throwable $e) {
                 $failed++;
-                Log::channel('ingest')->error("❌ Failed to process ticker overview", [
-                    'ticker' => $ticker,
+
+                Log::channel('ingest')->error("❌ Failed processing ticker overview", [
+                    'ticker'   => $ticker,
                     'batch_id' => $batchId,
-                    'error' => $e->getMessage(),
+                    'error'    => $e->getMessage(),
+                    'trace'    => substr($e->getTraceAsString(), 0, 300),
                 ]);
             }
 
             $processed++;
+
+            // Log progress every 50 tickers or at end
             if ($processed % 50 === 0 || $processed === $total) {
                 Log::channel('ingest')->info("📊 Batch progress", [
-                    'batch_id' => $batchId,
+                    'batch_id'  => $batchId,
                     'processed' => $processed,
                     'succeeded' => $succeeded,
-                    'failed' => $failed,
+                    'failed'    => $failed,
                 ]);
             }
         }
 
-        Log::channel('ingest')->info("✅ Batch complete", [
-            'batch_id' => $batchId,
+        $duration = microtime(true) - $started;
+
+        Log::channel('ingest')->info("✅ Overview batch complete", [
+            'batch_id'  => $batchId,
             'processed' => $processed,
             'succeeded' => $succeeded,
-            'failed' => $failed,
+            'failed'    => $failed,
+            'duration_s'=> round($duration, 2),
         ]);
     }
 }

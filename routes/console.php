@@ -31,7 +31,8 @@ app()->afterResolving(Schedule::class, function (Schedule $schedule) {
     |--------------------------------------------------------------------------
     | 1️⃣ Intraday Prefetch to Redis (1-min, 15-min delayed)
     |--------------------------------------------------------------------------
-    | Runs every minute during US market hours.
+    | Runs every minute during US market hours to warm Redis with
+    | 1-minute OHLCV snapshots via PolygonRealtimePriceService.
     */
     $schedule->command('polygon:intraday-prices:prefetch')
         ->timezone('America/New_York')
@@ -46,96 +47,78 @@ app()->afterResolving(Schedule::class, function (Schedule $schedule) {
 
     /*
     |--------------------------------------------------------------------------
-    | 2️⃣ Polygon: Ticker Universe
+    | 2️⃣ Nightly Umbrella Refresh (tickers:refresh-all --daily)
     |--------------------------------------------------------------------------
+    |
+    | Runs the “daily” TickerWolf ingestion + analytics pipeline in a single,
+    | ordered command. This maps directly to the --daily mode in the
+    | TickersRefreshAll command and intentionally:
+    |
+    |   • Includes:
+    |       1. polygon:tickers:ingest           (universe + new symbols)
+    |       2. tickers:generate-slugs           (SEO slugs)
+    |       3. polygon:ticker-overviews:ingest  (company metadata)
+    |       4. polygon:ticker-price-histories:ingest (smart missing-date, windowed)
+    |       5. tickers:compute-indicators       (technical indicators, 1d)
+    |       6. tickers:build-snapshots          (feature snapshots / metrics)
+    |       7. polygon:ticker-news:ingest       (news items, windowed / incremental)
+    |       8. polygon:intraday-prices:prefetch (one-shot warm Redis snapshot)
+    |
+    |   • Skips:
+    |       - polygon:fundamentals:ingest
+    |
+    | Fundamentals are handled separately in a weekly run (see schedule #3).
+    |
+    | Notes:
+    |   • This runs in "safe" mode (no --fast flag) for nightly production-style
+    |     refreshes. For manual local catch-up you can still run:
+    |         php artisan tickers:refresh-all --dev
+    |     which implies --fast and skips fundamentals/news.
+    |   • Assumes the queue worker is running in the queue container.
     */
-    $schedule->command('polygon:tickers:ingest --market=stocks')
-        ->timezone('America/Los_Angeles')
-        ->dailyAt('19:30')
-        ->withoutOverlapping()
-        ->appendOutputTo(storage_path('logs/polygon/cron/tickers_cron.log'));
-
-    /*
-    |--------------------------------------------------------------------------
-    | 3️⃣ Ticker Slugs (SEO)
-    |--------------------------------------------------------------------------
-    */
-    $schedule->command('tickers:generate-slugs')
-        ->timezone('America/Los_Angeles')
-        ->dailyAt('19:45')
-        ->withoutOverlapping()
-        ->appendOutputTo(storage_path('logs/polygon/cron/tickers_cron.log'));
-
-    /*
-    |--------------------------------------------------------------------------
-    | 4️⃣ Polygon: Ticker Overviews
-    |--------------------------------------------------------------------------
-    */
-    $schedule->command('polygon:ticker-overviews:ingest --batch=1000 --sleep=5')
+    $schedule->command('tickers:refresh-all --daily')
         ->timezone('America/Los_Angeles')
         ->dailyAt('20:00')
         ->withoutOverlapping()
-        ->appendOutputTo(storage_path('logs/polygon/cron/ticker_overviews_cron.log'));
+        ->appendOutputTo(storage_path('logs/polygon/cron/tickers_refresh_all_cron.log'));
 
     /*
     |--------------------------------------------------------------------------
-    | 5️⃣ Polygon: Fundamentals (heavier job)
+    | 3️⃣ Weekly Fundamentals-Only Umbrella (tickers:refresh-all --weekly)
     |--------------------------------------------------------------------------
+    |
+    | Runs the heavier fundamentals pipeline once per week. The --weekly mode
+    | in TickersRefreshAll is defined to:
+    |
+    |   • Include:
+    |       - polygon:fundamentals:ingest (2019+; all timeframes; windowed)
+    |
+    |   • Skip:
+    |       - tickers / slugs / overviews
+    |       - price histories
+    |       - indicators
+    |       - snapshots
+    |       - news
+    |       - intraday prefetch
+    |
+    | This keeps fundamentals fresh without hammering your box every night.
     */
-    $schedule->command('polygon:fundamentals:ingest --timeframe=all --gte=2019-01-01 --batch=2000 --sleep=1')
+    $schedule->command('tickers:refresh-all --weekly')
         ->timezone('America/Los_Angeles')
-        ->dailyAt('20:45')
+        ->weeklyOn(0, '22:30') // Sunday 22:30 PT
         ->withoutOverlapping()
-        ->appendOutputTo(storage_path('logs/polygon/cron/fundamentals_cron.log'));
+        ->appendOutputTo(storage_path('logs/polygon/cron/tickers_fundamentals_weekly_cron.log'));
 
     /*
     |--------------------------------------------------------------------------
-    | 6️⃣ Polygon: Price History (smart missing-date ingest)
+    | 4️⃣ Intraday DB Purge (rolling retention)
     |--------------------------------------------------------------------------
-    */
-    $schedule->command('polygon:ticker-price-histories:ingest --resolution=1d --sleep=1')
-        ->timezone('America/Los_Angeles')
-        ->dailyAt('21:30')
-        ->withoutOverlapping()
-        ->appendOutputTo(storage_path('logs/polygon/cron/ticker_price_histories_cron.log'));
-
-    /*
-    |--------------------------------------------------------------------------
-    | 7️⃣ Indicators (SMA/EMA/RSI/etc)
-    |--------------------------------------------------------------------------
-    */
-    $schedule->command('tickers:compute-indicators --from=2019-01-01 --to=2030-01-01 --batch=3000 --sleep=1 --include-inactive')
-        ->timezone('America/Los_Angeles')
-        ->dailyAt('22:30')
-        ->withoutOverlapping()
-        ->appendOutputTo(storage_path('logs/polygon/cron/indicators_cron.log'));
-
-    /*
-    |--------------------------------------------------------------------------
-    | 8️⃣ Ticker Snapshots / Metrics
-    |--------------------------------------------------------------------------
-    */
-    $schedule->command('tickers:build-snapshots --from=2019-01-01 --to=2030-01-01 --batch=500 --sleep=1 --include-inactive')
-        ->timezone('America/Los_Angeles')
-        ->dailyAt('23:00')
-        ->withoutOverlapping()
-        ->appendOutputTo(storage_path('logs/polygon/cron/snapshots_cron.log'));
-
-    /*
-    |--------------------------------------------------------------------------
-    | 9️⃣ Polygon: News Ingestion
-    |--------------------------------------------------------------------------
-    */
-    $schedule->command('polygon:ticker-news:ingest --batch=500 --sleep=1')
-        ->timezone('America/Los_Angeles')
-        ->dailyAt('23:30')
-        ->withoutOverlapping()
-        ->appendOutputTo(storage_path('logs/polygon/cron/news_cron.log'));
-
-    /*
-    |--------------------------------------------------------------------------
-    | 🔟 Intraday DB Purge (rolling retention)
-    |--------------------------------------------------------------------------
+    | Cleans up old intraday data (if/when you store it in DB) to keep tables
+    | lean and reduce query overhead. Currently wired to:
+    |
+    |   tickers:purge-old-intraday --days=8
+    |
+    | meaning: keep ~8 days of intraday history.
     */
     $schedule->command('tickers:purge-old-intraday --days=8')
         ->timezone('America/Los_Angeles')
@@ -145,12 +128,68 @@ app()->afterResolving(Schedule::class, function (Schedule $schedule) {
 
     /*
     |--------------------------------------------------------------------------
-    | 1️⃣1️⃣ Polygon: Batch Cleanup (existing)
+    | 🔁 Hourly (1h) Price History Ingestion — Daily Post-Close
     |--------------------------------------------------------------------------
+    | Fetches the latest 7-day rolling 1h bars with redundancy, and automatically
+    | purges hourly bars older than 7 days.
+    |
+    | Runs after market close (NYSE: 4pm ET → 1pm PT).
+    | Here we schedule for 4:30pm PT to allow Polygon finalization.
+    */
+    $schedule->command('polygon:ticker-price-histories:ingest --resolution=1h --batch=600 --sleep=0')
+        ->timezone('America/Los_Angeles')
+        ->dailyAt('16:30')   // 4:30 PM PT
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/polygon/cron/hourly_price_history_cron.log'));
+
+    /*
+    |--------------------------------------------------------------------------
+    | 5️⃣ Polygon: Batch Cleanup
+    |--------------------------------------------------------------------------
+    | Cleans up completed/failed job batches older than 30 days to keep the
+    | job_batches table from growing unbounded.
     */
     $schedule->command('polygon:batches:cleanup --completed --days=30')
         ->timezone('America/Los_Angeles')
         ->dailyAt('23:59')
         ->onSuccess(fn () => Log::info('Polygon batch cleanup ran successfully.'))
         ->appendOutputTo(storage_path('logs/polygon/cron/batch_cleanup_cron.log'));
+
+    /*
+    |--------------------------------------------------------------------------
+    | 6️⃣ Queue Supervisor
+    |--------------------------------------------------------------------------
+    |
+    | Runs every 5 minutes to:
+    |   • Log queue health and backlog
+    |   • Trigger queue:restart when thresholds are exceeded
+    |
+    | Safe in both dev + prod. In dev, it simply keeps your workers sane
+    | while you experiment with large ingest runs.
+    */
+    $schedule->command('queue:supervisor')
+        ->everyFiveMinutes()
+        ->withoutOverlapping()
+        ->appendOutputTo(storage_path('logs/queue/supervisor.log'));
+
+    /*
+    |--------------------------------------------------------------------------
+    | 🔍 (Optional) Granular Nightly Steps [DISABLED]
+    |--------------------------------------------------------------------------
+    |
+    | The following used to be scheduled individually:
+    |
+    |   polygon:tickers:ingest
+    |   tickers:generate-slugs
+    |   polygon:ticker-overviews:ingest
+    |   polygon:fundamentals:ingest
+    |   polygon:ticker-price-histories:ingest
+    |   tickers:compute-indicators
+    |   tickers:build-snapshots
+    |   polygon:ticker-news:ingest
+    |
+    | They are now orchestrated via tickers:refresh-all instead.
+    | If you ever want to go back to fully granular scheduling, you can
+    | reintroduce those schedule definitions here.
+    */
 });
