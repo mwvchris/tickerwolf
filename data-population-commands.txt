@@ -98,7 +98,8 @@ php artisan polygon:intraday-prices:prefetch --symbol=APLD --force
 
 Verify:
 docker exec -it tickerwolf-redis redis-cli
-KEYS tw:rt:snap:APLD*
+127.0.0.1:6379> keys *
+
 
 ***********************
  Mariadb/Mysql

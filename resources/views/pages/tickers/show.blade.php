@@ -28,12 +28,7 @@
         <div id="price-chart-tabs" class="is-scrollbar-hidden overflow-x-auto rounded-lg bg-slate-200 text-slate-600 dark:bg-navy-800 dark:text-navy-200">
             <div class="tabs-list flex p-1">
                 @foreach (['1D','1W','1M','6M','1Y','5Y'] as $range)
-                <button
-                    data-chart-range="{{ $range }}"
-                    class="tab btn shrink-0 px-3 py-1 text-xs-plus font-medium"
-                    data-active-class="bg-white shadow-sm dark:bg-navy-500 dark:text-navy-100"
-                    data-default-class="hover:text-slate-800 focus:text-slate-800 dark:hover:text-navy-100 dark:focus:text-navy-100"
-                >
+                <button data-chart-range="{{ $range }}" class="tab btn shrink-0 px-3 py-1 text-xs-plus font-medium" data-active-class="bg-white shadow-sm dark:bg-navy-500 dark:text-navy-100" data-default-class="hover:text-slate-800 focus:text-slate-800 dark:hover:text-navy-100 dark:focus:text-navy-100">
                     {{ $range }}
                 </button>
                 @endforeach
@@ -55,51 +50,46 @@
 
         {{-- Price Snapshot --}}
 
-{{-- Close price row --}}
-<div class="flex items-end gap-2">
-  <span class="text-3xl font-semibold">
-    {{ $headerStats['lastPrice'] }}
-  </span>
-  <span class="text-sm text-slate-500">
-    {{ $headerStats['closeTimeLabel'] }}
-  </span>
-</div>
+        {{-- Close price row --}}
+        <div class="flex items-end gap-2">
+            <span class="text-3xl font-semibold">
+                {{ $headerStats['lastPrice'] }}
+            </span>
+            <span class="text-sm text-slate-500">
+                {{ $headerStats['closeTimeLabel'] }}
+            </span>
+        </div>
 
-{{-- After hours / pre-market row (only if session != regular/closed) --}}
-@if(in_array($headerStats['intradaySessionCode'], ['pre', 'after'], true))
-  <div class="mt-1 flex items-center gap-2 text-xs-plus">
-    <span class="font-medium">
-      {{ $headerStats['intradaySessionLabel'] }}
-    </span>
-    @if($headerStats['intradayLastPrice'] !== null)
-      <span>
-        {{ \App\Helpers\FormatHelper::currency($headerStats['intradayLastPrice']) }}
-      </span>
-    @endif
-    @if($headerStats['intradayChangeAbs'] !== null)
-      <span class="{{ $headerStats['intradayChangeAbs'] >= 0 ? 'text-emerald-500' : 'text-rose-500' }}">
-        {{ \App\Helpers\FormatHelper::signedCurrencyChange($headerStats['intradayChangeAbs']) }}
-        ({{ \App\Helpers\FormatHelper::percent($headerStats['intradayChangePct']) }})
-      </span>
-    @endif
-    @if($headerStats['intradayTimeLabel'])
-      <span class="text-slate-500">
-        {{ $headerStats['intradayTimeLabel'] }}
-      </span>
-    @endif
-  </div>
-@endif
+        {{-- After hours / pre-market row (only if session != regular/closed) --}}
+
+            {{-- dd($headerStats) --}}
+
+        @if(in_array($headerStats['intradaySessionCode'], ['pre', 'after'], true))
+        <div class="mt-1 flex items-center gap-2 text-xs-plus">
+            <span class="font-medium">
+            {{ $headerStats['intradaySessionLabel'] }}
+            </span>
+            @if($headerStats['intradayLastPrice'] !== null)
+            <span>
+                {{ \App\Helpers\FormatHelper::currency($headerStats['intradayLastPrice']) }}
+            </span>
+            @endif
+            @if($headerStats['intradayChangeAbs'] !== null)
+            <span class="{{ $headerStats['intradayChangeAbs'] >= 0 ? 'text-emerald-500' : 'text-rose-500' }}">
+                {{ \App\Helpers\FormatHelper::signedCurrencyChange($headerStats['intradayChangeAbs']) }}
+                ({{ \App\Helpers\FormatHelper::percent($headerStats['intradayChangePct']) }})
+            </span>
+            @endif
+            @if($headerStats['intradayTimeLabel'])
+            <span class="text-slate-500">
+                {{ $headerStats['intradayTimeLabel'] }}
+            </span>
+            @endif
+        </div>
+        @endif
 
         <div class="mb-2">
           <div class="flex items-center space-x-1">
-
-            {{-- Latest Price --}}
-            <p class="text-3xl font-semibold text-slate-700 dark:text-navy-100">
-              {{ $headerStats['lastPrice'] }}
-            </p>
-            <p class="text-xs text-slate-400 dark:text-navy-300">
-              {{ $ticker->currency }}
-            </p>
 
             {{-- Refresh Button --}}
             <!--

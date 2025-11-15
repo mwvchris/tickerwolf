@@ -29,15 +29,25 @@ app()->afterResolving(Schedule::class, function (Schedule $schedule) {
 
     /*
     |--------------------------------------------------------------------------
-    | 1️⃣ Intraday Prefetch to Redis (1-min, 15-min delayed)
+    | 1️⃣ Intraday Prefetch to Redis (1-min, extended-hours aware)
     |--------------------------------------------------------------------------
-    | Runs every minute during US market hours to warm Redis with
-    | 1-minute OHLCV snapshots via PolygonRealtimePriceService.
+    | Runs every minute on weekdays to warm Redis with 1-minute OHLCV snapshots
+    | via PolygonRealtimePriceService. Combined with polygon.intraday_max_age_minutes,
+    | this covers:
+    |
+    |   • Pre-market      (≈04:00–09:30 ET)
+    |   • Regular session (09:30–16:00 ET)
+    |   • After hours     (16:00–20:00 ET)
+    |   • Overnight       (20:00–04:00 ET; for 24/5 trading symbols)
+    |
+    | Notes:
+    |   • We no longer restrict by ->between('09:25','20:05'), so the prefetch
+    |     runs 24h on weekdays. This guarantees that the rolling window of bars
+    |     (configured by polygon.intraday_max_age_minutes) is continuously warm.
     */
     $schedule->command('polygon:intraday-prices:prefetch')
         ->timezone('America/New_York')
         ->weekdays()
-        ->between('09:25', '20:05')
         ->everyMinute()
         ->withoutOverlapping()
         ->appendOutputTo(storage_path(env(
