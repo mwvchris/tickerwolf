@@ -298,15 +298,14 @@ class Ticker extends Model
     }
 
     /**
-     * Clean base company name (removes trailing instrument descriptors).
-     * Example: "Arch Capital Group Ltd. Depositary Shares..." → "Arch Capital Group Ltd"
+     * Extract clean company name without stock type, share type, class, series,
+     * ADR/ADS, units, warrants, etc.
      *
-     * @return string|null
-     *
-     * @example
-     * <h1 class="text-xl font-semibold">
-     *   {{ $ticker->clean_base_name ?? $ticker->name }}
-     * </h1>
+     * Example:
+     *  "Alphabet Inc. Capital Stock – Class C" → "Alphabet Inc."
+     *  "AST SpaceMobile, Inc.. Common Stock – Class A" → "AST SpaceMobile, Inc."
+     *  "Rocket Lab Corp.. Common Stock" → "Rocket Lab Corp."
+     *  "Nebius Group N.V. Class A Ordinary Shares" → "Nebius Group N.V."
      */
     public function getCleanBaseNameAttribute(): ?string
     {
@@ -315,30 +314,116 @@ class Ticker extends Model
             return null;
         }
 
-        // Remove known suffixes but leave identifiers like "Series F" or "Class A"
-        $patterns = [
-            '/\b(common|ordinary)\s+stock\b/i',
-            '/\b(preferred|redeemable|depositary|depository)\s+shares?\b/i',
-            '/\bwarrants?\b/i',
-            '/\betf\b/i',
-            '/\btrust\s+units?\b/i',
-            '/\bnotes?\b/i',
-            '/\bincome\s+strategy\b/i',
-            '/\bfund\b/i',
-            '/\bexchange[-\s]*traded\s+fund\b/i',
+        // ---------------------------------------------
+        // Normalize spacing
+        // ---------------------------------------------
+        $name = preg_replace('/\s{2,}/', ' ', $name);
+        $name = preg_replace('/\.\./', '.', $name);       // Fix "Inc.." -> "Inc."
+        $name = preg_replace('/\s*\.\s*/', '. ', $name);  // space-normalize periods
+        $name = preg_replace('/\s*,\s*/', ', ', $name);   // commas
+        $name = preg_replace('/\s*[\-–—]\s*/', ' – ', $name);
+
+        // ---------------------------------------------
+        // Restore proper corporate suffixes *with periods*
+        // ---------------------------------------------
+        $corpPatterns = [
+            '/\bInc\b/i'           => 'Inc.',
+            '/\bInc\.\b/i'         => 'Inc.',
+            '/\bCorporation\b/i'   => 'Corporation',
+            '/\bCorp\b/i'          => 'Corp.',
+            '/\bCorp\.\b/i'        => 'Corp.',
+            '/\bCo\b/i'            => 'Co.',
+            '/\bCo\.\b/i'          => 'Co.',
+            '/\bLtd\b/i'           => 'Ltd.',
+            '/\bLtd\.\b/i'         => 'Ltd.',
+            '/\bLLC\b/i'           => 'LLC',
+            '/\bPLC\b/i'           => 'PLC',
+            '/\bN\.?\s?V\.?\b/i'   => 'N.V.',
         ];
+        foreach ($corpPatterns as $regex => $replacement) {
+            $name = preg_replace($regex, $replacement, $name);
+        }
 
-        $cleaned = preg_replace($patterns, '', $name);
-        $cleaned = preg_replace('/\s{2,}/', ' ', $cleaned);
-        $cleaned = trim($cleaned, " \t\n\r\0\x0B-");
-        $cleaned = preg_replace('/[,\.\-]+$/', '', $cleaned);
+        // Keep suffix periods tight
+        $name = preg_replace('/\.\s+/', '. ', $name);
 
-        // Normalize punctuation spacing and capitalization
-        $cleaned = preg_replace('/\s*,\s*/', ', ', $cleaned);
-        $cleaned = preg_replace('/\s*\.\s*/', '. ', $cleaned);
-        $cleaned = preg_replace('/\s{2,}/', ' ', $cleaned);
+        // ---------------------------------------------
+        // Remove stock-type words
+        // ---------------------------------------------
+        $remove = [
+            '/\bcommon\s+stock\b/i',
+            '/\bcapital\s+stock\b/i',
+            '/\bordinary\s+shares?\b/i',
+            '/\bpreferred\s+shares?\b/i',
+            '/\bpreferred\s+stock\b/i',
+            '/\bredeemable\s+shares?\b/i',
+            '/\bdepositary\s+shares?\b/i',
+            '/\bwarrants?\b/i',
+            '/\bunits?\b/i',
+            '/\bshares?\b/i',
+            '/\bstock\b/i',
+            '/\bsecurity\b/i',
+            '/\bsecurities\b/i',
+            '/\betf\b/i',
+            '/\betn\b/i',
+            '/\badr\b/i',
+            '/\bads\b/i',
+        ];
+        foreach ($remove as $pattern) {
+            $name = preg_replace($pattern, '', $name);
+        }
 
-        return ucfirst($cleaned);
+        // ---------------------------------------------
+        // Remove class/series
+        // ---------------------------------------------
+        $name = preg_replace('/\bClass\s+[A-Z0-9]+\b/i', '', $name);
+        $name = preg_replace('/\bSeries\s+[A-Z0-9]+\b/i', '', $name);
+
+        // ---------------------------------------------
+        // Cleanup punctuation / spaces
+        // ---------------------------------------------
+        $name = trim($name);
+        $name = preg_replace('/[ \-–—]+$/', '', $name);
+        $name = preg_replace('/\s{2,}/', ' ', $name);
+        $name = preg_replace('/\s+\./', '.', $name);
+
+        // ---------------------------------------------
+        // Remove duplicate trailing periods
+        // ---------------------------------------------
+        $name = preg_replace('/\.+$/', '.', $name);
+
+        return trim($name);
+    }
+
+    /**
+     * Extract ONLY the share class ("Class A", "Class C", "Series F", etc.)
+     * Example:
+     *   "Alphabet Inc. Capital Stock – Class C" → "Class C"
+     *   "Nebius Group N.V. Class A Ordinary Shares" → "Class A"
+     */
+    public function getShareClassAttribute(): ?string
+    {
+        $name = $this->name ?? '';
+
+        if (preg_match('/\b(Class|Series)\s+([A-Z0-9]+)\b/i', $name, $m)) {
+            return "{$m[1]} {$m[2]}";
+        }
+
+        return null;
+    }
+
+    /**
+     * Combine base name + class for UI layouts that want them together.
+     *
+     * Alphabet Inc. + Class C → "Alphabet Inc. – Class C"
+     */
+    public function getFullDisplayNameAttribute(): ?string
+    {
+        $base  = $this->clean_base_name;
+        $class = $this->share_class;
+
+        if (!$base) return null;
+        return $class ? "{$base} – {$class}" : $base;
     }
 
     /**
@@ -353,42 +438,7 @@ class Ticker extends Model
      */
     public function getCleanDisplayNameAttribute(): ?string
     {
-        $name = trim($this->name ?? '');
-        if ($name === '') {
-            return null;
-        }
-
-        $base = $this->clean_base_name ?? $name;
-
-        // Attempt to extract unique identifiers (Series, Class, etc.)
-        $matches = [];
-        preg_match('/(Series\s+[A-Z0-9]+|Class\s+[A-Z0-9]+)/i', $name, $matches);
-        $suffix = $matches[1] ?? null;
-
-        // Detect preferred or warrant instruments
-        $isPreferred  = stripos($name, 'preferred') !== false;
-        $isWarrant    = stripos($name, 'warrant') !== false;
-        $isDepositary = stripos($name, 'depositary') !== false;
-
-        $descriptor = '';
-        if ($isPreferred) {
-            $descriptor = 'Preferred';
-        } elseif ($isWarrant) {
-            $descriptor = 'Warrant';
-        } elseif ($isDepositary) {
-            $descriptor = 'Depositary Shares';
-        }
-
-        // Compose readable short display version
-        $display = $base;
-        if ($suffix || $descriptor) {
-            $display .= ' – ' . trim(($suffix ?? '') . ' ' . ($descriptor ?? ''));
-        }
-
-        // Clean up double spaces and punctuation
-        $display = preg_replace('/\s{2,}/', ' ', $display);
-
-        return trim($display, " \t\n\r\0\x0B-");
+        return $this->full_display_name;
     }
 
     /* ----------------------------------------------------------------------

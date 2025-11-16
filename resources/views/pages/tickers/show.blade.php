@@ -13,16 +13,17 @@
 
 <div class="col-span-12 lg:col-span-9">
 
-    {{-- Top Row: Logo + Name + Symbol + Exchange --}}
+    {{-- Top Row: Logo + Name + Chart Tabs --}}
     <div class="flex items-center justify-between space-x-2">
 
+        {{-- Logo + Name + Symbol + Exchange --}}
         <div class="flex items-center space-x-4 py-5 lg:py-6">
             <div class="avatar size-12">
                 <img src="{{ $ticker->icon_url }}" class="mask is-squircle object-cover" alt="{{ $ticker->clean_display_name }} Logo" />
             </div>
             <div>
                 <h2 class="text-xl font-medium text-slate-800 dark:text-navy-50 lg:text-2xl">
-                    {{ $ticker->clean_display_name }}
+                    {{ $headerStats['companyName'] }}
                 </h2>
                 <p class="text-xs text-slate-400 dark:text-navy-300 mt-0.5">
                     ${{ $ticker->ticker }} &bull; {{ $ticker->exchange_short }}
@@ -46,7 +47,6 @@
                 @endforeach
             </div>
         </div>
-
     </div>
 
 
@@ -56,7 +56,7 @@
 
     <div class="flex flex-col sm:flex-row sm:space-x-7">
 
-        {{-- LEFT SIDE — Price + Change + Time --}}
+        {{-- Price + Change + Time --}}
         <div class="mt-2 flex shrink-0 flex-col space-y-4 sm:items-start">
 
             {{-- ===================================== --}}
@@ -162,106 +162,72 @@
     </div>
 </div>
 
-  {{-- Right Column Overview Cards --}}
-  <div class="col-span-12 lg:col-span-3">
-    <div class="grid grid-cols-2 gap-3 sm:grid-cols-3 sm:gap-5 lg:grid-cols-2">
+{{-- Right Column Overview Cards --}}
+<div class="col-span-12 lg:col-span-3">
+    <div class="rounded-lg bg-info/10 px-4 pb-5 dark:bg-navy-800 sm:px-5">
+        <div class="flex items-center justify-between py-3">
 
-    {{-- Market Cap Card --}}
-      <div class="rounded-lg bg-slate-150 p-4 dark:bg-navy-700">
-        <div class="flex justify-between space-x-1">
-          <p class="text-xl font-semibold text-slate-700 dark:text-navy-100">
-            {{ $headerStats['marketCap'] }}
-          </p>
-          <svg xmlns="http://www.w3.org/2000/svg" class="size-5 text-info dark:text-info" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-            <path stroke-linecap="round" stroke-linejoin="round" d="M12 8c-1.657 0-3 .895-3 2s1.343 2 3 2 3 .895 3 2-1.343 2-3 2m0-8c1.11 0 2.08.402 2.599 1M12 8V7m0 1v8m0 0v1m0-1c-1.11 0-2.08-.402-2.599-1M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-          </svg>
-        </div>
-        <p class="mt-1 text-xs-plus">Market Cap</p>
-      </div>
-    
-    {{-- Avg. Volume --}}
-      <div class="rounded-lg bg-slate-150 p-4 dark:bg-navy-700">
+            <h2 class="font-medium tracking-wide text-slate-700 dark:text-navy-100">Company Overview</h2>
 
-        <div class="flex justify-between">
-          <p
-            class="text-xl font-semibold text-slate-700 dark:text-navy-100"
-          >
-            {{ $headerStats['avgVolume'] }}
-          </p>
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            class="size-5 text-success"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            stroke-width="2"
-          >
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              d="M9 12l2 2 4-4M7.835 4.697a3.42 3.42 0 001.946-.806 3.42 3.42 0 014.438 0 3.42 3.42 0 001.946.806 3.42 3.42 0 013.138 3.138 3.42 3.42 0 00.806 1.946 3.42 3.42 0 010 4.438 3.42 3.42 0 00-.806 1.946 3.42 3.42 0 01-3.138 3.138 3.42 3.42 0 00-1.946.806 3.42 3.42 0 01-4.438 0 3.42 3.42 0 00-1.946-.806 3.42 3.42 0 01-3.138-3.138 3.42 3.42 0 00-.806-1.946 3.42 3.42 0 010-4.438 3.42 3.42 0 00.806-1.946 3.42 3.42 0 013.138-3.138z"
-            />
-          </svg>
-        </div>
-        <p class="mt-1 text-xs-plus">Avg. Volume</p>
-      </div>
+            {{-- Company Options Menu --}}
+            <div id="company-options-menu" class="inline-flex">
+                <button class="popper-ref btn -mr-1.5 size-8 rounded-full p-0 hover:bg-slate-300/20 focus:bg-slate-300/20 active:bg-slate-300/25 dark:hover:bg-navy-300/20 dark:focus:bg-navy-300/20 dark:active:bg-navy-300/25">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="size-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+                    <path stroke-linecap="round" stroke-linejoin="round" d="M5 12h.01M12 12h.01M19 12h.01M6 12a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0zm7 0a1 1 0 11-2 0 1 1 0 012 0z" />
+                    </svg>
+                </button>
+                <div class="popper-root">
+                    <div class="popper-box rounded-md border border-slate-150 bg-white py-1.5 font-inter dark:border-navy-500 dark:bg-navy-700">
+                        <ul>
+                            <li><a href="#" class="flex h-8 items-center px-3 pr-8 font-medium tracking-wide outline-hidden transition-all hover:bg-slate-100 hover:text-slate-800 focus:bg-slate-100 focus:text-slate-800 dark:hover:bg-navy-600 dark:hover:text-navy-100 dark:focus:bg-navy-600 dark:focus:text-navy-100">Action</a></li>
+                            <li><a href="#" class="flex h-8 items-center px-3 pr-8 font-medium tracking-wide outline-hidden transition-all hover:bg-slate-100 hover:text-slate-800 focus:bg-slate-100 focus:text-slate-800 dark:hover:bg-navy-600 dark:hover:text-navy-100 dark:focus:bg-navy-600 dark:focus:text-navy-100">Another Action</a></li>
+                            <li><a href="#" class="flex h-8 items-center px-3 pr-8 font-medium tracking-wide outline-hidden transition-all hover:bg-slate-100 hover:text-slate-800 focus:bg-slate-100 focus:text-slate-800 dark:hover:bg-navy-600 dark:hover:text-navy-100 dark:focus:bg-navy-600 dark:focus:text-navy-100">Something else</a></li>
+                        </ul>
+                        <div class="my-1 h-px bg-slate-150 dark:bg-navy-500"></div>
+                        <ul>
+                            <li><a href="#" class="flex h-8 items-center px-3 pr-8 font-medium tracking-wide outline-hidden transition-all hover:bg-slate-100 hover:text-slate-800 focus:bg-slate-100 focus:text-slate-800 dark:hover:bg-navy-600 dark:hover:text-navy-100 dark:focus:bg-navy-600 dark:focus:text-navy-100">Separated Link</a></li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
 
-    {{-- 52 Week High --}}
-      <div class="rounded-lg bg-slate-150 p-4 dark:bg-navy-700">
-        <div class="flex justify-between">
-          <p
-            class="text-xl font-semibold text-slate-700 dark:text-navy-100"
-          >
-            {{ $headerStats['high52w'] }}
-          </p>
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            class="size-5 text-warning"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            stroke-width="2"
-          >
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
-            />
-          </svg>
         </div>
-        <p class="mt-1 text-xs-plus">52-Wk. High</p>
-      </div>
-
-    {{-- 52 Week Low --}}
-      <div class="rounded-lg bg-slate-150 p-4 dark:bg-navy-700">
-        <div class="flex justify-between">
-          <p
-            class="text-xl font-semibold text-slate-700 dark:text-navy-100"
-          >
-            {{ $headerStats['low52w'] }}
-          </p>
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            class="size-5 text-info"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            stroke-width="2"
-          >
-            <path
-              d="M9 17a2 2 0 11-4 0 2 2 0 014 0zM19 17a2 2 0 11-4 0 2 2 0 014 0z"
-            />
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              d="M13 16V6a1 1 0 00-1-1H4a1 1 0 00-1 1v10a1 1 0 001 1h1m8-1a1 1 0 01-1 1H9m4-1V8a1 1 0 011-1h2.586a1 1 0 01.707.293l3.414 3.414a1 1 0 01.293.707V16a1 1 0 01-1 1h-1m-6-1a1 1 0 001 1h1M5 17a2 2 0 104 0m-4 0a2 2 0 114 0m6 0a2 2 0 104 0m-4 0a2 2 0 114 0"
-            />
-          </svg>
+        <div class="space-y-4">
+            <div class="flex justify-between">
+                <div>
+                    <p class="text-xs text-slate-400 dark:text-navy-300">Symbol</p>
+                    <p class="text-xl font-medium text-slate-700 dark:text-navy-100"><span>$</span>{{ $ticker->ticker }}</p>
+                </div>
+                <div>
+                    <p class="text-xs text-slate-400 dark:text-navy-300">Mkt. Cap</p>
+                    <p class="text-xl font-medium text-slate-700 dark:text-navy-100">{{ $headerStats['marketCap'] }}</p>
+                </div>
+            </div>
+            <p class="text-sm text-slate-400 dark:text-navy-300">General Info</p>
+            <div class="space-y-3 text-xs-plus">
+                <div class="flex justify-between">
+                    <p class="font-medium text-slate-700 dark:text-navy-100">Exchange</p>
+                    <p class="text-right">{{ $ticker->exchange_short }}</p>
+                </div>
+                <div class="flex justify-between">
+                    <p class="font-medium text-slate-700 dark:text-navy-100">Shares Outstanding</p>
+                    <p class="text-right">{{ $headerStats['sharesOut'] }}</p>
+                </div>
+                <div class="flex justify-between">
+                    <p class="font-medium text-slate-700 dark:text-navy-100">IPO Date</p>
+                    <p class="text-right">{{ $headerStats['ipoDate'] }}</p>
+                </div>
+                <div class="flex justify-between">
+                    <p class="font-medium text-slate-700 dark:text-navy-100">Employees</p>
+                    <p class="text-right">{{ $headerStats['employees'] }}</p>
+                </div>
+                <hr class="my-4 border-slate-150 dark:border-navy-500" />
+                <p class="mt-1">{{ $headerStats['description'] }}</p>
+            </div>
         </div>
-        <p class="mt-1 text-xs-plus">52-Wk. Low</p>
-      </div>
     </div>
-  </div>
+</div>
+  
   <div class="card col-span-12 lg:col-span-8">
     <div class="flex items-center justify-between py-3 px-4">
       <h2

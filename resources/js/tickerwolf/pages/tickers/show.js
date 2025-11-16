@@ -213,6 +213,7 @@ export function init() {
       }
     };
 
+    safePopper('#company-options-menu', '.popper-ref', '.popper-root');
     safePopper('#project-status-menu', '.popper-ref', '.popper-root');
     safePopper('#satisfaction-menu', '.popper-ref', '.popper-root');
     safePopper('#bandwidth-menu', '.popper-ref', '.popper-root');

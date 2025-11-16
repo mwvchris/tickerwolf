@@ -209,13 +209,22 @@ class TickerController extends Controller
 
             // Market cap & shares
             'marketCap'     => $overview ? FormatHelper::compactCurrency($overview->market_cap ?? null) : '—',
-            'sharesOut'     => $overview ? FormatHelper::compactNumber($overview->weighted_shares_outstanding ?? null) : '—',
+            'sharesOut'     => $ticker->weighted_shares_outstanding ? FormatHelper::compactNumber($ticker->weighted_shares_outstanding ?? null) : '—',
 
             // Meta
             'exchange'      => $ticker->exchange_short ?? $ticker->primary_exchange,
-            'name'          => $ticker->clean_display_name ?? $ticker->name,
+            'companyName'          => $ticker->clean_base_name,      // "Alphabet Inc."
+            'shareClass'    => $ticker->share_class,          // "Class C"
+            'displayName'   => $ticker->clean_display_name,   // "Alphabet Inc. – Class C"
+            'fullName'      => $ticker->full_display_name,    // same as above
+            'description'   => $ticker->description ?? null,
             'logoUrl'       => $ticker->logo_url,
             'iconUrl'       => $ticker->icon_url,
+            'ipoDate'       => $ticker->list_date ? \Illuminate\Support\Carbon::parse($ticker->list_date)->toFormattedDateString() : '—',
+            'employees'     => $ticker->total_employees ? $ticker->total_employees : '—',
+
+            // Sector & industry
+            'industry'        => $ticker->sic_description ? $ticker->sic_description : '—',
         ];
 
         // ------------------------------------------------------------------
