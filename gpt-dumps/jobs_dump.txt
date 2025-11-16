@@ -1,4 +1,4 @@
-===== GPT DUMP GENERATED: 2025-11-13T23:00:56Z =====
+===== GPT DUMP GENERATED: 2025-11-15T23:18:12Z =====
 ===== DIRECTORY: app/Jobs =====
 
 app/Jobs/IngestTickerPriceHistoryJob.php
@@ -10,75 +10,241 @@ app/Jobs/IngestTickerPriceHistoryJob.php
 
 namespace App\Jobs;
 
-use App\Models\Ticker;
-use App\Models\JobBatch;
 use App\Services\PolygonTickerPriceHistoryService;
-use App\Services\BatchMonitorService;
 use Illuminate\Bus\Batchable;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\App;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
+/**
+ * ============================================================================
+ *  IngestTickerPriceHistoryJob (v3.0.0)
+ * ============================================================================
+ *
+ *  MULTI-TICKER + MULTI-RESOLUTION (1d + 1h) PRICE HISTORY INGESTION
+ *
+ *  ✔ Handles MANY tickers per job (100–500 depending on batch size)
+ *  ✔ Auto-from per ticker using DB latest-t + redundancy
+ *  ✔ Fetches BOTH daily + hourly bars in same job
+ *  ✔ Bulk inserts via PolygonTickerPriceHistoryService
+ *  ✔ Hourly retention purge (default: 168 hours)
+ *  ✔ Ultra-safe logging & error isolation (ticker-level try/catch)
+ *
+ *  Payload Input:
+ *      $tickers = [
+ *         [id => 24, ticker => 'AAPL', type => 'cs'],
+ *         [id => ...],
+ *         ...
+ *      ]
+ *
+ *  NOTE: No memory blow-up — each ticker is processed independently.
+ * ============================================================================
+ */
 class IngestTickerPriceHistoryJob implements ShouldQueue
 {
-    use Batchable, Dispatchable, InteractsWithQueue, Queueable, SerializesModels;
+    use Dispatchable, InteractsWithQueue, Queueable, SerializesModels, Batchable;
 
-    public Ticker $ticker;
-    public string $from;
-    public string $to;
+    /**
+     * @var array<int, array{id:int,ticker:string,type:?string}>
+     */
+    protected array $tickers;
 
-    public int $tries = 3;
-    public int $backoff = 30;
+    protected string $resolutionMode; // "1d", "1h", or "both"
+    protected string $globalFrom;
+    protected string $toDate;
 
-    public function __construct(Ticker $ticker, string $from = '2019-01-01', ?string $to = null)
-    {
-        $this->ticker = $ticker;
-        $this->from = $from;
-        $this->to = $to ?? now()->toDateString();
+    protected int $windowDays;       // Daily auto-from lookback
+    protected int $redundancyDays;   // Daily overlap
+    protected int $redundancyHours;  // Hourly overlap
+    protected int $retentionHours;   // Retention cutoff for 1h
+
+    /**
+     * @param array<int,array{id:int,ticker:string,type:?string}> $tickers
+     */
+    public function __construct(
+        array $tickers,
+        string $resolutionMode,
+        string $globalFrom,
+        string $toDate,
+        int $windowDays,
+        int $redundancyDays,
+        int $redundancyHours,
+        int $retentionHours
+    ) {
+        $this->tickers         = $tickers;
+        $this->resolutionMode  = $resolutionMode;
+        $this->globalFrom      = $globalFrom;
+        $this->toDate          = $toDate;
+        $this->windowDays      = $windowDays;
+        $this->redundancyDays  = $redundancyDays;
+        $this->redundancyHours = $redundancyHours;
+        $this->retentionHours  = $retentionHours;
     }
 
-    public function handle(PolygonTickerPriceHistoryService $service): void
+    /**
+     * Execute the multi-ticker job.
+     */
+    public function handle(): void
     {
-        $symbol = $this->ticker->ticker ?? $this->ticker->symbol ?? 'UNKNOWN';
+        $service = App::make(PolygonTickerPriceHistoryService::class);
+        $logger  = Log::channel('ingest');
+
+        $batchId = $this->batchId ?? 'n/a';
+
+        $logger->info("🚀 Multi-ticker price-history batch started", [
+            'batch_id'        => $batchId,
+            'tickers_count'   => count($this->tickers),
+            'resolution_mode' => $this->resolutionMode,
+        ]);
+
+        $processed  = 0;
+        $succeeded  = 0;
+        $failed     = 0;
+
+        foreach ($this->tickers as $t) {
+            $tickerId = $t['id'];
+            $symbol   = $t['ticker'];
+
+            try {
+                $this->processOneTicker(
+                    $service,
+                    $symbol,
+                    $tickerId
+                );
+
+                $succeeded++;
+            } catch (Throwable $e) {
+                $failed++;
+
+                $logger->error('❌ Failed ticker ingestion', [
+                    'ticker'   => $symbol,
+                    'ticker_id'=> $tickerId,
+                    'batch_id' => $batchId,
+                    'error'    => $e->getMessage(),
+                    'trace'    => substr($e->getTraceAsString(), 0, 500),
+                ]);
+            }
+
+            $processed++;
+
+            if ($processed % 25 === 0 || $processed === count($this->tickers)) {
+                $logger->info("📊 Ingestion batch progress", [
+                    'batch_id'  => $batchId,
+                    'processed' => $processed,
+                    'succeeded' => $succeeded,
+                    'failed'    => $failed,
+                ]);
+            }
+        }
+
+        // Global hourly retention purge (only once per job)
+        try {
+            $cutoff = Carbon::now()->subHours($this->retentionHours);
+            $deleted = $service->purgeOld1h($cutoff);
+
+            $logger->info("🧹 Hourly retention purge completed", [
+                'batch_id'       => $batchId,
+                'cutoff'         => $cutoff->toDateTimeString(),
+                'deleted_rows'   => $deleted,
+                'retentionHours' => $this->retentionHours,
+            ]);
+        } catch (Throwable $e) {
+            $logger->error("❌ 1h retention purge failed", [
+                'batch_id' => $batchId,
+                'error'    => $e->getMessage(),
+            ]);
+        }
+
+        $logger->info("✅ Multi-ticker batch complete", [
+            'batch_id'  => $batchId,
+            'processed' => $processed,
+            'succeeded' => $succeeded,
+            'failed'    => $failed,
+        ]);
+    }
+
+    /**
+     * Process a single ticker (1d + 1h resolution).
+     */
+    protected function processOneTicker(
+        PolygonTickerPriceHistoryService $service,
+        string $symbol,
+        int $tickerId
+    ): void {
         $logger = Log::channel('ingest');
 
-        try {
-            $logger->info("🚀 Ingesting price history for {$symbol} ({$this->from} → {$this->to})");
-            $service->fetchAndStore($this->ticker, $this->from, $this->to);
+        $logger->info("📈 Processing ticker", [
+            'symbol'    => $symbol,
+            'ticker_id' => $tickerId,
+        ]);
 
-            if ($batch = $this->batch()) {
-                if ($jobBatch = JobBatch::find($batch->id)) {
-                    BatchMonitorService::decrementPending($jobBatch);
-                }
-            }
+        $globalFrom = Carbon::parse($this->globalFrom);
+        $toDate     = Carbon::parse($this->toDate)->endOfDay();
 
-            $logger->info("✅ Completed ingestion for {$symbol}");
-        } catch (Throwable $e) {
-            $logger->error("❌ Error ingesting {$symbol}: " . $e->getMessage(), [
-                'ticker_id' => $this->ticker->id,
-                'trace' => $e->getTraceAsString(),
-            ]);
+        // ---------------------------------------------------------------------
+        // DAILY AUTO-FROM
+        // ---------------------------------------------------------------------
+        $latestDaily = $service->getLatestTimestamp($tickerId, '1d');
+        $dailyFrom = $latestDaily
+            ? Carbon::parse($latestDaily)->subDays($this->redundancyDays)
+            : $globalFrom->copy();
 
-            if ($batch = $this->batch()) {
-                if ($jobBatch = JobBatch::find($batch->id)) {
-                    BatchMonitorService::markFailed($jobBatch, $this->job?->uuid() ?? uniqid('job_', true));
-                }
-            }
-
-            throw $e;
+        if ($dailyFrom->lt($globalFrom)) {
+            $dailyFrom = $globalFrom->copy();
         }
-    }
 
-    public function tags(): array
-    {
-        return [
-            'ticker:' . ($this->ticker->ticker ?? 'unknown'),
-            'price-history',
-        ];
+        // Bound the auto-from window
+        $minDaily = Carbon::now()->subDays($this->windowDays);
+        if ($dailyFrom->lt($minDaily)) {
+            $dailyFrom = $minDaily;
+        }
+
+        // ---------------------------------------------------------------------
+        // HOURLY AUTO-FROM
+        // ---------------------------------------------------------------------
+        $latestHourly = $service->getLatestTimestamp($tickerId, '1h');
+        $hourlyFrom = $latestHourly
+            ? Carbon::parse($latestHourly)->subHours($this->redundancyHours)
+            : Carbon::now()->subDays(7)->startOfDay(); // fallback: 7-day lookback
+
+        // ---------------------------------------------------------------------
+        // FETCH DAILY BARS
+        // ---------------------------------------------------------------------
+        if ($this->resolutionMode === '1d' || $this->resolutionMode === 'both') {
+            $service->fetchAndStoreBars(
+                $symbol,
+                $tickerId,
+                '1d',
+                $dailyFrom,
+                $toDate
+            );
+        }
+
+        // ---------------------------------------------------------------------
+        // FETCH HOURLY BARS
+        // ---------------------------------------------------------------------
+        if ($this->resolutionMode === '1h' || $this->resolutionMode === 'both') {
+            $service->fetchAndStoreBars(
+                $symbol,
+                $tickerId,
+                '1h',
+                $hourlyFrom,
+                $toDate
+            );
+        }
+
+        $logger->info("✅ Completed ticker", [
+            'symbol'        => $symbol,
+            'ticker_id'     => $tickerId,
+            'daily_from'    => $dailyFrom->toDateString(),
+            'hourly_from'   => $hourlyFrom->toDateTimeString(),
+        ]);
     }
 }app/Jobs/IngestTickerNewsJob.php
 
@@ -102,62 +268,133 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
+/**
+ * ============================================================================
+ *  IngestTickerNewsJob (v2.0 — Serialization-Safe Refactor)
+ * ============================================================================
+ *
+ * ❗ WHAT THIS FIXES:
+ *   • Removes ALL non-primitive members from the public job payload.
+ *   • Prevents "Cannot assign NativeSerializableClosure..." failures.
+ *   • Ensures the DB queue payload contains ONLY primitives.
+ *
+ * PURPOSE:
+ *   Fetches & stores Polygon.io news items for a single ticker.
+ *   This job is dispatched in large batches by PolygonTickerNewsIngest.
+ *
+ * SAFE PAYLOAD:
+ *   - int $tickerId
+ *   - int $limit
+ * ============================================================================
+ */
 class IngestTickerNewsJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels, Batchable;
 
+    /**
+     * Strictly primitive-only properties (required for DB queue safety)
+     */
     public int $tickerId;
     public int $limit;
 
+    /**
+     * Retry behavior
+     */
     public int $tries = 3;
-    public int $backoff = 30;
+    public int $backoff = 30; // seconds
 
+    /**
+     * @param int $tickerId  The ID of the ticker (NOT a model instance)
+     * @param int $limit     Max number of articles to pull (per API call cycle)
+     */
     public function __construct(int $tickerId, int $limit = 50)
     {
         $this->tickerId = $tickerId;
-        $this->limit = $limit;
+        $this->limit    = $limit;
     }
 
+    /**
+     * Execute the job.
+     */
     public function handle(PolygonTickerNewsService $service): void
     {
+        // Lookup ticker safely inside the job (do NOT store model in payload)
         $ticker = Ticker::find($this->tickerId);
 
         if (! $ticker) {
-            Log::warning("⚠️ Ticker not found for news ingestion: ID {$this->tickerId}");
+            Log::channel('ingest')->warning("⚠️ News job: Ticker not found", [
+                'ticker_id' => $this->tickerId,
+            ]);
             return;
         }
 
-        try {
-            $count = $service->fetchNewsForTicker($ticker->ticker, $this->limit);
-            Log::channel('ingest')->info("📰 Ingested {$count} news items for {$ticker->ticker}");
+        $symbol = $ticker->ticker;
 
-            // Batch monitoring update
+        Log::channel('ingest')->info("📰 Starting news ingestion job", [
+            'ticker_id' => $this->tickerId,
+            'symbol'    => $symbol,
+            'limit'     => $this->limit,
+        ]);
+
+        try {
+            /**
+             * Service returns: int $count OR array with details
+             */
+            $result = $service->fetchNewsForTicker($symbol, $this->limit);
+
+            if (is_numeric($result)) {
+                Log::channel('ingest')->info("✅ News ingestion complete", [
+                    'symbol'  => $symbol,
+                    'count'   => (int) $result,
+                ]);
+            } else {
+                Log::channel('ingest')->warning("⚠️ Unexpected news service result", [
+                    'symbol' => $symbol,
+                    'type'   => gettype($result),
+                    'sample' => is_array($result) ? array_slice($result, 0, 3) : $result,
+                ]);
+            }
+
+            // -----------------------------
+            // BatchMonitorService integration
+            // -----------------------------
             if ($batch = $this->batch()) {
                 if ($jobBatch = JobBatch::find($batch->id)) {
                     BatchMonitorService::decrementPending($jobBatch);
                 }
             }
-        } catch (Throwable $e) {
-            Log::channel('ingest')->error("❌ Failed news ingestion for {$ticker->ticker}: {$e->getMessage()}");
 
+        } catch (Throwable $e) {
+
+            Log::channel('ingest')->error("❌ News ingestion failed", [
+                'symbol'    => $symbol,
+                'ticker_id' => $this->tickerId,
+                'message'   => $e->getMessage(),
+                'trace'     => substr($e->getTraceAsString(), 0, 1000),
+            ]);
+
+            // Mark batch job failure
             if ($batch = $this->batch()) {
                 if ($jobBatch = JobBatch::find($batch->id)) {
                     BatchMonitorService::markFailed(
                         $jobBatch,
-                        $this->job?->uuid() ?? uniqid('job_', true)
+                        $this->job?->uuid() ?? uniqid('news_', true)
                     );
                 }
             }
 
-            throw $e;
+            throw $e; // allow queue retries
         }
     }
 
+    /**
+     * Queue job tags (shown in Horizon/UIs)
+     */
     public function tags(): array
     {
         return [
-            'ticker:' . ($this->tickerId ?? 'unknown'),
             'news',
+            'ticker:' . $this->tickerId,
         ];
     }
 }app/Jobs/IngestTickerOverviewJob.php
@@ -181,36 +418,60 @@ use Illuminate\Support\Facades\Log;
 use Throwable;
 
 /**
- * Job: IngestTickerOverviewJob
+ * ============================================================================
+ *  IngestTickerOverviewJob  (v2.1 — Hardened & Time-Aware)
+ * ============================================================================
  *
- * Processes a batch of ticker symbols by fetching their overview data
- * from Polygon.io and upserting into the local DB.
- *
- * Note: This job is dispatched in batches by PolygonTickerOverviewsIngest.
- * Each instance should only contain scalar ticker symbols (strings) to
- * ensure serialization into the database queue works properly.
+ *  ✔ Ensures all tickers are STRINGS before serialization
+ *  ✔ Completely prevents "Array to string conversion" errors
+ *  ✔ Safe JSON logging for debugging without breaking workers
+ *  ✔ Validates Polygon response shape at runtime
+ *  ✔ Ensures the service receives only scalar ticker symbols
+ *  ✔ Fully compatible with database queue serialization
+ *  ✔ Adds basic timing info to understand per-job runtime
+ * ============================================================================
  */
 class IngestTickerOverviewJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels, Batchable;
 
     /**
-     * @var array List of ticker symbols (strings only)
+     * @var array<string> Guaranteed list of clean string tickers
      */
-    protected $tickers;
+    protected array $tickers;
 
     /**
-     * @param array $tickers Plain array of ticker symbols, e.g. ['AAPL','MSFT']
+     * Maximum attempts for this job.
+     *
+     * (We keep this modest; flakey tickers will eventually give up.)
+     */
+    public int $tries = 3;
+
+    /**
+     * @param  array  $tickers  An array of raw items (strings, models, objects, etc.).
+     *                          All values are normalized to simple strings here.
      */
     public function __construct(array $tickers)
     {
-        // Convert possible Eloquent models or objects to strings for safe serialization
-        $this->tickers = array_map(function ($t) {
+        $clean = [];
+
+        foreach ($tickers as $t) {
             if (is_object($t) && isset($t->ticker)) {
-                return $t->ticker;
+                $clean[] = (string) $t->ticker;
+            } elseif (is_string($t)) {
+                $clean[] = $t;
+            } elseif (is_scalar($t)) {
+                $clean[] = (string) $t;
+            } else {
+                // ❗ Any non-scalar / non-string / non-model value is discarded to avoid crashes.
+                Log::channel('ingest')->warning('⚠️ Dropping non-scalar ticker in job payload', [
+                    'received_type' => gettype($t),
+                    'value_preview' => is_array($t) ? array_slice($t, 0, 5) : $t,
+                ]);
             }
-            return (string) $t;
-        }, $tickers);
+        }
+
+        $this->tickers = array_values($clean);
     }
 
     /**
@@ -218,47 +479,74 @@ class IngestTickerOverviewJob implements ShouldQueue
      */
     public function handle(): void
     {
-        $service = App::make(PolygonTickerOverviewService::class);
-        $batchId = $this->batchId ?? 'n/a';
-        $total = count($this->tickers);
+        $service  = App::make(PolygonTickerOverviewService::class);
+        $batchId  = $this->batchId ?? 'n/a';
+        $total    = count($this->tickers);
+        $started  = microtime(true);
 
-        Log::channel('ingest')->info("🚀 Processing ticker overview batch", [
+        Log::channel('ingest')->info("🚀 Starting ticker overview batch", [
             'batch_id' => $batchId,
-            'total_tickers' => $total,
-            'tickers_sample' => array_slice($this->tickers, 0, 5),
+            'count'    => $total,
+            'sample'   => array_slice($this->tickers, 0, 5),
         ]);
 
-        $processed = $succeeded = $failed = 0;
+        $processed = 0;
+        $succeeded = 0;
+        $failed    = 0;
 
         foreach ($this->tickers as $ticker) {
+            // ⛑ Safety guard: ensure scalar string before service call
+            if (! is_string($ticker) || trim($ticker) === '') {
+                $failed++;
+                Log::channel('ingest')->error("❌ Invalid ticker value encountered", [
+                    'batch_id'   => $batchId,
+                    'ticker_raw' => $ticker,
+                ]);
+                $processed++;
+                continue;
+            }
+
             try {
-                $service->fetchAndUpsertOverview($ticker);
+                $result = $service->fetchAndUpsertOverview($ticker);
+
+                // OPTIONAL: Validate service return shape to prevent upstream failures
+                if (is_array($result) && isset($result['error'])) {
+                    throw new \Exception("Polygon service reported error: " . json_encode($result['error']));
+                }
+
                 $succeeded++;
             } catch (Throwable $e) {
                 $failed++;
-                Log::channel('ingest')->error("❌ Failed to process ticker overview", [
-                    'ticker' => $ticker,
+
+                Log::channel('ingest')->error("❌ Failed processing ticker overview", [
+                    'ticker'   => $ticker,
                     'batch_id' => $batchId,
-                    'error' => $e->getMessage(),
+                    'error'    => $e->getMessage(),
+                    'trace'    => substr($e->getTraceAsString(), 0, 300),
                 ]);
             }
 
             $processed++;
+
+            // Log progress every 50 tickers or at end
             if ($processed % 50 === 0 || $processed === $total) {
                 Log::channel('ingest')->info("📊 Batch progress", [
-                    'batch_id' => $batchId,
+                    'batch_id'  => $batchId,
                     'processed' => $processed,
                     'succeeded' => $succeeded,
-                    'failed' => $failed,
+                    'failed'    => $failed,
                 ]);
             }
         }
 
-        Log::channel('ingest')->info("✅ Batch complete", [
-            'batch_id' => $batchId,
+        $duration = microtime(true) - $started;
+
+        Log::channel('ingest')->info("✅ Overview batch complete", [
+            'batch_id'  => $batchId,
             'processed' => $processed,
             'succeeded' => $succeeded,
-            'failed' => $failed,
+            'failed'    => $failed,
+            'duration_s'=> round($duration, 2),
         ]);
     }
 }app/Jobs/IngestTickerIndicatorsJob.php
@@ -917,26 +1205,93 @@ use Illuminate\Queue\SerializesModels;
 use Illuminate\Support\Facades\Log;
 use Throwable;
 
+/**
+ * ============================================================================
+ *  IngestTickerFundamentalsJob (Hardened v2.0)
+ * ============================================================================
+ *
+ *  ✔ Serialization-safe — no closures, no console objects, no Symfony input
+ *  ✔ Automatically sanitizes options down to primitive scalars/arrays
+ *  ✔ Strong logging + structured context for debugging
+ *  ✔ Safe for Bus::batch() + redis/database queues (Laravel 10–12)
+ *  ✔ Prevents the "Cannot assign ... suggestedValues" error permanently
+ *
+ *  Payload Rules:
+ *  --------------
+ *  Jobs may only contain:
+ *      - ints
+ *      - strings
+ *      - floats
+ *      - bools
+ *      - null
+ *      - arrays of primitives
+ *
+ *  Anything else (objects, closures, Symfony console defs) is stripped.
+ *
+ * ============================================================================
+ */
 class IngestTickerFundamentalsJob implements ShouldQueue
 {
     use Dispatchable, InteractsWithQueue, Queueable, SerializesModels, Batchable;
 
+    /** @var int */
     public int $tickerId;
+
+    /** @var array  Safe, sanitized option list */
     public array $options;
 
-    public int $tries = 3;
+    /** Retry behavior */
+    public int $tries   = 3;
     public int $backoff = 30; // seconds
 
     /**
      * @param int   $tickerId
-     * @param array $options  e.g. ['order' => 'desc', 'limit' => 100, 'timeframe' => 'quarterly']
+     * @param array $options   Raw options (may contain closures/objects before sanitization)
      */
     public function __construct(int $tickerId, array $options = [])
     {
         $this->tickerId = $tickerId;
-        $this->options  = $options;
+
+        // 🧹 SANITIZE: ensure only primitives/arrays survive
+        $this->options = $this->sanitizeOptions($options);
     }
 
+    /**
+     * Sanitize options to guarantee queue-safe serialization.
+     */
+    private function sanitizeOptions(array $options): array
+    {
+        $clean = [];
+
+        foreach ($options as $key => $value) {
+            // Allow scalar
+            if (is_scalar($value) || $value === null) {
+                $clean[$key] = $value;
+                continue;
+            }
+
+            // Allow arrays but recursively sanitize
+            if (is_array($value)) {
+                $clean[$key] = $this->sanitizeOptions($value);
+                continue;
+            }
+
+            // Drop anything else (closure, object, etc.)
+            $clean[$key] = null;
+
+            Log::channel('ingest')->warning("⚠️ Dropped non-serializable option value in IngestTickerFundamentalsJob", [
+                'key'         => $key,
+                'value_type'  => gettype($value),
+                'value_class' => is_object($value) ? get_class($value) : null,
+            ]);
+        }
+
+        return $clean;
+    }
+
+    /**
+     * Main job executor.
+     */
     public function handle(PolygonFundamentalsService $service): void
     {
         $ticker = Ticker::find($this->tickerId);
@@ -944,68 +1299,70 @@ class IngestTickerFundamentalsJob implements ShouldQueue
         if (! $ticker) {
             Log::channel('ingest')->warning("⚠️ Ticker not found for fundamentals ingestion", [
                 'ticker_id' => $this->tickerId,
+                'options'   => $this->options,
             ]);
             return;
         }
 
         $symbol = $ticker->ticker;
+
         Log::channel('ingest')->info("▶️ Fundamentals job starting", [
-            'symbol' => $symbol,
-            'ticker_id' => $this->tickerId,
-            'options' => $this->options,
+            'symbol'       => $symbol,
+            'ticker_id'    => $this->tickerId,
+            'batch_id'     => $this->batchId ?? 'none',
+            'options'      => $this->options,
         ]);
 
         try {
-            // --- Phase 1: Begin API call
+            // --- Begin API call ---
             Log::channel('ingest')->info("🌐 Calling PolygonFundamentalsService::fetchAndStoreFundamentals()", [
                 'symbol' => $symbol,
             ]);
 
             $count = $service->fetchAndStoreFundamentals($symbol, $this->options);
 
-            // --- Phase 2: Validate response
-            if (is_array($count)) {
-                Log::channel('ingest')->warning("⚠️ Service returned array instead of count", [
+            // --- Validate service return ---
+            if (!is_numeric($count)) {
+                Log::channel('ingest')->warning("⚠️ Fundamentals service returned non-numeric result", [
                     'symbol' => $symbol,
-                    'response_type' => gettype($count),
-                    'keys' => array_keys($count),
-                ]);
-            }
-
-            if (is_numeric($count)) {
-                Log::channel('ingest')->info("✅ Fundamentals service completed successfully", [
-                    'symbol' => $symbol,
-                    'records_inserted_or_updated' => (int) $count,
+                    'type'   => gettype($count),
+                    'value'  => $count,
                 ]);
             } else {
-                Log::channel('ingest')->warning("⚠️ Fundamentals service returned unexpected result", [
-                    'symbol' => $symbol,
-                    'result_type' => gettype($count),
-                    'value' => $count,
+                Log::channel('ingest')->info("✅ Fundamentals ingestion completed", [
+                    'symbol'  => $symbol,
+                    'records' => (int) $count,
                 ]);
             }
 
             Log::channel('ingest')->info("🏁 Fundamentals job complete", [
-                'symbol' => $symbol,
-                'ticker_id' => $this->tickerId,
+                'symbol'     => $symbol,
+                'ticker_id'  => $this->tickerId,
+                'batch_id'   => $this->batchId ?? 'none',
             ]);
 
         } catch (Throwable $e) {
             Log::channel('ingest')->error("❌ Fundamentals job failed", [
-                'symbol' => $symbol,
-                'ticker_id' => $this->tickerId,
-                'message' => $e->getMessage(),
-                'trace' => substr($e->getTraceAsString(), 0, 1000), // limit trace length
+                'symbol'     => $symbol,
+                'ticker_id'  => $this->tickerId,
+                'message'    => $e->getMessage(),
+                'batch_id'   => $this->batchId ?? 'none',
+                'trace'      => substr($e->getTraceAsString(), 0, 1200),
             ]);
-            throw $e; // Let the queue handle retries
+
+            // Allow Laravel queue worker to retry automatically
+            throw $e;
         }
     }
 
+    /**
+     * Tags for horizon/queue debugging.
+     */
     public function tags(): array
     {
         return [
             'fundamentals',
-            'ticker:' . ($this->tickerId ?? 'unknown'),
+            'ticker:' . $this->tickerId,
         ];
     }
 }

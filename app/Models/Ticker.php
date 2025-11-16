@@ -202,7 +202,9 @@ class Ticker extends Model
      */
     public function latestPrice(): ?\App\Models\TickerPriceHistory
     {
-        return $this->priceHistories()->latest('t')->first();
+        return $this->dailyPriceQuery()
+            ->latest('t')
+            ->first();
     }
 
     /**
@@ -215,7 +217,7 @@ class Ticker extends Model
      */
     public function previousPrice(): ?\App\Models\TickerPriceHistory
     {
-        $rows = $this->priceHistories()
+        $rows = $this->dailyPriceQuery()
             ->orderBy('t', 'desc')
             ->limit(2)
             ->get();
@@ -558,6 +560,16 @@ class Ticker extends Model
      | ---------------------------------------------------------------------- */
 
     /**
+     * Base query for daily (1d) bars only.
+     *
+     * @return \Illuminate\Database\Eloquent\Relations\HasMany
+     */
+    protected function dailyPriceQuery()
+    {
+        return $this->priceHistories()->where('resolution', '1d');
+    }
+
+    /**
      * Today's open price (from latest row's "o").
      *
      * @return float|null
@@ -676,7 +688,9 @@ class Ticker extends Model
      */
     public function getVolumeLatestAttribute(): ?int
     {
-        $v = $this->priceHistories()->latest('t')->value('v');
+        $v = $this->dailyPriceQuery()
+            ->latest('t')
+            ->value('v');
 
         return $v !== null ? (int) $v : null;
     }
@@ -702,7 +716,7 @@ class Ticker extends Model
      */
     public function averageVolume(int $days = 30): ?float
     {
-        $rows = $this->priceHistories()
+        $rows = $this->dailyPriceQuery()
             ->whereNotNull('v')
             ->orderBy('t', 'desc')
             ->limit($days)
@@ -725,7 +739,7 @@ class Ticker extends Model
      */
     public function getHigh52wAttribute(): ?float
     {
-        return $this->priceHistories()
+        return $this->dailyPriceQuery()
             ->orderBy('t', 'desc')
             ->limit(252)
             ->max('h');
@@ -741,7 +755,7 @@ class Ticker extends Model
      */
     public function getLow52wAttribute(): ?float
     {
-        return $this->priceHistories()
+        return $this->dailyPriceQuery()
             ->orderBy('t', 'desc')
             ->limit(252)
             ->min('l');
@@ -781,18 +795,24 @@ class Ticker extends Model
      */
     public function regularSessionStats(): ?array
     {
-        $latest = $this->latestPrice();
+        $latest = $this->dailyPriceQuery()
+            ->latest('t')
+            ->first();
+
         if (! $latest || ! $latest->t) {
             return null;
         }
 
+        // Interpret the stored timestamp in market timezone,
+        // then force the displayed time to 4:00 PM (regular session close).
         $dt = Carbon::parse($latest->t)->setTimezone($this->marketTimezone());
+        $dt->setTime(16, 0, 0); // 4:00 PM local market time
 
         return [
             'timestamp' => $dt,
             'label'     => sprintf(
                 'At close: %s',
-                $dt->format('M j, g:i:s A T')
+                $dt->format('M j, g:i A T')
             ),
         ];
     }
@@ -816,20 +836,24 @@ class Ticker extends Model
      */
     public function extendedSessionStats(): ?array
     {
-        $latest = $this->latestPrice();
+        $latest = $this->dailyPriceQuery()
+            ->latest('t')
+            ->first();
+
         if (! $latest || ! $latest->t) {
             return null;
         }
 
         $dt = Carbon::parse($latest->t)
             ->setTimezone($this->marketTimezone())
-            ->addHours(3); // synthetic placeholder
+            ->setTime(16, 0, 0) // anchor at close
+            ->addHours(3);      // synthetic after-hours snapshot (~7 PM)
 
         return [
             'timestamp' => $dt,
             'label'     => sprintf(
                 'After hours: %s',
-                $dt->format('M j, g:i:s A T')
+                $dt->format('M j, g:i A T')
             ),
         ];
     }
@@ -923,7 +947,9 @@ class Ticker extends Model
             'change_5d'     => $this->percentChange(5),
             'change_30d'    => $this->percentChange(30),
             'market_cap'    => $this->overview?->market_cap,
-            'volume_latest' => $this->priceHistories()->latest('t')->value('v'),
+            'volume_latest' => $this->dailyPriceQuery()
+                                     ->latest('t')
+                                     ->value('v'),
             'employees'     => $this->total_employees,
             'location'      => $this->location,
         ];

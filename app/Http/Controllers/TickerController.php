@@ -134,12 +134,8 @@ class TickerController extends Controller
         $intradaySnapshot = $realtimeService->getIntradaySnapshotForTicker($ticker);
 
         // Close time label from the latest *daily* bar (TickerPriceHistory)
-        $latestDaily   = $ticker->latestPrice();
-        $closeTimeLabel = $latestDaily
-            ? Carbon::parse($latestDaily->t)
-                ->setTimezone(config('polygon.market_timezone', 'America/New_York'))
-                ->format('M j, g:i A T')
-            : null;
+        $regularSession = $ticker->regularSessionStats();
+        $closeTimeLabel = $regularSession['label'] ?? 'At close: —';
 
         // Intraday session labels from snapshot (only if Polygon returned bars)
         $intradaySessionLabel = $intradaySnapshot['session_label']      ?? null;
@@ -182,9 +178,7 @@ class TickerController extends Controller
 
             // Close-time metadata (EOD, daily-level)
             // Example: "At close: Nov 12, 4:00 PM ET"
-            'closeTimeLabel' => $closeTimeLabel
-                ? 'At close: ' . $closeTimeLabel
-                : 'At close: —',
+            'closeTimeLabel' => $closeTimeLabel ?: 'At close: —',
 
             // Intraday / After-hours / Pre-market metadata
             // Example: "After hours: Nov 12, 7:45 PM ET"

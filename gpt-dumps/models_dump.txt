@@ -1,4 +1,4 @@
-===== GPT DUMP GENERATED: 2025-11-13T23:00:56Z =====
+===== GPT DUMP GENERATED: 2025-11-15T23:18:12Z =====
 ===== DIRECTORY: app/Models =====
 
 app/Models/TickerIndicator.php
@@ -1426,6 +1426,75 @@ class Ticker extends Model
                 ];
             })
             ->values();
+    }
+
+    /**
+     * Get raw hourly OHLCV for the past N days.
+     *
+     * @param int $days
+     * @return \Illuminate\Support\Collection
+     */
+    public function hourlyBarsLastDays(int $days = 7)
+    {
+        $from = now()->subDays($days)->startOfDay();
+
+        return $this->priceHistories()
+            ->where('resolution', '1h')
+            ->where('t', '>=', $from)
+            ->orderBy('t', 'asc')
+            ->get(['t', 'o', 'h', 'l', 'c', 'v']);
+    }
+
+    /**
+     * Build {x,y} series from hourly bars for charting the 1W view.
+     *
+     * @return array<int, array{x:string,y:?float}>
+     */
+    public function hourlyPriceSeriesForOneWeek(): array
+    {
+        return $this->hourlyBarsLastDays(7)
+            ->map(function ($bar) {
+                return [
+                    'x' => \Illuminate\Support\Carbon::parse($bar->t)->toIso8601String(),
+                    'y' => $bar->c !== null ? (float) $bar->c : null,
+                ];
+            })
+            ->values()
+            ->all();
+    }
+
+    /**
+     * Build a 1D intraday series from Redis/Polygon snapshot data.
+     *
+     * Converts the intraday "bars" array returned by
+     * PolygonRealtimePriceService → [{x: timestamp, y: close}]
+     *
+     * @param array|null $snapshot
+     * @return array<int, array{x:string,y:?float}>
+     */
+    public function buildIntradaySeries(?array $snapshot): array
+    {
+        if (!$snapshot || empty($snapshot['bars']) || !is_array($snapshot['bars'])) {
+            return [];
+        }
+
+        $series = [];
+
+        foreach ($snapshot['bars'] as $bar) {
+            // Expected bar: ['t'=>timestamp, 'c'=>close, ...]
+            if (!isset($bar['t'])) continue;
+
+            $ts = is_numeric($bar['t'])
+                ? Carbon::createFromTimestamp($bar['t'])
+                : Carbon::parse($bar['t']);
+
+            $series[] = [
+                'x' => $ts->toIso8601String(),  // full intraday timestamp
+                'y' => isset($bar['c']) ? (float)$bar['c'] : null,
+            ];
+        }
+
+        return $series;
     }
 
     /**

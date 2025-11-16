@@ -1,7 +1,7 @@
 mkdir -p gpt-dumps && \
 ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ") && \
 echo "🕒 GPT Dump started at $ts (UTC)" && \
-for dir in app/Bus app/Console/Commands app/Http app/Jobs app/Models app/Providers app/Schedules app/Services config routes; do \
+for dir in resources/js/tickerwolf/charts resources/js/tickerwolf/pages app/Console/Commands app/Http app/Jobs app/Models app/Providers app/Schedules app/Services config routes; do \
   name=$(basename "$dir" | tr '[:upper:]' '[:lower:]'); \
   out="gpt-dumps/${name}_dump.txt"; \
   echo "📄 Dumping $dir → $out"; \

@@ -7,182 +7,160 @@
 
 <div class="mt-4 grid grid-cols-12 gap-4 px-[var(--margin-x)] transition-all duration-[.25s] sm:mt-5 sm:gap-5 lg:mt-6 lg:gap-6">
 
-    {{-- Main Ticker Header --}}
-    <div class="col-span-12 lg:col-span-9">
-        <div class="flex items-center justify-between space-x-2">
-        
-        {{-- Ticker Name --}}
+{{-- =============================== --}}
+{{--   MAIN TICKER HEADER (CLEAN)   --}}
+{{-- =============================== --}}
+
+<div class="col-span-12 lg:col-span-9">
+
+    {{-- Top Row: Logo + Name + Symbol + Exchange --}}
+    <div class="flex items-center justify-between space-x-2">
+
         <div class="flex items-center space-x-4 py-5 lg:py-6">
-          <div class="avatar size-12">
-            <img src="{{ $ticker->icon_url }}" class="mask is-squircle object-cover" alt="{{ $ticker->clean_display_name }} Logo" />
-          </div>
-          <div>
-            <h2 class="text-xl font-medium text-slate-800 dark:text-navy-50 lg:text-2xl">{{ $ticker->clean_display_name }}</h2>
-            <p class="py-1text-xs text-slate-400 dark:text-navy-300">
-              ${{ $ticker->ticker }}&nbsp; &bull; &nbsp;{{ $ticker->exchange_short }}
-            </p>
-          </div>
+            <div class="avatar size-12">
+                <img src="{{ $ticker->icon_url }}" class="mask is-squircle object-cover" alt="{{ $ticker->clean_display_name }} Logo" />
+            </div>
+            <div>
+                <h2 class="text-xl font-medium text-slate-800 dark:text-navy-50 lg:text-2xl">
+                    {{ $ticker->clean_display_name }}
+                </h2>
+                <p class="text-xs text-slate-400 dark:text-navy-300 mt-0.5">
+                    ${{ $ticker->ticker }} &bull; {{ $ticker->exchange_short }}
+                </p>
+            </div>
         </div>
 
-        {{-- Price Chart Tabs --}}
-        <div id="price-chart-tabs" class="is-scrollbar-hidden overflow-x-auto rounded-lg bg-slate-200 text-slate-600 dark:bg-navy-800 dark:text-navy-200">
+        {{-- Chart Range Tabs --}}
+        <div id="price-chart-tabs"
+             class="is-scrollbar-hidden overflow-x-auto rounded-lg bg-slate-200 text-slate-600 dark:bg-navy-800 dark:text-navy-200">
             <div class="tabs-list flex p-1">
                 @foreach (['1D','1W','1M','6M','1Y','5Y'] as $range)
-                <button data-chart-range="{{ $range }}" class="tab btn shrink-0 px-3 py-1 text-xs-plus font-medium" data-active-class="bg-white shadow-sm dark:bg-navy-500 dark:text-navy-100" data-default-class="hover:text-slate-800 focus:text-slate-800 dark:hover:text-navy-100 dark:focus:text-navy-100">
-                    {{ $range }}
-                </button>
+                    <button
+                        data-chart-range="{{ $range }}"
+                        class="tab btn shrink-0 px-3 py-1 text-xs-plus font-medium"
+                        data-active-class="bg-white shadow-sm dark:bg-navy-500 dark:text-navy-100"
+                        data-default-class="hover:text-slate-800 dark:hover:text-navy-100"
+                    >
+                        {{ $range }}
+                    </button>
                 @endforeach
             </div>
         </div>
 
     </div>
 
+
+    {{-- =============================== --}}
+    {{--      PRICE + SESSION BLOCK      --}}
+    {{-- =============================== --}}
+
     <div class="flex flex-col sm:flex-row sm:space-x-7">
-      <div class="mt-2 flex shrink-0 flex-col items-center sm:items-start">
 
-        {{-- Pie Chart Icon --}}
-        <!--
-        <svg xmlns="http://www.w3.org/2000/svg" class="size-8 text-info" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
-          <path stroke-linecap="round" stroke-linejoin="round" d="M11 3.055A9.001 9.001 0 1020.945 13H11V3.055z" />
-          <path stroke-linecap="round" stroke-linejoin="round" d="M20.488 9H15V3.512A9.025 9.025 0 0120.488 9z" />
-        </svg>
-        -->
+        {{-- LEFT SIDE — Price + Change + Time --}}
+        <div class="mt-2 flex shrink-0 flex-col space-y-4 sm:items-start">
 
-        {{-- Price Snapshot --}}
+            {{-- ===================================== --}}
+            {{--   MAIN CLOSE PRICE + CHANGE + TIME    --}}
+            {{-- ===================================== --}}
+            <div class="flex flex-col space-y-1">
 
-        {{-- Close price row --}}
-        <div class="flex items-end gap-2">
-            <span class="text-3xl font-semibold">
-                {{ $headerStats['lastPrice'] }}
-            </span>
-            <span class="text-sm text-slate-500">
-                {{ $headerStats['closeTimeLabel'] }}
-            </span>
-        </div>
+                {{-- MAIN CLOSE PRICE --}}
+                <div class="flex items-baseline space-x-2">
+                    <span class="text-4xl font-semibold leading-none">
+                        {{ $headerStats['lastPrice'] }}
+                    </span>
+                </div>
 
-        {{-- After hours / pre-market row (only if session != regular/closed) --}}
+                {{-- DAILY CHANGE --}}
+                @php
+                    $changeAbs = $headerStats['changeAbs'];
+                    $isUp = Str::startsWith($changeAbs, '+');
+                    $color = $isUp ? 'text-emerald-400' : 'text-rose-400';
+                @endphp
 
-            {{-- dd($headerStats) --}}
+                <div class="flex items-center space-x-2">
 
-        @if(in_array($headerStats['intradaySessionCode'], ['pre', 'after'], true))
-        <div class="mt-1 flex items-center gap-2 text-xs-plus">
-            <span class="font-medium">
-            {{ $headerStats['intradaySessionLabel'] }}
-            </span>
-            @if($headerStats['intradayLastPrice'] !== null)
-            <span>
-                {{ \App\Helpers\FormatHelper::currency($headerStats['intradayLastPrice']) }}
-            </span>
-            @endif
-            @if($headerStats['intradayChangeAbs'] !== null)
-            <span class="{{ $headerStats['intradayChangeAbs'] >= 0 ? 'text-emerald-500' : 'text-rose-500' }}">
-                {{ \App\Helpers\FormatHelper::signedCurrencyChange($headerStats['intradayChangeAbs']) }}
-                ({{ \App\Helpers\FormatHelper::percent($headerStats['intradayChangePct']) }})
-            </span>
-            @endif
-            @if($headerStats['intradayTimeLabel'])
-            <span class="text-slate-500">
-                {{ $headerStats['intradayTimeLabel'] }}
-            </span>
-            @endif
-        </div>
-        @endif
+                    {{-- Icon --}}
+                    @if ($isUp)
+                        <svg xmlns="http://www.w3.org/2000/svg"
+                            class="w-4 h-4 {{ $color }}"
+                            viewBox="0 0 20 20" fill="currentColor">
+                            <path fill-rule="evenodd"
+                                d="M10 3l6 6H4l6-6zm0 14l6-6H4l6 6z"
+                                clip-rule="evenodd" />
+                        </svg>
+                    @else
+                        <svg xmlns="http://www.w3.org/2000/svg"
+                            class="w-4 h-4 rotate-180 {{ $color }}"
+                            viewBox="0 0 20 20" fill="currentColor">
+                            <path fill-rule="evenodd"
+                                d="M10 3l6 6H4l6-6zm0 14l6-6H4l6 6z"
+                                clip-rule="evenodd" />
+                        </svg>
+                    @endif
 
-        <div class="mb-2">
-          <div class="flex items-center space-x-1">
+                    {{-- % Change --}}
+                    <span class="text-base font-medium {{ $color }}">
+                        {{ $headerStats['changePct'] }} <span class="opacity-70">1D</span>
+                    </span>
 
-            {{-- Refresh Button --}}
-            <!--
-            <button class="btn size-6 rounded-full p-0 hover:bg-slate-300/20 focus:bg-slate-300/20 active:bg-slate-300/25 dark:hover:bg-navy-300/20 dark:focus:bg-navy-300/20 dark:active:bg-navy-300/25">
-              <svg xmlns="http://www.w3.org/2000/svg" class="size-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="1.5">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-              </svg>
-            </button>
-            -->
+                    {{-- $ Change --}}
+                    <span class="text-base text-slate-300">
+                        {{ $headerStats['changeAbs'] }}
+                    </span>
+                </div>
 
-          </div>
-        </div>
-
-        {{-- Today Snapshot --}}
-          <div class="flex items-center">
-
-              {{-- Change Arrow --}}
-              @if (Str::startsWith($headerStats['changeAbs'], '+'))
-                  {{-- Upward change --}}
-                  <svg xmlns="http://www.w3.org/2000/svg" class="size-5 text-success" viewBox="0 0 20 20" fill="currentColor">
-                      <path fill-rule="evenodd"
-                            d="M12 7a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0V8.414l-4.293 4.293a1 1 0 01-1.414 0L8 10.414l-4.293 4.293a1 1 0 01-1.414-1.414l5-5a1 1 0 011.414 0L11 10.586 14.586 7H12z"
-                            clip-rule="evenodd" />
-                  </svg>
-              @else
-                  {{-- Downward change --}}
-                  <svg xmlns="http://www.w3.org/2000/svg" class="size-5 text-error rotate-90" viewBox="0 0 20 20" fill="currentColor">
-                      <path fill-rule="evenodd"
-                            d="M12 7a1 1 0 110-2h5a1 1 0 011 1v5a1 1 0 11-2 0V8.414l-4.293 4.293a1 1 0 01-1.414 0L8 10.414l-4.293 4.293a1 1 0 01-1.414-1.414l5-5a1 1 0 011.414 0L11 10.586 14.586 7H12z"
-                            clip-rule="evenodd" />
-                  </svg>
-              @endif
-
-              {{-- Change Values %/$ --}}
-              <span class="text-lg pr-1 font-medium {{ Str::startsWith($headerStats['changeAbs'], '+') ? 'text-success' : 'text-error' }}">
-                {{ $headerStats['changePct'] }}&nbsp;1D
-              </span>
-              <span class="px-1">{{ $headerStats['changeAbs'] }}</span>
-          </div>
-
-          {{-- Close Time --}}
-          <p class="mt-1 text-xs">
-            {{-- $headerStats['closeTime'] --}}
-          </p>
-
-          {{-- Mini Price Chart --}}
-          {{--
-          <div class="flex items-center space-x-2">
-            <div class="ax-transparent-gridline w-28">
-              <div id="salesMonthChart"></div>
+                {{-- CLOSE TIME --}}
+                <span class="text-xs text-slate-400">
+                    {{ $headerStats['closeTimeLabel'] }}
+                </span>
             </div>
-          </div>
-          --}}
 
-          <div class="card flex flex-col mt-4 py-2 justify-between border-4 border-transparent border-l-info px-4">
-          <p class="text-base font-medium text-slate-600 dark:text-navy-100">
-            After Hours
-          </p>
-          <p class="text-xs text-slate-400 dark:text-navy-300">
-            Design Learn Management System
-          </p>
-          <div class="badge mt-2 bg-info/10 text-info dark:bg-info/15">
-            UI/UX Design
-          </div>
-          </div>
 
-        <button class="btn mt-8 space-x-2 rounded-full border border-slate-300 px-3 text-xs-plus font-medium text-slate-700 hover:bg-slate-150 focus:bg-slate-150 active:bg-slate-150/80 dark:border-navy-450 dark:text-navy-100 dark:hover:bg-navy-500 dark:focus:bg-navy-500 dark:active:bg-navy-500/90">
-          <svg
-            xmlns="http://www.w3.org/2000/svg"
-            class="size-4.5 text-slate-400 dark:text-navy-300"
-            fill="none"
-            viewBox="0 0 24 24"
-            stroke="currentColor"
-            stroke-width="2"
-          >
-            <path
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              d="M15 13l-3 3m0 0l-3-3m3 3V8m0 13a9 9 0 110-18 9 9 0 010 18z"
-            />
-          </svg>
-          <span> Add to Watchlist</span>
-        </button>
-      </div>
+            {{-- ===================================== --}}
+            {{--   EXTENDED HOURS (AFTER/PRE) BLOCK     --}}
+            {{-- ===================================== --}}
+            @php
+                $session = $headerStats['intradaySessionCode'];   // pre | after | regular | null
+                $isExtUp = ($headerStats['intradayChangeAbs'] ?? 0) >= 0;
+                $extColor = $isExtUp ? 'text-emerald-400' : 'text-rose-400';
+            @endphp
 
-      {{-- Main Price Chart --}}
-      <div class="ax-transparent-gridline grid w-full grid-cols-1">
-        {{--<div id="salesOverview"></div>--}}
-        <div id="price-chart" class="w-full"></div>
-      </div>
+            @if(in_array($session, ['pre','after'], true))
+                <div class="flex flex-col space-y-1">
+
+                    {{-- AH/PM PRICE --}}
+                    <div class="flex items-center space-x-2">
+                        <span class="text-2xl font-semibold text-slate-200">
+                            {{ \App\Helpers\FormatHelper::currency($headerStats['intradayLastPrice']) }}
+                        </span>
+
+                        {{-- Percent --}}
+                        <span class="text-sm font-medium {{ $extColor }}">
+                            {{ \App\Helpers\FormatHelper::percent($headerStats['intradayChangePct']) }}
+                        </span>
+
+                        {{-- Dollar --}}
+                        <span class="text-sm {{ $extColor }}">
+                            ({{ \App\Helpers\FormatHelper::signedCurrencyChange($headerStats['intradayChangeAbs']) }})
+                        </span>
+                    </div>
+
+                    {{-- TIME LABEL --}}
+                    <div class="text-xs text-slate-400">
+                        {{ $headerStats['intradayTimeLabel'] }}
+                    </div>
+                </div>
+            @endif
+        </div>
+
+        {{-- RIGHT SIDE — Main Price Chart --}}
+        <div class="ax-transparent-gridline grid w-full grid-cols-1 mt-4 sm:mt-0">
+            <div id="price-chart" class="w-full"></div>
+        </div>
 
     </div>
-  </div>
+</div>
 
   {{-- Right Column Overview Cards --}}
   <div class="col-span-12 lg:col-span-3">

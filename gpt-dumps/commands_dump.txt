@@ -1,4 +1,4 @@
-===== GPT DUMP GENERATED: 2025-11-13T23:00:56Z =====
+===== GPT DUMP GENERATED: 2025-11-15T23:18:12Z =====
 ===== DIRECTORY: app/Console/Commands =====
 
 app/Console/Commands/TickersBuildSnapshots.php
@@ -355,177 +355,851 @@ namespace App\Console\Commands;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Carbon;
 use Throwable;
 
 /**
  * ============================================================================
- *  tickers:refresh-all  (v1.0.0 — Umbrella Data Refresh)
+ *  tickers:refresh-all  (v4.1 — Orchestrated, Mode-Aware Umbrella Pipeline)
  * ============================================================================
  *
- * 🔧 Purpose:
- *   Run the core TickerWolf ingestion pipeline in a single, ordered command.
- *   Designed primarily for local/dev "catch me up" runs, but safe for use
- *   in staging as well.
+ * 🔧 Purpose
+ * ----------------------------------------------------------------------------
+ * Run the core TickerWolf ingestion pipeline in a single, ordered command.
+ * Primarily for local/dev “catch me up” runs, but safe for staging or even
+ * carefully-used production refreshes.
  *
- * Command Signature:
+ * This version adds:
+ *   • Step orchestration + timing
+ *   • Semi-synchronous mode with --wait
+ *   • Queue backlog / batch health checks between phases
+ *   • Structured summary of which steps succeeded / failed
+ *   • Multiple *modes* (full / core / daily / weekly / dev)
+ *   • Dev “alpha flag” (--dev) that dominates all other modes and implies --fast
+ *   • Optimized Polygon overview batching (streamed + chunked)
+ *   • Optimized multi-resolution (1d + 1h) price history engine
+ *
+ * Command Signature
  * ----------------------------------------------------------------------------
  *   php artisan tickers:refresh-all
  *   php artisan tickers:refresh-all --fast
+ *   php artisan tickers:refresh-all --wait
+ *   php artisan tickers:refresh-all --dev
+ *   php artisan tickers:refresh-all --daily
+ *   php artisan tickers:refresh-all --weekly
+ *   php artisan tickers:refresh-all --core
  *
- * Behavior:
+ * Flags
  * ----------------------------------------------------------------------------
+ *   --fast   → Use more aggressive batching & fewer sleeps for local runs.
+ *   --wait   → After EACH major phase, wait for the queue to drain:
+ *                - pending jobs on "default" queue reach zero
+ *                - job_batches all finished
+ *              (with timeouts & warnings, not hard failure)
+ *
+ *   --dev    → Dev-mode (ALPHA FLAG; dominates all others):
+ *                • Implies --fast
+ *                • Includes:
+ *                    - tickers
+ *                    - slugs
+ *                    - overviews
+ *                    - price histories (1d + 1h, optimized)
+ *                    - indicators
+ *                    - snapshots
+ *                    - intraday prefetch
+ *                • Skips:
+ *                    - fundamentals
+ *                    - news
+ *
+ *   --daily  → Nightly “daily” pipeline (for production-style runs):
+ *                • Includes:
+ *                    - tickers
+ *                    - slugs
+ *                    - overviews
+ *                    - price histories (1d + 1h, optimized)
+ *                    - indicators
+ *                    - snapshots
+ *                    - news
+ *                    - intraday prefetch
+ *                • Skips:
+ *                    - fundamentals (handled weekly instead)
+ *
+ *   --weekly → Heavier weekly pipeline focused on fundamentals:
+ *                • Includes:
+ *                    - fundamentals
+ *                • Skips:
+ *                    - all other steps (tickers, slugs, overviews, prices,
+ *                      indicators, snapshots, news, intraday)
+ *
+ *   --core   → Core universe sync only:
+ *                • Includes:
+ *                    - tickers
+ *                    - slugs
+ *                    - overviews
+ *                • Skips:
+ *                    - fundamentals
+ *                    - prices
+ *                    - indicators
+ *                    - snapshots
+ *                    - news
+ *                    - intraday
+ *
+ * Precedence
+ * ----------------------------------------------------------------------------
+ *   1) --dev is ALPHA:
+ *        • If present, it *wins* over everything else.
+ *        • It implicitly sets --fast = true.
+ *        • If combined with other mode flags (--daily, --weekly, --core),
+ *          those are ignored with a warning.
+ *
+ *   2) Other modes (--daily, --weekly, --core):
+ *        • Exactly one of these may be used at a time.
+ *        • If more than one is passed (and --dev is NOT present), this
+ *          command fails fast with an error rather than guess.
+ *
+ *   3) No mode flags:
+ *        • Fall back to “full pipeline” (v3-style behavior):
+ *            - tickers
+ *            - slugs
+ *            - overviews
+ *            - fundamentals
+ *            - prices (1d + 1h, optimized)
+ *            - indicators
+ *            - snapshots
+ *            - news
+ *            - intraday prefetch
+ *
+ * Behavior (High-Level Pipeline)
+ * ----------------------------------------------------------------------------
+ *   Steps (in order; actual inclusion controlled by mode):
+ *
  *   1. polygon:tickers:ingest           (universe + new symbols)
  *   2. tickers:generate-slugs           (SEO slugs)
- *   3. polygon:ticker-overviews:ingest  (company metadata)
- *   4. polygon:fundamentals:ingest      (recent fundamentals, fast-mode tuned)
+ *   3. polygon:ticker-overviews:ingest  (company metadata; streamed + chunked)
+ *   4. polygon:fundamentals:ingest      (fundamentals; mode + fast tuned)
  *   5. polygon:ticker-price-histories:ingest
- *        → now auto-uses only missing dates unless --from passed
+ *        → multi-resolution engine (1d + 1h), missing-date aware, windowed
  *   6. tickers:compute-indicators       (technical indicators)
  *   7. tickers:build-snapshots          (feature snapshots / metrics)
  *   8. polygon:ticker-news:ingest       (news items)
  *   9. polygon:intraday-prices:prefetch (warm Redis intraday snapshot)
  *
- * Notes:
+ * Notes
  * ----------------------------------------------------------------------------
- *   • This command assumes a queue worker is running separately:
- *       php artisan queue:work --queue=default --tries=3 --timeout=180
- *   • The --fast flag increases batch sizes & removes sleeps to reduce
- *     runtime on your local machine. Use without --fast for safer production.
+ *   • Assumes a queue worker is running separately, e.g.:
+ *
+ *       php artisan queue:work \
+ *         --queue=default \
+ *         --sleep=3 \
+ *         --backoff=5 \
+ *         --max-jobs=25 \
+ *         --max-time=240 \
+ *         --tries=3 \
+ *         --timeout=120
+ *
+ *   • Use --dev for “I’m on my laptop, just catch me up on daily-ish stuff
+ *     without crushing my box” (no fundamentals/news).
+ *
+ *   • Use --daily for the nightly production-style pipeline (everything except
+ *     fundamentals).
+ *
+ *   • Use --weekly for heavier fundamentals-only runs (wired in the scheduler).
+ *
+ *   • Use --core when you only want the universe / metadata synced.
  * ============================================================================
  */
 class TickersRefreshAll extends Command
 {
+    /**
+     * Queue wait settings for --wait mode.
+     */
+    private const WAIT_POLL_SECONDS = 10;    // How often to poll queue state
+    private const WAIT_MAX_MINUTES  = 45;    // Max minutes to wait per phase
+    private const WAIT_SOFT_BACKLOG = 50000; // Backlog threshold for “getting large” warning
+
     /**
      * The console command name and signature.
      *
      * @var string
      */
     protected $signature = 'tickers:refresh-all
-                            {--fast : Use aggressive batching and no sleeps for local/dev runs}';
+                            {--fast : Use aggressive batching and minimal sleeps for local/dev runs}
+                            {--wait : Block between phases until queues have drained (semi-synchronous mode)}
+                            {--dev : Dev-mode (alpha flag; implies --fast; skips fundamentals/news)}
+                            {--daily : Daily-mode pipeline (nightly; skips fundamentals)}
+                            {--weekly : Weekly-mode pipeline (fundamentals only)}
+                            {--core : Core universe sync only (tickers/slugs/overviews)}';
 
     /**
      * The console command description.
      *
      * @var string
      */
-    protected $description = 'Run the full TickerWolf data refresh pipeline in one go.';
+    protected $description = 'Run the TickerWolf data refresh pipeline (full or mode-based) in one go.';
 
     /**
      * Execute the console command.
      */
     public function handle(): int
     {
-        $fast = (bool) $this->option('fast');
-        $logger = Log::channel('ingest');
+        $fast   = (bool) $this->option('fast');
+        $wait   = (bool) $this->option('wait');
+        $dev    = (bool) $this->option('dev');
+        $daily  = (bool) $this->option('daily');
+        $weekly = (bool) $this->option('weekly');
+        $core   = (bool) $this->option('core');
 
-        $logger->info('🚀 tickers:refresh-all started', ['fast' => $fast]);
-        $this->info('🚀 Starting TickerWolf umbrella refresh' . ($fast ? ' (FAST MODE)' : ''));
+        $logger    = Log::channel('ingest');
+        $startedAt = microtime(true);
 
-        // Helper to call and log each step
-        $run = function (string $description, string $command) use ($logger) {
-            $this->newLine();
-            $this->info("▶ {$description}");
-            $this->line("   $ {$command}");
+        /*
+        |--------------------------------------------------------------------------
+        | Mode Resolution / Precedence
+        |--------------------------------------------------------------------------
+        | --dev is alpha (dominates and implies --fast).
+        | Other modes must be mutually exclusive.
+        */
+        $mode = 'full'; // default
 
-            try {
-                Artisan::call($command);
-                $output = Artisan::output();
-                $this->line(trim($output));
-                $logger->info("✅ Step completed: {$description}", ['command' => $command]);
-            } catch (Throwable $e) {
-                $this->error("❌ Step failed: {$description}");
-                $this->error($e->getMessage());
-                $logger->error("❌ Step failed: {$description}", [
-                    'command' => $command,
-                    'error'   => $e->getMessage(),
-                    'trace'   => substr($e->getTraceAsString(), 0, 400),
+        if ($dev) {
+            $mode = 'dev';
+            $fast = true;
+
+            if ($daily || $weekly || $core) {
+                $this->warn('⚠️ --dev provided; ignoring --daily / --weekly / --core (dev is alpha).');
+                $logger->warning('Mode conflict resolved in favor of dev', [
+                    'daily'  => $daily,
+                    'weekly' => $weekly,
+                    'core'   => $core,
                 ]);
             }
-        };
+        } else {
+            $modeFlagsCount = ($daily ? 1 : 0) + ($weekly ? 1 : 0) + ($core ? 1 : 0);
 
-        // 1️⃣ Base tickers
-        $run(
-            'Ingest polygon tickers (universe)',
-            'polygon:tickers:ingest --market=stocks'
-        );
+            if ($modeFlagsCount > 1) {
+                $this->error('❌ You may specify at most ONE of: --daily, --weekly, --core (or use --dev).');
+                $logger->error('Invalid mode combination', [
+                    'daily'  => $daily,
+                    'weekly' => $weekly,
+                    'core'   => $core,
+                ]);
 
-        // 2️⃣ Slugs
-        $run(
-            'Generate ticker slugs',
-            'tickers:generate-slugs'
-        );
+                return self::FAILURE;
+            }
 
-        // 3️⃣ Overviews
-        $overviewCmd = $fast
-            ? 'polygon:ticker-overviews:ingest --batch=1500 --sleep=0'
-            : 'polygon:ticker-overviews:ingest --batch=1000 --sleep=5';
+            if ($daily) {
+                $mode = 'daily';
+            } elseif ($weekly) {
+                $mode = 'weekly';
+            } elseif ($core) {
+                $mode = 'core';
+            }
+        }
 
-        $run(
-            'Ingest ticker overviews',
-            $overviewCmd
-        );
+        /*
+        |--------------------------------------------------------------------------
+        | Step Inclusion Matrix per Mode
+        |--------------------------------------------------------------------------
+        */
+        $includeTickers       = true;
+        $includeSlugs         = true;
+        $includeOverviews     = true;
+        $includeFundamentals  = true;
+        $includePrices        = true;
+        $includeIndicators    = true;
+        $includeSnapshots     = true;
+        $includeNews          = true;
+        $includeIntraday      = true;
 
-        // 4️⃣ Fundamentals (recent-focused for fast mode)
-        $fundamentalsCmd = $fast
-            ? 'polygon:fundamentals:ingest --timeframe=all --gte=2023-01-01 --batch=3000 --sleep=0'
-            : 'polygon:fundamentals:ingest --timeframe=all --gte=2019-01-01 --batch=2000 --sleep=1';
+        switch ($mode) {
+            case 'dev':
+                // Dev: everything except fundamentals + news.
+                $includeFundamentals = false;
+                $includeNews         = false;
+                break;
 
-        $run(
-            'Ingest fundamentals',
-            $fundamentalsCmd
-        );
+            case 'daily':
+                // Daily: full nightly pipeline except fundamentals (handled weekly).
+                $includeFundamentals = false;
+                // Everything else remains enabled.
+                break;
 
-        // 5️⃣ Daily price histories (auto-missing-date logic inside command)
-        $priceCmd = $fast
-            ? 'polygon:ticker-price-histories:ingest --resolution=1d --sleep=1'
-            : 'polygon:ticker-price-histories:ingest --resolution=1d --sleep=1';
+            case 'weekly':
+                // Weekly: fundamentals-only.
+                $includeTickers      = false;
+                $includeSlugs        = false;
+                $includeOverviews    = false;
+                $includePrices       = false;
+                $includeIndicators   = false;
+                $includeSnapshots    = false;
+                $includeNews         = false;
+                $includeIntraday     = false;
+                break;
 
-        $run(
-            'Ingest daily price histories (only missing dates)',
-            $priceCmd
-        );
+            case 'core':
+                // Core: universe + metadata only.
+                $includeFundamentals = false;
+                $includePrices       = false;
+                $includeIndicators   = false;
+                $includeSnapshots    = false;
+                $includeNews         = false;
+                $includeIntraday     = false;
+                break;
 
-        // 6️⃣ Indicators
-        $indicatorsCmd = $fast
-            ? 'tickers:compute-indicators --from=2019-01-01 --to=2030-01-01 --batch=5000 --sleep=0 --include-inactive'
-            : 'tickers:compute-indicators --from=2019-01-01 --to=2030-01-01 --batch=3000 --sleep=1 --include-inactive';
+            case 'full':
+            default:
+                // Full: everything enabled.
+                break;
+        }
 
-        $run(
-            'Compute indicators',
-            $indicatorsCmd
-        );
+        /*
+        |--------------------------------------------------------------------------
+        | Header Logging
+        |--------------------------------------------------------------------------
+        */
+        $logger->info('🚀 tickers:refresh-all started', [
+            'fast' => $fast,
+            'wait' => $wait,
+            'mode' => $mode,
+        ]);
 
-        // 7️⃣ Feature snapshots / metrics
-        $snapshotsCmd = $fast
-            ? 'tickers:build-snapshots --from=2019-01-01 --to=2030-01-01 --batch=3000 --sleep=0 --include-inactive'
-            : 'tickers:build-snapshots --from=2019-01-01 --to=2030-01-01 --batch=500 --sleep=1 --include-inactive';
+        $this->newLine();
+        $this->info('🚀 Starting TickerWolf umbrella refresh');
+        $this->line('   Mode            : ' . $mode . ($dev ? ' (dev is alpha)' : ''));
+        $this->line('   Fast batching   : ' . ($fast ? 'YES' : 'no'));
+        $this->line('   Queue-aware     : ' . ($wait ? 'YES (--wait enabled)' : 'no'));
+        $this->line('   Queue connection: database');
+        $this->line('   Queue name      : default');
+        $this->newLine();
 
-        $run(
-            'Build ticker snapshots/metrics',
-            $snapshotsCmd
-        );
+        // Structured results store for summary at the end.
+        $results = [];
 
-        // 8️⃣ News items
-        $newsCmd = $fast
-            ? 'polygon:ticker-news:ingest --batch=800 --sleep=0'
-            : 'polygon:ticker-news:ingest --batch=500 --sleep=1';
+        /*
+        |--------------------------------------------------------------------------
+        | 1️⃣ Base tickers
+        |--------------------------------------------------------------------------
+        */
+        if ($includeTickers) {
+            $this->runStep(
+                key: 'tickers',
+                label: 'Ingest polygon tickers (universe)',
+                command: 'polygon:tickers:ingest --market=stocks',
+                wait: $wait,
+                logger: $logger,
+                results: $results
+            );
+        } else {
+            $results['tickers'] = [
+                'label'    => 'Ingest polygon tickers (universe)',
+                'command'  => '(skipped by mode)',
+                'success'  => true,
+                'duration' => null,
+                'error'    => null,
+            ];
+        }
 
-        $run(
-            'Ingest ticker news items',
-            $newsCmd
-        );
+        /*
+        |--------------------------------------------------------------------------
+        | 2️⃣ Slugs
+        |--------------------------------------------------------------------------
+        */
+        if ($includeSlugs) {
+            $this->runStep(
+                key: 'slugs',
+                label: 'Generate ticker slugs',
+                command: 'tickers:generate-slugs',
+                wait: $wait,
+                logger: $logger,
+                results: $results
+            );
+        } else {
+            $results['slugs'] = [
+                'label'    => 'Generate ticker slugs',
+                'command'  => '(skipped by mode)',
+                'success'  => true,
+                'duration' => null,
+                'error'    => null,
+            ];
+        }
 
-        // 9️⃣ Optional: intraday Redis prefetch for today
-        $run(
-            'Prefetch intraday prices into Redis',
-            'polygon:intraday-prices:prefetch --force'
-        );
+        /*
+        |--------------------------------------------------------------------------
+        | 3️⃣ Overviews (optimized streamed batching)
+        |--------------------------------------------------------------------------
+        */
+        if ($includeOverviews) {
+            // New optimized command signature:
+            // polygon:ticker-overviews:ingest --limit=0 --batch=... --per-job=... --sleep=...
+            $overviewCmd = $fast
+                ? 'polygon:ticker-overviews:ingest --limit=0 --batch=1500 --per-job=75 --sleep=0'
+                : 'polygon:ticker-overviews:ingest --limit=0 --batch=800 --per-job=50 --sleep=1';
 
+            $this->runStep(
+                key: 'overviews',
+                label: 'Ingest ticker overviews',
+                command: $overviewCmd,
+                wait: $wait,
+                logger: $logger,
+                results: $results
+            );
+        } else {
+            $results['overviews'] = [
+                'label'    => 'Ingest ticker overviews',
+                'command'  => '(skipped by mode)',
+                'success'  => true,
+                'duration' => null,
+                'error'    => null,
+            ];
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 4️⃣ Fundamentals (mode + fast tuned)
+        |--------------------------------------------------------------------------
+        |
+        | NOTE: For BOTH fast + non-fast, we now use gte=2019-01-01 so that dev
+        | and full runs have a consistent historical floor.
+        */
+        if ($includeFundamentals) {
+            $fundamentalsCmd = $fast
+                ? 'polygon:fundamentals:ingest --timeframe=all --gte=2019-01-01 --batch=3000 --sleep=0'
+                : 'polygon:fundamentals:ingest --timeframe=all --gte=2019-01-01 --batch=1500 --sleep=1';
+
+            $this->runStep(
+                key: 'fundamentals',
+                label: 'Ingest fundamentals',
+                command: $fundamentalsCmd,
+                wait: $wait,
+                logger: $logger,
+                results: $results
+            );
+        } else {
+            $results['fundamentals'] = [
+                'label'    => 'Ingest fundamentals',
+                'command'  => '(skipped by mode)',
+                'success'  => true,
+                'duration' => null,
+                'error'    => null,
+            ];
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 5️⃣ Multi-resolution price histories (1d + 1h, optimized engine)
+        |--------------------------------------------------------------------------
+        |
+        | Internals of polygon:ticker-price-histories:ingest now:
+        |   • perform per-ticker missing-date detection (auto-from)
+        |   • ingest both 1d and 1h bars per ticker
+        |   • window the date ranges to keep per-ticker Polygon calls bounded
+        |   • support redundancy days to heal gaps
+        */
+        if ($includePrices) {
+            $priceCmd = $fast
+                ? 'polygon:ticker-price-histories:ingest --window=45 --sleep=0 --redundancy-days=2'
+                : 'polygon:ticker-price-histories:ingest --window=14 --sleep=2 --redundancy-days=3';
+
+            $this->runStep(
+                key: 'prices',
+                label: 'Ingest price histories (1d + 1h, optimized multi-resolution)',
+                command: $priceCmd,
+                wait: $wait,
+                logger: $logger,
+                results: $results
+            );
+        } else {
+            $results['prices'] = [
+                'label'    => 'Ingest price histories (1d + 1h, optimized multi-resolution)',
+                'command'  => '(skipped by mode)',
+                'success'  => true,
+                'duration' => null,
+                'error'    => null,
+            ];
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 6️⃣ Indicators
+        |--------------------------------------------------------------------------
+        */
+        if ($includeIndicators) {
+            $indicatorsCmd = $fast
+                ? 'tickers:compute-indicators --from=2019-01-01 --to=2030-01-01 --batch=5000 --sleep=0 --include-inactive'
+                : 'tickers:compute-indicators --from=2019-01-01 --to=2030-01-01 --batch=2000 --sleep=1 --include-inactive';
+
+            $this->runStep(
+                key: 'indicators',
+                label: 'Compute indicators',
+                command: $indicatorsCmd,
+                wait: $wait,
+                logger: $logger,
+                results: $results
+            );
+        } else {
+            $results['indicators'] = [
+                'label'    => 'Compute indicators',
+                'command'  => '(skipped by mode)',
+                'success'  => true,
+                'duration' => null,
+                'error'    => null,
+            ];
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 7️⃣ Feature snapshots / metrics
+        |--------------------------------------------------------------------------
+        */
+        if ($includeSnapshots) {
+            $snapshotsCmd = $fast
+                ? 'tickers:build-snapshots --from=2019-01-01 --to=2030-01-01 --batch=3000 --sleep=0 --include-inactive'
+                : 'tickers:build-snapshots --from=2019-01-01 --to=2030-01-01 --batch=1000 --sleep=1 --include-inactive';
+
+            $this->runStep(
+                key: 'snapshots',
+                label: 'Build ticker snapshots/metrics',
+                command: $snapshotsCmd,
+                wait: $wait,
+                logger: $logger,
+                results: $results
+            );
+        } else {
+            $results['snapshots'] = [
+                'label'    => 'Build ticker snapshots/metrics',
+                'command'  => '(skipped by mode)',
+                'success'  => true,
+                'duration' => null,
+                'error'    => null,
+            ];
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 8️⃣ News items
+        |--------------------------------------------------------------------------
+        |
+        | Internals handle:
+        |   • recent-window based ingestion (e.g., last N days)
+        |   • pagination / multiple pages per ticker when needed
+        */
+        if ($includeNews) {
+            $newsCmd = $fast
+                ? 'polygon:ticker-news:ingest --batch=800 --sleep=0'
+                : 'polygon:ticker-news:ingest --batch=400 --sleep=1';
+
+            $this->runStep(
+                key: 'news',
+                label: 'Ingest ticker news items',
+                command: $newsCmd,
+                wait: $wait,
+                logger: $logger,
+                results: $results
+            );
+        } else {
+            $results['news'] = [
+                'label'    => 'Ingest ticker news items',
+                'command'  => '(skipped by mode)',
+                'success'  => true,
+                'duration' => null,
+                'error'    => null,
+            ];
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 9️⃣ Optional: intraday Redis prefetch for today
+        |--------------------------------------------------------------------------
+        |
+        | This is intentionally left as a short, synchronous prefetch that hits a
+        | limited universe (e.g., top-N active tickers per our command logic).
+        |
+        | Note: you already have a separate schedule for intraday prefetch
+        | running every minute; this step is just a one-shot warm-up at the end.
+        */
+        if ($includeIntraday) {
+            $this->runStep(
+                key: 'intraday',
+                label: 'Prefetch intraday prices into Redis',
+                command: 'polygon:intraday-prices:prefetch --force',
+                wait: $wait,
+                logger: $logger,
+                results: $results
+            );
+        } else {
+            $results['intraday'] = [
+                'label'    => 'Prefetch intraday prices into Redis',
+                'command'  => '(skipped by mode)',
+                'success'  => true,
+                'duration' => null,
+                'error'    => null,
+            ];
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 🔚 Final Summary
+        |--------------------------------------------------------------------------
+        */
+        $totalSeconds = microtime(true) - $startedAt;
         $this->newLine(2);
-        $this->info('🎯 tickers:refresh-all completed. Check logs for any step failures.');
-        $logger->info('🏁 tickers:refresh-all finished', ['fast' => $fast]);
 
-        return Command::SUCCESS;
+        $this->info('📊 TickerWolf umbrella pipeline summary');
+        $this->line(str_repeat('─', 72));
+
+        $anyFailures = false;
+
+        foreach ($results as $key => $step) {
+            $statusLabel = $step['success'] ? '✅' : '❌';
+            $anyFailures = $anyFailures || ! $step['success'];
+
+            $timeStr = $step['duration'] !== null
+                ? sprintf('%5.1fs', $step['duration'])
+                : '  n/a ';
+
+            $this->line(sprintf(
+                "%s %-18s  %s  (%s)",
+                $statusLabel,
+                '[' . $key . ']',
+                $step['label'],
+                $timeStr
+            ));
+
+            if (! $step['success'] && $step['error']) {
+                $this->line('   ↳ ' . $step['error']);
+            }
+        }
+
+        $this->line(str_repeat('─', 72));
+        $this->line(sprintf(
+            "⏱  Total wall-clock time: %.1f seconds (~%.1f minutes)",
+            $totalSeconds,
+            $totalSeconds / 60
+        ));
+
+        // Final queue snapshot for --wait mode.
+        $pendingJobs = $this->safeCount(function () {
+            return DB::table('jobs')->where('queue', 'default')->count();
+        });
+
+        $runningBatches = $this->safeCount(function () {
+            return DB::table('job_batches')->whereNull('finished_at')->count();
+        });
+
+        $failedJobs = $this->safeCount(function () {
+            return DB::table('failed_jobs')->count();
+        });
+
+        $this->newLine();
+        $this->info('📦 Final queue snapshot (database / default):');
+        $this->line('   Pending jobs      : ' . ($pendingJobs ?? 'n/a'));
+        $this->line('   Running batches   : ' . ($runningBatches ?? 'n/a'));
+        $this->line('   Failed jobs (all) : ' . ($failedJobs ?? 'n/a'));
+
+        if ($failedJobs > 0) {
+            $this->warn('⚠️ There are failed jobs in the queue. Inspect via:');
+            $this->line('   php artisan queue:failed');
+        }
+
+        if ($anyFailures) {
+            $this->newLine();
+            $this->error('❌ tickers:refresh-all completed WITH step failures. See logs for details.');
+        } else {
+            $this->newLine();
+            $this->info('🎯 tickers:refresh-all completed successfully. Check logs for per-step details.');
+        }
+
+        $logger->info('🏁 tickers:refresh-all finished', [
+            'fast'     => $fast,
+            'wait'     => $wait,
+            'mode'     => $mode,
+            'duration' => $totalSeconds,
+            'failures' => $anyFailures,
+            'queue'    => [
+                'pending' => $pendingJobs,
+                'running' => $runningBatches,
+                'failed'  => $failedJobs,
+            ],
+        ]);
+
+        return $anyFailures ? self::FAILURE : self::SUCCESS;
+    }
+
+    /**
+     * Run a single pipeline step (sub-command) with logging, timing,
+     * error capture, and optional --wait queue drainage.
+     *
+     * @param  array<string,mixed>  $results
+     */
+    protected function runStep(
+        string $key,
+        string $label,
+        string $command,
+        bool $wait,
+        $logger,
+        array &$results
+    ): void {
+        $this->newLine();
+        $this->info("▶ {$label}");
+        $this->line("   $ {$command}");
+
+        $stepStart = microtime(true);
+        $success   = false;
+        $errorMsg  = null;
+
+        try {
+            $exitCode = Artisan::call($command);
+            $output   = trim(Artisan::output());
+
+            if ($output !== '') {
+                // Indent output so it visually nests under the step.
+                foreach (explode(PHP_EOL, $output) as $line) {
+                    $this->line('   ' . $line);
+                }
+            }
+
+            $success = ($exitCode === 0);
+
+            if (! $success) {
+                $errorMsg = "Artisan exit code {$exitCode}";
+                $this->error("❌ Step failed (non-zero exit code): {$label}");
+                $logger->error("❌ Step failed (non-zero exit code): {$label}", [
+                    'command'  => $command,
+                    'exitCode' => $exitCode,
+                ]);
+            } else {
+                $logger->info("✅ Step completed: {$label}", [
+                    'command'  => $command,
+                    'exitCode' => $exitCode,
+                ]);
+            }
+        } catch (Throwable $e) {
+            $success  = false;
+            $errorMsg = $e->getMessage();
+
+            $this->error("❌ Step failed: {$label}");
+            $this->error($e->getMessage());
+
+            $logger->error("❌ Exception during step: {$label}", [
+                'command' => $command,
+                'error'   => $e->getMessage(),
+                'trace'   => substr($e->getTraceAsString(), 0, 400),
+            ]);
+        }
+
+        $duration = microtime(true) - $stepStart;
+
+        // Record result for final summary.
+        $results[$key] = [
+            'label'    => $label,
+            'command'  => $command,
+            'success'  => $success,
+            'duration' => $duration,
+            'error'    => $errorMsg,
+        ];
+
+        // If step failed, we *continue* with later stages, but mark failures in summary.
+        if (! $success) {
+            return;
+        }
+
+        // In --wait mode, block until queue is reasonably drained after this stage.
+        if ($wait) {
+            $this->waitForQueueDrain($label, $logger);
+        }
+    }
+
+    /**
+     * In --wait mode, block until:
+     *   • pending jobs on "default" queue reach zero, AND
+     *   • all job_batches are finished,
+     * OR until timeout is reached.
+     */
+    protected function waitForQueueDrain(string $afterStep, $logger): void
+    {
+        $this->newLine();
+        $this->info("⏳ Waiting for queue to drain after step: {$afterStep}");
+        $this->line(sprintf(
+            '   Polling every %ds, timeout after %d minutes...',
+            self::WAIT_POLL_SECONDS,
+            self::WAIT_MAX_MINUTES
+        ));
+
+        $started          = Carbon::now();
+        $warnedOnBacklog  = false;
+
+        while (true) {
+            try {
+                $pending = DB::table('jobs')
+                    ->where('queue', 'default')
+                    ->count();
+
+                $runningBatches = DB::table('job_batches')
+                    ->whereNull('finished_at')
+                    ->count();
+
+                $failed = DB::table('failed_jobs')->count();
+            } catch (Throwable $e) {
+                $this->warn('⚠️ Unable to query queue tables while waiting; skipping wait.');
+                $logger->warning('⚠️ Queue wait aborted due to DB error', [
+                    'after_step' => $afterStep,
+                    'error'      => $e->getMessage(),
+                ]);
+                return;
+            }
+
+            $this->line(sprintf(
+                '   → Pending: %d, Running batches: %d, Failed: %d',
+                $pending,
+                $runningBatches,
+                $failed
+            ));
+
+            if ($pending === 0 && $runningBatches === 0) {
+                $this->info('✅ Queue drained; proceeding to next step.');
+                $logger->info('✅ Queue drained after step', [
+                    'after_step' => $afterStep,
+                ]);
+                return;
+            }
+
+            // Soft warning if backlog gets large.
+            if (! $warnedOnBacklog && $pending > self::WAIT_SOFT_BACKLOG) {
+                $warnedOnBacklog = true;
+                $this->warn("⚠️ Large backlog detected ({$pending} jobs). Make sure queue:work is running.");
+                $logger->warning('⚠️ Large backlog detected during waitForQueueDrain', [
+                    'after_step' => $afterStep,
+                    'pending'    => $pending,
+                ]);
+            }
+
+            // Timeout?
+            if ($started->diffInMinutes(now()) >= self::WAIT_MAX_MINUTES) {
+                $this->warn('⚠️ Queue did not fully drain before timeout; continuing anyway.');
+                $logger->warning('⚠️ waitForQueueDrain timeout reached', [
+                    'after_step' => $afterStep,
+                    'pending'    => $pending,
+                    'running'    => $runningBatches,
+                ]);
+                return;
+            }
+
+            sleep(self::WAIT_POLL_SECONDS);
+        }
+    }
+
+    /**
+     * Small helper to safely run a counting closure; if anything explodes,
+     * return null instead of throwing.
+     */
+    protected function safeCount(callable $callback): ?int
+    {
+        try {
+            return (int) $callback();
+        } catch (Throwable) {
+            return null;
+        }
     }
 }app/Console/Commands/PolygonFundamentalsIngest.php
 
@@ -543,69 +1217,197 @@ use Illuminate\Support\Facades\Log;
 use App\Models\Ticker;
 use App\Jobs\IngestTickerFundamentalsJob;
 use Throwable;
+use Illuminate\Support\Carbon;
 
+/**
+ * ============================================================================
+ *  polygon:fundamentals:ingest
+ *  (v3.0 — Windowed, Redundant, Skip-Aware Fundamentals Ingestion)
+ * ============================================================================
+ *
+ * 🔧 Purpose:
+ * ----------------------------------------------------------------------------
+ *   Queues Polygon fundamentals ingestion jobs for:
+ *     • A single ticker  (argument: ticker)
+ *     • Or the active universe (no ticker argument)
+ *
+ *   This refactor adds:
+ *     ✅ Per-ticker / per-timeframe redundancy window (re-fetch last N days)
+ *     ✅ Windowed subjobs (date slices via filing_date.gte / filing_date.lte)
+ *     ✅ Smarter batching by JOB COUNT instead of only ticker count
+ *     ✅ “Skip already complete” detection when there’s nothing new to pull
+ *
+ * 🧠 Behavior (High-Level):
+ * ----------------------------------------------------------------------------
+ *   • Accepts an optional {ticker} argument (single symbol, unchanged).
+ *   • Accepts date filters (--gte/--gt/--lte/--lt). If ANY are provided:
+ *       → They are honored exactly.
+ *       → No redundancy / auto-windowing is applied (you are in full control).
+ *
+ *   • If NO date filters are provided:
+ *       → For each (ticker, timeframe) pair:
+ *           1. Find the latest filing_date we’ve stored.
+ *           2. Compute a redundancy window:
+ *                start_date = max(latest_filing_date - redundancy_days, min_date)
+ *              or, if no history yet:
+ *                start_date = min_date
+ *           3. end_date = today (inclusive).
+ *           4. If start_date > end_date → skip (already up-to-date).
+ *           5. Split [start_date, end_date] into N windows of size --window days.
+ *           6. Create one job per window with filing_date.gte / lte set.
+ *
+ * ⚙️ Config Integration (config/polygon.php):
+ * ----------------------------------------------------------------------------
+ *   • fundamentals_min_date          → default historical floor (e.g. '2015-01-01')
+ *   • fundamentals_window_days       → default date window size (days) when windowing
+ *   • fundamentals_redundancy_days   → default redundancy (days) per ticker/timeframe
+ *
+ *   All of these can be overridden via CLI flags.
+ *
+ * 📦 Command Signature (CLI):
+ * ----------------------------------------------------------------------------
+ *   php artisan polygon:fundamentals:ingest
+ *       {ticker?}                      # optional single symbol
+ *       --limit=                       # per-API page size (forwarded to Polygon)
+ *       --order=desc                   # asc|desc
+ *       --timeframe=all                # annual|quarterly|ttm|all
+ *       --gte=                         # filing_date.gte (YYYY-MM-DD)
+ *       --gt=                          # filing_date.gt  (YYYY-MM-DD)
+ *       --lte=                         # filing_date.lte (YYYY-MM-DD)
+ *       --lt=                          # filing_date.lt  (YYYY-MM-DD)
+ *       --batch=200                    # ≈ max jobs per Bus::batch
+ *       --sleep=5                      # seconds between Bus::batch dispatches
+ *       --sync                         # run jobs synchronously (debug mode)
+ *       --window=365                   # window size (days) for auto date-slicing
+ *       --redundancy-days=365          # days to backtrack from last filing_date
+ *
+ * 💡 Examples:
+ * ----------------------------------------------------------------------------
+ *   # Full-universe, all timeframes, auto-windowed & redundant:
+ *   php artisan polygon:fundamentals:ingest --timeframe=all
+ *
+ *   # Single ticker, annual only, exact manual date filters (no auto windowing):
+ *   php artisan polygon:fundamentals:ingest AAPL --timeframe=annual --gte=2019-01-01
+ *
+ *   # Full-universe, but smaller windows & shorter redundancy:
+ *   php artisan polygon:fundamentals:ingest --window=180 --redundancy-days=90
+ *
+ * ============================================================================
+ */
 class PolygonFundamentalsIngest extends Command
 {
+    /**
+     * Command signature.
+     */
     protected $signature = 'polygon:fundamentals:ingest
                             {ticker? : Optional specific ticker symbol}
                             {--limit= : Optional page size per API call (omit for provider default)}
                             {--order=desc : Sort order returned by API: asc|desc}
-                            {--timeframe= : Optional timeframe: annual|quarterly|ttm|all}
+                            {--timeframe=all : Timeframe: annual|quarterly|ttm|all}
                             {--gte= : filing_date.gte (≥ start date, YYYY-MM-DD)}
                             {--gt= : filing_date.gt (> start date, YYYY-MM-DD)}
                             {--lte= : filing_date.lte (≤ end date, YYYY-MM-DD)}
                             {--lt= : filing_date.lt (< end date, YYYY-MM-DD)}
-                            {--batch=200 : Number of tickers per batch}
+                            {--batch=200 : Approximate maximum jobs per Bus::batch}
                             {--sleep=5 : Seconds to pause between batch dispatches}
-                            {--sync : Run jobs synchronously for debugging (bypass queue)}';
+                            {--sync : Run jobs synchronously for debugging (bypass queue)}
+                            {--window=365 : Window size in days when auto chunking date ranges (>=1)}
+                            {--redundancy-days=365 : Days to backtrack from last filing_date when auto-ranging (>=0)}';
 
-    protected $description = 'Queue and batch ingest of Polygon Fundamentals (financials) for one or all tickers, across multiple timeframes, with optional filing_date filters.';
+    /**
+     * Description.
+     */
+    protected $description = 'Queue and batch ingest of Polygon Fundamentals for one or all tickers, with smart date windowing and redundancy.';
 
+    /**
+     * Entry point.
+     */
     public function handle(): int
     {
-        $ticker    = $this->argument('ticker');
-        $limit     = $this->option('limit');
-        $order     = $this->option('order') ?: 'desc';
-        $timeframe = $this->option('timeframe');
-        $batchSize = (int) $this->option('batch');
-        $sleep     = (int) $this->option('sleep');
-        $syncMode  = (bool) $this->option('sync');
+        $tickerArg        = $this->argument('ticker');
+        $limit            = $this->option('limit');
+        $order            = $this->option('order') ?: 'desc';
+        $timeframeInput   = $this->option('timeframe') ?: 'all';
+        $batchSize        = (int) $this->option('batch');
+        $sleep            = (int) $this->option('sleep');
+        $syncMode         = (bool) $this->option('sync');
+        $windowDays       = (int) ($this->option('window') ?? config('polygon.fundamentals_window_days', 365));
+        $redundancyDays   = (int) ($this->option('redundancy-days') ?? config('polygon.fundamentals_redundancy_days', 365));
 
-        // Determine timeframes to process
-        $timeframes = $this->resolveTimeframes($timeframe);
-
-        // Collect all ingestion options, including date filters
-        $options = array_filter([
-            'limit' => $limit !== null ? (int) $limit : null,
-            'order' => $order,
-            'filing_date.gte' => $this->option('gte'),
-            'filing_date.gt'  => $this->option('gt'),
-            'filing_date.lte' => $this->option('lte'),
-            'filing_date.lt'  => $this->option('lt'),
-        ], fn($v) => $v !== null);
-
-        Log::channel('ingest')->info('🚀 Starting fundamentals ingest command', [
-            'ticker' => $ticker,
-            'timeframes' => $timeframes,
-            'options' => $options,
-            'mode' => $syncMode ? 'sync' : 'queued',
-        ]);
-
-        if ($ticker) {
-            return $this->handleSingleTicker($ticker, $options, $timeframes, $syncMode);
+        // Ensure sane minimums
+        if ($windowDays < 1) {
+            $windowDays = 1;
+        }
+        if ($redundancyDays < 0) {
+            $redundancyDays = 0;
         }
 
-        return $this->handleBatchIngestion($options, $timeframes, $batchSize, $sleep, $syncMode);
+        // User-provided filing_date filters
+        $gte = $this->option('gte');
+        $gt  = $this->option('gt');
+        $lte = $this->option('lte');
+        $lt  = $this->option('lt');
+
+        $hasUserDateFilters = $gte !== null || $gt !== null || $lte !== null || $lt !== null;
+
+        // Determine which timeframes to process
+        $timeframes = $this->resolveTimeframes($timeframeInput);
+
+        // Base options forwarded into each job (augmented later per ticker/timeframe/window)
+        $baseOptions = array_filter([
+            'limit'             => $limit !== null ? (int) $limit : null,
+            'order'             => $order,
+            'filing_date.gte'   => $gte,
+            'filing_date.gt'    => $gt,
+            'filing_date.lte'   => $lte,
+            'filing_date.lt'    => $lt,
+        ], fn ($v) => $v !== null);
+
+        Log::channel('ingest')->info('🚀 Starting fundamentals ingest command (v3.0)', [
+            'ticker'              => $tickerArg,
+            'timeframes'          => $timeframes,
+            'base_options'        => $baseOptions,
+            'mode'                => $syncMode ? 'sync' : 'queued',
+            'window_days'         => $windowDays,
+            'redundancy_days'     => $redundancyDays,
+            'has_user_date_range' => $hasUserDateFilters,
+        ]);
+
+        if ($tickerArg) {
+            return $this->handleSingleTicker(
+                $tickerArg,
+                $baseOptions,
+                $timeframes,
+                $hasUserDateFilters,
+                $syncMode,
+                $windowDays,
+                $redundancyDays
+            );
+        }
+
+        return $this->handleBatchIngestion(
+            $baseOptions,
+            $timeframes,
+            $batchSize,
+            $sleep,
+            $syncMode,
+            $windowDays,
+            $redundancyDays,
+            $hasUserDateFilters
+        );
     }
 
+    /**
+     * Resolve timeframe input into a canonical list.
+     */
     protected function resolveTimeframes(?string $timeframe): array
     {
-        if ($timeframe === 'all' || $timeframe === null) {
+        if ($timeframe === null || $timeframe === 'all') {
             return ['quarterly', 'annual', 'ttm'];
         }
 
         $allowed = ['quarterly', 'annual', 'ttm'];
-        if (!in_array($timeframe, $allowed, true)) {
+        if (! in_array($timeframe, $allowed, true)) {
             $this->error("❌ Invalid timeframe: {$timeframe}. Allowed: " . implode(', ', $allowed) . ", or 'all'");
             exit(self::FAILURE);
         }
@@ -613,51 +1415,98 @@ class PolygonFundamentalsIngest extends Command
         return [$timeframe];
     }
 
-    protected function handleSingleTicker(string $ticker, array $options, array $timeframes, bool $syncMode = false): int
-    {
-        $symbol = trim($ticker);
+    /**
+     * Handle ingestion for a SINGLE ticker.
+     */
+    protected function handleSingleTicker(
+        string $tickerSymbol,
+        array $baseOptions,
+        array $timeframes,
+        bool $hasUserDateFilters,
+        bool $syncMode,
+        int $windowDays,
+        int $redundancyDays
+    ): int {
+        $symbol = trim($tickerSymbol);
+
         $this->info("📘 Queuing fundamentals ingestion for {$symbol}...");
-        Log::channel('ingest')->info("📘 Queuing single-ticker fundamentals ingestion", [
-            'symbol' => $symbol,
-            'timeframes' => $timeframes,
-            'options' => $options,
+        Log::channel('ingest')->info("📘 Single-ticker fundamentals ingestion initializing", [
+            'symbol'              => $symbol,
+            'timeframes'          => $timeframes,
+            'base_options'        => $baseOptions,
+            'has_user_date_range' => $hasUserDateFilters,
         ]);
 
         $tickerModel = Ticker::where('ticker', $symbol)->first();
-        if (!$tickerModel) {
-            $this->error("Ticker {$symbol} not found.");
-            Log::channel('ingest')->warning("⚠️ Ticker not found", ['symbol' => $symbol]);
+
+        if (! $tickerModel) {
+            $this->error("❌ Ticker {$symbol} not found.");
+            Log::channel('ingest')->warning('⚠️ Ticker not found for fundamentals ingestion', [
+                'symbol' => $symbol,
+            ]);
+
             return self::FAILURE;
         }
 
         try {
-            foreach ($timeframes as $tf) {
-                $opts = array_merge($options, ['timeframe' => $tf]);
-                Log::channel('ingest')->info("⏳ Ingesting {$tf} data for {$symbol}");
+            $jobs = $this->buildJobsForTicker(
+                $tickerModel,
+                $timeframes,
+                $baseOptions,
+                $hasUserDateFilters,
+                $windowDays,
+                $redundancyDays
+            );
 
-                if ($syncMode) {
-                    Log::channel('ingest')->info("⚙️ Running in SYNC mode for {$symbol} [{$tf}]");
-                    (new IngestTickerFundamentalsJob($tickerModel->id, $opts))->handle(
-                        app(\App\Services\PolygonFundamentalsService::class)
-                    );
-                } else {
-                    IngestTickerFundamentalsJob::dispatch($tickerModel->id, $opts)
-                        ->onConnection('database')
-                        ->onQueue('default');
+            if (empty($jobs)) {
+                $this->info("✅ No fundamentals work needed for {$symbol} (all timeframes up-to-date).");
+                Log::channel('ingest')->info('ℹ️ No fundamentals jobs generated (single ticker)', [
+                    'symbol'     => $symbol,
+                    'timeframes' => $timeframes,
+                ]);
+
+                return self::SUCCESS;
+            }
+
+            if ($syncMode) {
+                Log::channel('ingest')->info('⚙️ Running single-ticker fundamentals in SYNC mode', [
+                    'symbol'        => $symbol,
+                    'job_count'     => count($jobs),
+                    'timeframes'    => $timeframes,
+                ]);
+
+                $service = app(\App\Services\PolygonFundamentalsService::class);
+
+                foreach ($jobs as $job) {
+                    /** @var IngestTickerFundamentalsJob $job */
+                    $job->handle($service);
                 }
 
-                $this->info("✅ Fundamentals job dispatched for {$symbol} [{$tf}]");
-                Log::channel('ingest')->info("✅ Job dispatched successfully", [
-                    'symbol' => $symbol,
-                    'timeframe' => $tf,
-                    'mode' => $syncMode ? 'sync' : 'queued',
-                ]);
+                $this->info("✅ Completed fundamentals ingestion for {$symbol} in SYNC mode.");
+                return self::SUCCESS;
             }
-        } catch (Throwable $e) {
-            Log::channel('ingest')->error("❌ Failed dispatching fundamentals job", [
-                'symbol' => $symbol,
-                'error' => $e->getMessage(),
+
+            // Queue mode: single Bus batch (no then()/catch() closures to avoid closure serialization issues)
+            $batch = Bus::batch($jobs)
+                ->name("PolygonFundamentals Single ({$symbol})")
+                ->onConnection('database')
+                ->onQueue('default')
+                ->dispatch();
+
+            Log::channel('ingest')->info('✅ Single-ticker fundamentals batch dispatched', [
+                'symbol'    => $symbol,
+                'job_count' => $batch->totalJobs,
+                'batch_id'  => $batch->id ?? null,
             ]);
+
+            $this->info("✅ Dispatched fundamentals batch for {$symbol} ({$batch->totalJobs} jobs).");
+
+        } catch (Throwable $e) {
+            Log::channel('ingest')->error('❌ Failed dispatching single-ticker fundamentals job(s)', [
+                'symbol' => $symbol,
+                'error'  => $e->getMessage(),
+            ]);
+
             $this->error("❌ Dispatch failed: {$e->getMessage()}");
             return self::FAILURE;
         }
@@ -665,105 +1514,309 @@ class PolygonFundamentalsIngest extends Command
         return self::SUCCESS;
     }
 
-    protected function handleBatchIngestion(array $options, array $timeframes, int $batchSize, int $sleep, bool $syncMode = false): int
-    {
-        $this->info("🔎 Selecting active tickers...");
-        Log::channel('ingest')->info("🔎 Selecting active tickers for batch ingestion");
+    /**
+     * Handle BATCH ingestion for the active universe.
+     */
+    protected function handleBatchIngestion(
+        array $baseOptions,
+        array $timeframes,
+        int $batchSize,
+        int $sleep,
+        bool $syncMode,
+        int $windowDays,
+        int $redundancyDays,
+        bool $hasUserDateFilters
+    ): int {
+        $this->info('🔎 Selecting active tickers for fundamentals ingestion...');
+        Log::channel('ingest')->info('🔎 Selecting active tickers for fundamentals batch ingestion');
 
-        $tickers = Ticker::select('id', 'ticker')
+        $tickerQuery = Ticker::select('id', 'ticker')
             ->where('active', true)
-            ->orderBy('id')
-            ->cursor();
+            ->orderBy('id');
 
-        $count = $tickers->count();
-        if ($count === 0) {
-            $this->warn('No active tickers found.');
-            Log::channel('ingest')->warning("⚠️ No active tickers found");
+        $totalTickers = $tickerQuery->count();
+
+        if ($totalTickers === 0) {
+            $this->warn('⚠️ No active tickers found for fundamentals ingestion.');
+            Log::channel('ingest')->warning('⚠️ No active tickers found (fundamentals)');
             return self::SUCCESS;
         }
 
-        $this->info("🧱 Dispatching fundamentals ingestion for {$count} tickers ({$batchSize}/batch) across " . implode(', ', $timeframes));
-        Log::channel('ingest')->info("🧱 Beginning batch dispatch", [
-            'total_tickers' => $count,
-            'batch_size' => $batchSize,
-            'timeframes' => $timeframes,
-            'mode' => $syncMode ? 'sync' : 'queued',
+        $this->info("🧱 Dispatching fundamentals ingestion for {$totalTickers} tickers across " . implode(', ', $timeframes));
+        Log::channel('ingest')->info('🧱 Fundamentals batch ingestion starting', [
+            'total_tickers'       => $totalTickers,
+            'timeframes'          => $timeframes,
+            'batch_size_jobs'     => $batchSize,
+            'sleep_seconds'       => $sleep,
+            'mode'                => $syncMode ? 'sync' : 'queued',
+            'window_days'         => $windowDays,
+            'redundancy_days'     => $redundancyDays,
+            'has_user_date_range' => $hasUserDateFilters,
         ]);
 
-        $batchNumber = 0;
-        $dispatched = 0;
-        $chunk = [];
+        $tickerBar = $this->output->createProgressBar($totalTickers);
+        $tickerBar->setFormat("   🟢 Tickers: %current%/%max% [%bar%] %percent:3s%%");
+        $tickerBar->start();
 
-        foreach ($tickers as $t) {
-            foreach ($timeframes as $tf) {
-                $chunk[] = new IngestTickerFundamentalsJob($t->id, array_merge($options, ['timeframe' => $tf]));
-                $dispatched++;
+        $batchNumber          = 0;
+        $totalJobsDispatched  = 0;
+        $jobsBuffer           = [];
+
+        $tickerQuery->chunkById(200, function ($tickers) use (
+            $timeframes,
+            $baseOptions,
+            $hasUserDateFilters,
+            $windowDays,
+            $redundancyDays,
+            $batchSize,
+            $sleep,
+            $syncMode,
+            $tickerBar,
+            &$batchNumber,
+            &$totalJobsDispatched,
+            &$jobsBuffer
+        ) {
+            foreach ($tickers as $ticker) {
+                /** @var Ticker $ticker */
+
+                $jobsForTicker = $this->buildJobsForTicker(
+                    $ticker,
+                    $timeframes,
+                    $baseOptions,
+                    $hasUserDateFilters,
+                    $windowDays,
+                    $redundancyDays
+                );
+
+                if (empty($jobsForTicker)) {
+                    Log::channel('ingest')->info('⏭ Fundamentals up-to-date for ticker (no jobs generated)', [
+                        'ticker'     => $ticker->ticker,
+                        'timeframes' => $timeframes,
+                    ]);
+                    $tickerBar->advance();
+                    continue;
+                }
+
+                foreach ($jobsForTicker as $job) {
+                    $jobsBuffer[] = $job;
+                    $totalJobsDispatched++;
+
+                    if (count($jobsBuffer) >= $batchSize) {
+                        $batchNumber++;
+                        $this->dispatchJobBatch($jobsBuffer, $batchNumber, $sleep, $syncMode);
+                        $jobsBuffer = [];
+                    }
+                }
+
+                $tickerBar->advance();
             }
+        });
 
-            if (count($chunk) >= $batchSize) {
-                $batchNumber++;
-                $this->dispatchChunk($chunk, $batchNumber, $sleep, $syncMode);
-                $chunk = [];
-            }
-        }
-
-        if (!empty($chunk)) {
+        // Flush any remaining jobs
+        if (! empty($jobsBuffer)) {
             $batchNumber++;
-            $this->dispatchChunk($chunk, $batchNumber, $sleep, $syncMode);
+            $this->dispatchJobBatch($jobsBuffer, $batchNumber, $sleep, $syncMode);
         }
 
-        $this->info("✅ Queued {$dispatched} jobs across {$batchNumber} batches.");
-        Log::channel('ingest')->info("✅ Finished queuing fundamentals batches", [
-            'batches' => $batchNumber,
-            'total_dispatched' => $dispatched,
-        ]);
+        $tickerBar->finish();
+        $this->newLine(2);
+
+        if ($totalJobsDispatched === 0) {
+            $this->info('✅ Fundamentals ingestion: no new work detected for any ticker.');
+            Log::channel('ingest')->info('✅ Fundamentals ingestion complete — nothing new to ingest.');
+        } else {
+            $this->info("✅ Queued {$totalJobsDispatched} fundamentals jobs across {$batchNumber} batch(es).");
+            Log::channel('ingest')->info('✅ Finished queuing fundamentals batches', [
+                'batches'         => $batchNumber,
+                'total_jobs'      => $totalJobsDispatched,
+            ]);
+        }
 
         return self::SUCCESS;
     }
 
-    protected function dispatchChunk(array $jobs, int $batchNumber, int $sleep, bool $syncMode = false): void
+    /**
+     * Build fundamentals jobs for a single ticker across all requested timeframes.
+     *
+     * Invariants:
+     *   • If user supplied any filing_date filters → one job per timeframe (no windowing).
+     *   • If no user date filters:
+     *        - we do redundancy + windowing using filing_date.gte / lte.
+     */
+    protected function buildJobsForTicker(
+        Ticker $ticker,
+        array $timeframes,
+        array $baseOptions,
+        bool $hasUserDateFilters,
+        int $windowDays,
+        int $redundancyDays
+    ): array {
+        $jobs    = [];
+        $today   = Carbon::today();
+        $minDate = Carbon::parse(config('polygon.fundamentals_min_date', '2015-01-01'))->startOfDay();
+
+        foreach ($timeframes as $tf) {
+            if ($hasUserDateFilters) {
+                // Honor explicit user date filters EXACTLY — no auto magic.
+                $opts = $baseOptions;
+                $opts['timeframe'] = $tf;
+
+                Log::channel('ingest')->info('📡 Queueing fundamentals job (explicit date filters)', [
+                    'ticker'     => $ticker->ticker,
+                    'ticker_id'  => $ticker->id,
+                    'timeframe'  => $tf,
+                    'options'    => $opts,
+                ]);
+
+                $jobs[] = new IngestTickerFundamentalsJob($ticker->id, $opts);
+                continue;
+            }
+
+            // -----------------------------------------------------------------
+            // Auto-range mode (no user date filters):
+            //   1) Find latest filing_date for (ticker, timeframe).
+            //   2) Backtrack redundancyDays from that date.
+            //   3) Clamp to minDate.
+            //   4) Window [start, today] into N slices of windowDays.
+            // -----------------------------------------------------------------
+            $latestFilingDate = DB::table('ticker_fundamentals')
+                ->where('ticker_id', $ticker->id)
+                ->where('timeframe', $tf)
+                ->max('filing_date');
+
+            if ($latestFilingDate) {
+                $startDate = Carbon::parse($latestFilingDate)
+                    ->subDays($redundancyDays)
+                    ->startOfDay();
+            } else {
+                $startDate = $minDate->copy();
+            }
+
+            // Clamp to minDate safety floor
+            if ($startDate->lessThan($minDate)) {
+                $startDate = $minDate->copy();
+            }
+
+            $endDate = $today->copy();
+
+            // If the entire redundancy window is already in the "future" relative to today → nothing to do.
+            if ($startDate->greaterThan($endDate)) {
+                Log::channel('ingest')->info('⏭ Skipping fundamentals (up-to-date with redundancy)', [
+                    'ticker'         => $ticker->ticker,
+                    'ticker_id'      => $ticker->id,
+                    'timeframe'      => $tf,
+                    'latest_filing'  => $latestFilingDate,
+                    'start_date'     => $startDate->toDateString(),
+                    'end_date'       => $endDate->toDateString(),
+                    'redundancyDays' => $redundancyDays,
+                ]);
+                continue;
+            }
+
+            $cursorStart = $startDate->copy();
+
+            while ($cursorStart->lessThanOrEqualTo($endDate)) {
+                $cursorEnd = $cursorStart->copy()->addDays($windowDays - 1);
+
+                if ($cursorEnd->greaterThan($endDate)) {
+                    $cursorEnd = $endDate->copy();
+                }
+
+                $fromStr = $cursorStart->toDateString();
+                $toStr   = $cursorEnd->toDateString();
+
+                $opts = $baseOptions;
+                // NOTE: we override any existing filing_date.* in baseOptions in auto-mode.
+                $opts['timeframe']        = $tf;
+                $opts['filing_date.gte']  = $fromStr;
+                $opts['filing_date.lte']  = $toStr;
+
+                Log::channel('ingest')->info('📡 Queueing fundamentals subjob (windowed)', [
+                    'ticker'         => $ticker->ticker,
+                    'ticker_id'      => $ticker->id,
+                    'timeframe'      => $tf,
+                    'from'           => $fromStr,
+                    'to'             => $toStr,
+                    'window_days'    => $windowDays,
+                    'redundancyDays' => $redundancyDays,
+                ]);
+
+                $jobs[] = new IngestTickerFundamentalsJob($ticker->id, $opts);
+
+                $cursorStart = $cursorEnd->copy()->addDay();
+
+                // Safety guard in case of any strange date math
+                if ($cursorStart->diffInDays($startDate, false) > 3650) {
+                    Log::channel('ingest')->warning('⚠️ Aborting fundamentals window loop due to excessive span', [
+                        'ticker'    => $ticker->ticker,
+                        'timeframe' => $tf,
+                        'start'     => $startDate->toDateString(),
+                        'end'       => $endDate->toDateString(),
+                    ]);
+                    break;
+                }
+            }
+        }
+
+        return $jobs;
+    }
+
+    /**
+     * Dispatch a batch of jobs either synchronously or via Bus::batch.
+     */
+    protected function dispatchJobBatch(array $jobs, int $batchNumber, int $sleep, bool $syncMode): void
     {
+        $jobCount = count($jobs);
+        $logger   = Log::channel('ingest');
+
+        if ($jobCount === 0) {
+            return;
+        }
+
         try {
             if ($syncMode) {
-                Log::channel('ingest')->info("⚙️ Running batch #{$batchNumber} in SYNC mode", [
-                    'job_count' => count($jobs),
+                $logger->info("⚙️ Running fundamentals batch #{$batchNumber} in SYNC mode", [
+                    'job_count' => $jobCount,
                 ]);
+
+                $service = app(\App\Services\PolygonFundamentalsService::class);
+
                 foreach ($jobs as $job) {
-                    $job->handle(app(\App\Services\PolygonFundamentalsService::class));
+                    /** @var IngestTickerFundamentalsJob $job */
+                    $job->handle($service);
                 }
+
                 return;
             }
 
-            Log::channel('ingest')->info("📦 Dispatching batch #{$batchNumber}", [
-                'job_count' => count($jobs),
+            $logger->info("📦 Dispatching fundamentals batch #{$batchNumber}", [
+                'job_count' => $jobCount,
             ]);
 
+            // Ensure DB connection is alive before heavy batch dispatch
             DB::connection()->reconnect();
 
             $batch = Bus::batch($jobs)
                 ->name("PolygonFundamentals Batch #{$batchNumber}")
                 ->onConnection('database')
                 ->onQueue('default')
-                ->then(fn() => Log::channel('ingest')->info("✅ Batch #{$batchNumber} complete"))
-                ->catch(fn(Throwable $e) => Log::channel('ingest')->error("❌ Batch #{$batchNumber} failed", ['error' => $e->getMessage()]))
                 ->dispatch();
 
-            $this->info("✅ Dispatched batch #{$batchNumber} ({$batch->totalJobs} jobs)");
-            Log::channel('ingest')->info("🧩 Batch dispatched successfully", [
-                'batch_number' => $batchNumber,
-                'total_jobs' => $batch->totalJobs,
-            ]);
+            $this->info("✅ Dispatched fundamentals batch #{$batchNumber} ({$batch->totalJobs} jobs)");
 
             if ($sleep > 0) {
-                Log::channel('ingest')->info("😴 Sleeping for {$sleep}s before next batch");
+                $logger->info("😴 Sleeping for {$sleep}s before next fundamentals batch", [
+                    'batch_number' => $batchNumber,
+                ]);
                 sleep($sleep);
             }
         } catch (Throwable $e) {
-            Log::channel('ingest')->error("❌ Error dispatching fundamentals batch", [
+            $logger->error('❌ Error dispatching fundamentals batch', [
                 'batch_number' => $batchNumber,
-                'error' => $e->getMessage(),
+                'error'        => $e->getMessage(),
             ]);
-            $this->error("❌ Failed to dispatch batch #{$batchNumber}: {$e->getMessage()}");
+
+            $this->error("❌ Failed to dispatch fundamentals batch #{$batchNumber}: {$e->getMessage()}");
         }
     }
 }app/Console/Commands/PolygonTickersIngest.php
@@ -980,208 +2033,290 @@ class PolygonBatchCleanup extends Command
 namespace App\Console\Commands;
 
 use Illuminate\Console\Command;
-use Illuminate\Bus\Batch;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Log;
-use Illuminate\Support\Facades\DB;
-use App\Models\Ticker;
 use App\Jobs\IngestTickerOverviewJob;
+use App\Models\Ticker;
 use Throwable;
 
 /**
- * =============================================================================
- *  COMMAND: polygon:ticker-overviews:ingest
- * =============================================================================
+ * ============================================================================
+ *  polygon:ticker-overviews:ingest
+ *  (v2.1.0 — Streamed, Memory-Safe Batching + Safer Defaults)
+ * ============================================================================
  *
- *  PURPOSE:
- *  --------
- *  This Artisan command orchestrates the ingestion of **Polygon.io ticker
- *  overviews** for all tickers currently present in the `tickers` table.
+ * 🔧 Purpose
+ * ----------------------------------------------------------------------------
+ * Dispatch queued jobs to ingest Polygon.io ticker overviews for the current
+ * ticker universe. Uses a streaming cursor + buffered chunking so we never
+ * load all tickers into memory at once.
  *
- *  It does so by:
- *    1. Retrieving all tickers from the database.
- *    2. Chunking them into batches (configurable via `--batch` option).
- *    3. Creating a Laravel Bus **Batch** composed of multiple
- *       `IngestTickerOverviewJob` instances.
- *    4. Dispatching that batch to the queue system (`QUEUE_CONNECTION` = database).
+ * 🧠 High-Level Behavior
+ * ----------------------------------------------------------------------------
+ *  • Streams tickers from the DB using cursor() (no huge in-memory array).
+ *  • Buffers tickers into "dispatch batches" (size = --batch).
+ *  • Within each dispatch batch, splits into multiple queue jobs
+ *      (size = --per-job) so each job does a small, bounded unit of work.
+ *  • Enqueues Bus batches on the `database` queue connection.
+ *  • Plays nicely with your `queue:supervisor` / docker queue worker.
  *
- *  Each job in the batch calls the PolygonTickerOverviewService to fetch and
- *  upsert overview data into the `ticker_overviews` table.
+ * 📦 Typical Usage
+ * ----------------------------------------------------------------------------
+ *  # Nightly / safe mode
+ *  php artisan polygon:ticker-overviews:ingest
  *
- *  This command integrates with the `PolygonTickerOverviewsSchedule` class,
- *  which runs this nightly as part of the automated ingestion pipeline.
+ *  # Faster, but still safe-ish (what tickers:refresh-all --fast / --dev use)
+ *  php artisan polygon:ticker-overviews:ingest --batch=1500 --per-job=75 --sleep=0
  *
- *  OPTIONS:
- *  --------
- *    --batch : Number of tickers to include per job (default: 500)
- *    --sleep : Seconds to pause between batch dispatches (default: 5)
+ * ⚙️ Options
+ * ----------------------------------------------------------------------------
+ *  --limit       : Max number of tickers to process (0 = all).
+ *  --batch       : Number of tickers to buffer *per Bus batch dispatch*.
+ *                  This controls how many tickers we process per round-trip
+ *                  to the queue system.
+ *  --per-job     : Number of tickers each queue job will handle.
+ *                  Lower = smaller runtime and memory footprint per job.
+ *  --sleep       : Seconds to sleep between Bus batch dispatches.
  *
- *  LOGGING:
- *  --------
- *  All output is logged to the **"ingest"** logging channel (see
- *  `config/logging.php`) under `storage/logs/ingest.log`.
+ * 🧪 Safety / Memory Notes
+ * ----------------------------------------------------------------------------
+ *  • Uses cursor() to stream, not ->get().
+ *  • Bounds per-job work via --per-job (defaults conservative).
+ *  • You can tune --batch and --per-job separately to match hardware.
  *
- *  EXAMPLE USAGE:
- *  ---------------
- *  php artisan polygon:ticker-overviews:ingest --batch=1000 --sleep=10
- *
- *  ENVIRONMENT REQUIREMENTS:
- *  -------------------------
- *  • Polygon API credentials defined in `.env`
- *  • Database queues enabled (QUEUE_CONNECTION=database)
- *  • Proper indexing on `tickers.id` and `tickers.ticker`
- * =============================================================================
+ * 🧩 Related
+ * ----------------------------------------------------------------------------
+ *  • App\Jobs\IngestTickerOverviewJob
+ *  • docker `tickerwolf-queue` worker + queue:supervisor
+ *  • tickers:refresh-all umbrella command
+ * ============================================================================
  */
 class PolygonTickerOverviewsIngest extends Command
 {
     /**
      * The name and signature of the console command.
      *
-     * @var string
+     * NOTE:
+     *  • We keep --batch and --sleep for backward compatibility
+     *  • We keep --per-job for fine-tuning job runtime
      */
     protected $signature = 'polygon:ticker-overviews:ingest
-                            {--batch=500 : Number of tickers per job batch}
-                            {--sleep=5 : Seconds to sleep between batch dispatches}';
+                            {--limit=0 : Limit total tickers processed (0 = all)}
+                            {--batch=1200 : Number of tickers per Bus batch dispatch}
+                            {--per-job=75 : Number of tickers per queue job}
+                            {--sleep=1 : Seconds to sleep between Bus batches}';
 
     /**
      * The console command description.
-     *
-     * @var string
      */
-    protected $description = 'Ingest Polygon.io ticker overviews in batches using queued jobs.';
+    protected $description = 'Ingest Polygon.io ticker overviews in streamed, memory-safe batches using queued jobs.';
 
     /**
      * Execute the console command.
-     *
-     * @return int
      */
     public function handle(): int
     {
         // ---------------------------------------------------------------------
-        // STEP 1: Retrieve configuration options
+        // 1️⃣ Resolve options and log context
         // ---------------------------------------------------------------------
-        $batchSize = (int) $this->option('batch');
-        $sleep = (int) $this->option('sleep');
+        $limit         = (int) $this->option('limit');
+        $batchSize     = max(1, (int) $this->option('batch'));     // total tickers per Bus batch
+        $tickersPerJob = max(1, (int) $this->option('per-job'));   // tickers handled by each job
+        $sleep         = max(0, (int) $this->option('sleep'));     // pause between dispatches
 
-        $this->info("Preparing to dispatch Polygon.io overview ingestion jobs...");
-        Log::channel('ingest')->info("Starting Polygon overview ingestion command", [
-            'batch_size'    => $batchSize,
-            'sleep_seconds' => $sleep,
+        $logger = Log::channel('ingest');
+
+        $logger->info('📥 Polygon ticker-overviews ingestion command started', [
+            'limit'           => $limit,
+            'batch_size'      => $batchSize,
+            'tickers_per_job' => $tickersPerJob,
+            'sleep'           => $sleep,
         ]);
 
+        $this->info('📊 Polygon Ticker Overviews Ingestion (v2.1.0)');
+        $this->line('   Limit          : ' . ($limit ?: 'ALL'));
+        $this->line("   Bus batch size : {$batchSize} tickers");
+        $this->line("   Tickers / job  : {$tickersPerJob}");
+        $this->line("   Sleep between  : {$sleep} second(s)");
+        $this->newLine();
+
         // ---------------------------------------------------------------------
-        // STEP 2: Determine total tickers to process
+        // 2️⃣ Build base ticker query (active universe)
         // ---------------------------------------------------------------------
-        $totalTickers = Ticker::count();
-        if ($totalTickers === 0) {
-            $this->warn("No tickers found in the database. Nothing to ingest.");
-            Log::channel('ingest')->warning("No tickers found in database — skipping overview ingestion.");
+        $tickerQuery = Ticker::query()
+            ->where('is_active_polygon', true)
+            ->orderBy('id')
+            ->select(['id', 'ticker']);
+
+        if ($limit > 0) {
+            $tickerQuery->limit($limit);
+        }
+
+        $total = (clone $tickerQuery)->count();
+
+        if ($total === 0) {
+            $this->warn('⚠️ No tickers found for Polygon overview ingestion.');
+            $logger->warning('⚠️ No tickers found for Polygon overview ingestion.', [
+                'limit' => $limit,
+            ]);
             return Command::SUCCESS;
         }
 
-        $this->info("Found {$totalTickers} tickers.");
-        $this->info("Chunking into batches of {$batchSize} tickers each...");
-
-        Log::channel('ingest')->info("Ticker enumeration started", [
-            'total_tickers' => $totalTickers,
-            'batch_size'    => $batchSize,
-        ]);
+        $this->info("🔢 Found {$total} ticker(s) to process.");
+        $this->newLine();
 
         // ---------------------------------------------------------------------
-        // STEP 3: Build an array of IngestTickerOverviewJob instances
+        // 3️⃣ Stream tickers via cursor and dispatch in buffered Bus batches
         // ---------------------------------------------------------------------
-        $jobs = [];
-        $chunk = [];
-        $processed = 0;
+        $buffer        = [];
+        $dispatched    = 0;
+        $dispatchIndex = 1;
 
-        // Use a cursor to efficiently stream all tickers without memory exhaustion.
-        $tickers = Ticker::select('id', 'ticker')->orderBy('id')->cursor();
+        // Thin progress bar: total tickers we'll *attempt* to dispatch.
+        $bar = $this->output->createProgressBar($total);
+        $bar->setFormat("   🟢 Dispatch: %current%/%max% [%bar%] %percent:3s%%");
+        $bar->start();
 
-        foreach ($tickers as $ticker) {
-            $chunk[] = $ticker->ticker;
-            $processed++;
+        foreach ($tickerQuery->cursor() as $ticker) {
+            $buffer[] = [
+                'id'     => $ticker->id,
+                'ticker' => $ticker->ticker,
+            ];
 
-            if (count($chunk) >= $batchSize) {
-                $jobs[] = new IngestTickerOverviewJob($chunk);
-                $chunk = [];
+            // If buffer reached the desired Bus batch size, dispatch it.
+            if (count($buffer) >= $batchSize) {
+                $this->dispatchBufferAsBusBatch(
+                    $buffer,
+                    $tickersPerJob,
+                    $dispatchIndex,
+                    $logger
+                );
+
+                $dispatched += count($buffer);
+                $bar->advance(count($buffer));
+
+                $buffer = []; // Clear buffer for next run
+                $dispatchIndex++;
+
+                if ($sleep > 0) {
+                    $this->newLine();
+                    $this->line("⏳ Sleeping {$sleep} second(s) before next batch...");
+                    sleep($sleep);
+                }
             }
         }
 
-        // Handle any remaining tickers that didn’t fill the last chunk.
-        if (!empty($chunk)) {
-            $jobs[] = new IngestTickerOverviewJob($chunk);
+        // Flush any remaining tickers in the buffer.
+        if (! empty($buffer)) {
+            $this->dispatchBufferAsBusBatch(
+                $buffer,
+                $tickersPerJob,
+                $dispatchIndex,
+                $logger
+            );
+
+            $dispatched += count($buffer);
+            $bar->advance(count($buffer));
+
+            $dispatchIndex++;
+        }
+
+        $bar->finish();
+        $this->newLine(2);
+
+        // ---------------------------------------------------------------------
+        // 4️⃣ Final summary
+        // ---------------------------------------------------------------------
+        $this->info("🏁 Polygon ticker overview ingestion batches dispatched.");
+        $this->line("   Tickers targeted : {$total}");
+        $this->line("   Tickers buffered : {$dispatched}");
+        $this->line("   Bus batches sent : " . ($dispatchIndex - 1));
+        $this->newLine();
+
+        $logger->info('🏁 Polygon ticker overviews ingestion batches dispatched', [
+            'total_tickers'      => $total,
+            'dispatched_tickers' => $dispatched,
+            'bus_batches'        => $dispatchIndex - 1,
+            'batch_size'         => $batchSize,
+            'tickers_per_job'    => $tickersPerJob,
+            'sleep'              => $sleep,
+        ]);
+
+        return Command::SUCCESS;
+    }
+
+    /**
+     * Dispatch a buffer of tickers as a Bus batch, splitting into jobs of size $tickersPerJob.
+     *
+     * @param  array<int, array{id:int,ticker:string}>  $buffer
+     * @param  int                                      $tickersPerJob
+     * @param  int                                      $dispatchIndex
+     * @param  \Illuminate\Support\Facades\Log          $logger
+     * @return void
+     */
+    protected function dispatchBufferAsBusBatch(
+        array $buffer,
+        int $tickersPerJob,
+        int $dispatchIndex,
+        $logger
+    ): void {
+
+        $jobs = [];
+        $chunks = array_chunk($buffer, $tickersPerJob);
+
+        foreach ($chunks as $chunkIndex => $chunk) {
+
+            // FIX: extract only ticker strings
+            $tickersOnly = [];
+            foreach ($chunk as $row) {
+                if (isset($row['ticker'])) {
+                    $tickersOnly[] = $row['ticker'];
+                }
+            }
+
+            if (empty($tickersOnly)) {
+                $logger->warning('⚠️ Skipping empty ticker chunk', [
+                    'dispatch_index' => $dispatchIndex,
+                    'chunk_index'    => $chunkIndex,
+                ]);
+                continue;
+            }
+
+            $jobs[] = new IngestTickerOverviewJob($tickersOnly);
         }
 
         if (empty($jobs)) {
-            $this->warn("No jobs to dispatch (no tickers in queue).");
-            Log::channel('ingest')->warning("No ticker overview ingestion jobs created.");
-            return Command::SUCCESS;
+            return;
         }
 
-        // ---------------------------------------------------------------------
-        // STEP 4: Dispatch the batch to Laravel's queue system
-        // ---------------------------------------------------------------------
-        $this->info("Dispatching " . count($jobs) . " overview ingestion jobs...");
-        Log::channel('ingest')->info("Dispatching Polygon overview ingestion batch", [
-            'total_jobs' => count($jobs),
-        ]);
+        try {
+            $batch = Bus::batch($jobs)
+                ->name("PolygonTickerOverviewsIngest (Dispatch #{$dispatchIndex})")
+                ->onConnection('database')
+                ->onQueue('default')
+                ->dispatch();
 
-        $batch = Bus::batch($jobs)
-            ->name('PolygonTickerOverviews')
-            ->then(function (Batch $batch) {
-                // Triggered when *all* jobs succeed.
-                Log::channel('ingest')->info("✅ Polygon overview ingestion batch completed successfully", [
-                    'batch_id'   => $batch->id,
-                    'total_jobs' => $batch->totalJobs,
-                ]);
-            })
-            ->catch(function (Batch $batch, Throwable $e) {
-                // Triggered when *any* job in the batch fails.
-                Log::channel('ingest')->error("❌ Polygon overview ingestion batch failed", [
-                    'batch_id' => $batch->id,
-                    'error'    => $e->getMessage(),
-                    'trace'    => $e->getTraceAsString(),
-                ]);
-            })
-            ->finally(function (Batch $batch) {
-                // Always triggered at the end (success or failure).
-                Log::channel('ingest')->info("🏁 Polygon overview ingestion batch finished", [
-                    'batch_id'       => $batch->id,
-                    'finished_jobs'  => $batch->processedJobs(),
-                    'failed_jobs'    => $batch->failedJobs,
-                    'pending_jobs'   => $batch->pendingJobs,
-                ]);
-            })
-            ->dispatch();
-
-        // ---------------------------------------------------------------------
-        // STEP 5: Report batch dispatch success to console and logs
-        // ---------------------------------------------------------------------
-        $this->info("✅ Dispatched Polygon.io overview ingestion batch!");
-        $this->line("   Batch ID: {$batch->id}");
-        $this->line("   Total Jobs: {$batch->totalJobs}");
-
-        Log::channel('ingest')->info("Polygon overview ingestion batch dispatched successfully", [
-            'batch_id'   => $batch->id,
-            'total_jobs' => $batch->totalJobs,
-        ]);
-
-        // Optional rate-limiting delay between batch dispatches (to prevent overload)
-        if ($sleep > 0) {
-            Log::channel('ingest')->debug("Sleeping between batch dispatches", [
-                'seconds' => $sleep,
+            $logger->info('✅ Dispatched Polygon ticker-overviews Bus batch', [
+                'dispatch_index' => $dispatchIndex,
+                'batch_id'       => $batch->id ?? null,
+                'job_count'      => count($jobs),
+                'tickers_count'  => count($buffer),
             ]);
-            sleep($sleep);
+
+            $this->info("✅ Dispatched Bus batch #{$dispatchIndex} — "
+                . count($jobs) . " job(s), "
+                . count($buffer) . " ticker(s)");
+
+        } catch (Throwable $e) {
+
+            $logger->error('❌ Failed to dispatch Polygon ticker-overviews Bus batch', [
+                'dispatch_index' => $dispatchIndex,
+                'error'          => $e->getMessage(),
+                'trace'          => substr($e->getTraceAsString(), 0, 400),
+            ]);
+
+            $this->error("❌ Failed to dispatch Bus batch #{$dispatchIndex}: {$e->getMessage()}");
         }
-
-        // ---------------------------------------------------------------------
-        // STEP 6: Wrap-up summary
-        // ---------------------------------------------------------------------
-        $this->newLine();
-        $this->info("Polygon.io ticker overview ingestion pipeline initialized successfully.");
-        $this->comment("Monitor progress via 'php artisan queue:monitor' or check logs under storage/logs/ingest.log");
-
-        return Command::SUCCESS;
     }
 }app/Console/Commands/TickersIntegrityScanCommand.php
 
@@ -2376,64 +3511,176 @@ use App\Jobs\IngestTickerNewsJob;
 use App\Services\BatchMonitorService;
 use Throwable;
 
+/**
+ * ============================================================================
+ *  polygon:ticker-news:ingest
+ *  (v2.0 — Batched, Monitored, Incremental-Aware News Ingestion)
+ * ============================================================================
+ *
+ *  Queue Polygon/Massive.io news ingestion jobs for:
+ *    • A single ticker (via argument) → one job
+ *    • The active ticker universe     → many jobs, chunked into Bus::batch-es
+ *
+ *  The per-ticker incremental behavior (“fetch only newer articles”) lives in:
+ *      • IngestTickerNewsJob
+ *      • PolygonTickerNewsService
+ *
+ *  THIS COMMAND decides:
+ *      • which tickers get jobs
+ *      • how many recent articles to request (--limit)
+ *      • batching strategy (--batch, --sleep)
+ *      • queue + BatchMonitor + logging
+ *
+ * ============================================================================
+ */
 class PolygonTickerNewsIngest extends Command
 {
-    protected $signature = 'polygon:ticker-news:ingest 
-                            {ticker? : Optional specific ticker symbol} 
-                            {--limit=50 : Max news items per ticker} 
-                            {--batch=200 : Number of tickers per batch}
-                            {--sleep=5 : Seconds to pause between batch dispatches}';
+    /**
+     * Artisan signature.
+     */
+    protected $signature = 'polygon:ticker-news:ingest
+                            {ticker? : Optional specific, case-sensitive ticker symbol}
+                            {--limit=200 : Approximate max news items per ticker this run}
+                            {--batch=400 : Number of tickers per Bus::batch dispatch}
+                            {--sleep=2 : Seconds to pause between batch dispatches}';
 
-    protected $description = 'Queue and batch ingest of latest news items for one or all tickers from Polygon.io';
+    /**
+     * Description.
+     */
+    protected $description = 'Queue and batch ingest of latest / incremental news items for one or all tickers from Polygon/Massive.io';
 
-    public function handle(): int
+    /**
+     * 🔒 Ensure limit is always a safe, serializable scalar.
+     */
+    protected function sanitizeLimit($limit): int
     {
-        $ticker = $this->argument('ticker');
-        $limit = (int) $this->option('limit');
-        $batchSize = (int) $this->option('batch');
-        $sleep = (int) $this->option('sleep');
-
-        if ($ticker) {
-            return $this->handleSingleTicker($ticker, $limit);
-        }
-
-        return $this->handleBatchIngestion($limit, $batchSize, $sleep);
+        return is_numeric($limit) ? (int)$limit : 200;
     }
 
-    protected function handleSingleTicker(string $ticker, int $limit): int
+    /**
+     * Entry point.
+     */
+    public function handle(): int
     {
-        $this->info("📰 Queuing news ingestion for {$ticker}...");
-        $tickerModel = Ticker::where('ticker', $ticker)->first();
+        $tickerArg = $this->argument('ticker');
+        $ticker    = $tickerArg !== null ? trim($tickerArg) : null;
 
-        if (! $tickerModel) {
-            $this->error("Ticker {$ticker} not found.");
+        // Ensure limit is always scalar
+        $limit     = $this->sanitizeLimit($this->option('limit'));
+        $batchSize = (int)$this->option('batch');
+        $sleep     = (int)$this->option('sleep');
+
+        if ($batchSize <= 0) $batchSize = 400;
+        if ($sleep < 0) $sleep = 0;
+
+        $logger = Log::channel('ingest');
+
+        $logger->info('📰 polygon:ticker-news:ingest starting', [
+            'ticker'     => $ticker ?? 'ALL_ACTIVE',
+            'limit'      => $limit,
+            'batch_size' => $batchSize,
+            'sleep'      => $sleep,
+        ]);
+
+        if (!empty($ticker)) {
+            return $this->handleSingleTicker($ticker, $limit, $logger);
+        }
+
+        return $this->handleBatchIngestion($limit, $batchSize, $sleep, $logger);
+    }
+
+    /**
+     * Handle single-ticker mode (no Bus::batch needed).
+     */
+    protected function handleSingleTicker(string $ticker, int $limit, $logger): int
+    {
+        $symbol = trim($ticker);
+
+        $this->info("📰 Queuing news ingestion for [{$symbol}]...");
+        $logger->info('📰 Queuing news ingestion for single ticker', [
+            'ticker' => $symbol,
+            'limit'  => $limit,
+        ]);
+
+        $tickerModel = Ticker::where('ticker', $symbol)->first();
+
+        if (!$tickerModel) {
+            $this->error("❌ Ticker {$symbol} not found.");
+            $logger->warning('⚠️ Ticker not found for news ingest', ['ticker' => $symbol]);
             return self::FAILURE;
         }
 
-        IngestTickerNewsJob::dispatch($tickerModel->id, $limit)->onQueue('default');
-        $this->info("✅ Dispatched news job for {$ticker}");
-        return self::SUCCESS;
+        try {
+            IngestTickerNewsJob::dispatch($tickerModel->id, $limit)
+                ->onConnection('database')
+                ->onQueue('default');
+
+            $this->info("✅ Dispatched news job for {$symbol}");
+            $logger->info('✅ Dispatched news job for single ticker', [
+                'ticker_id' => $tickerModel->id,
+                'ticker'    => $symbol,
+                'limit'     => $limit,
+            ]);
+
+            return self::SUCCESS;
+
+        } catch (Throwable $e) {
+            $this->error("❌ Failed to dispatch news job for {$symbol}: {$e->getMessage()}");
+
+            $logger->error('❌ Exception while dispatching single-ticker news job', [
+                'ticker' => $symbol,
+                'limit'  => $limit,
+                'error'  => $e->getMessage(),
+            ]);
+
+            return self::FAILURE;
+        }
     }
 
-    protected function handleBatchIngestion(int $limit, int $batchSize, int $sleep): int
+    /**
+     * Handle full-universe ingestion.
+     */
+    protected function handleBatchIngestion(int $limit, int $batchSize, int $sleep, $logger): int
     {
-        $tickers = Ticker::select('id', 'ticker')->where('active', true)->orderBy('id')->cursor();
+        $this->info("🔎 Selecting active tickers for news ingestion...");
 
-        if ($tickers->count() === 0) {
-            $this->warn('No active tickers found.');
+        $baseQuery = Ticker::query()
+            ->select('id', 'ticker')
+            ->where('active', true)
+            ->orderBy('id');
+
+        // IMPORTANT: cursor() does not support ->count()
+        $totalTickers = (clone $baseQuery)->count();
+
+        if ($totalTickers === 0) {
+            $this->warn('⚠️ No active tickers found. Nothing to ingest.');
+            $logger->warning('⚠️ No active tickers found for news ingestion');
             return self::SUCCESS;
         }
 
         $this->info("🧱 Dispatching ticker news ingestion batches (batch size: {$batchSize})...");
-        $logger = Log::channel('ingest');
+        $this->line("   Total active tickers : {$totalTickers}");
+        $this->line("   Limit per ticker     : {$limit}");
+        $this->newLine();
 
-        $chunk = [];
-        $batchNumber = 0;
-        $total = 0;
+        $logger->info('🧱 Dispatching ticker news ingestion batches', [
+            'total_tickers' => $totalTickers,
+            'batch_size'    => $batchSize,
+            'limit'         => $limit,
+            'sleep'         => $sleep,
+        ]);
 
-        foreach ($tickers as $t) {
-            $chunk[] = new IngestTickerNewsJob($t->id, $limit);
-            $total++;
+        // Top-level batch monitor for UX
+        BatchMonitorService::createBatch('PolygonTickerNews', $totalTickers);
+
+        $chunk         = [];
+        $batchNumber   = 0;
+        $queuedTickers = 0;
+
+        foreach ($baseQuery->cursor() as $ticker) {
+            // Only scalars passed into jobs → serialization-safe
+            $chunk[] = new IngestTickerNewsJob((int)$ticker->id, (int)$limit);
+            $queuedTickers++;
 
             if (count($chunk) >= $batchSize) {
                 $batchNumber++;
@@ -2442,34 +3689,326 @@ class PolygonTickerNewsIngest extends Command
             }
         }
 
-        if (! empty($chunk)) {
+        // Flush remaining jobs (last partial batch)
+        if (!empty($chunk)) {
             $batchNumber++;
             $this->dispatchChunk($chunk, $batchNumber, $sleep, $logger);
         }
 
-        $this->info("✅ Queued {$total} tickers across {$batchNumber} batches.");
+        $this->info("✅ Queued {$queuedTickers} tickers across {$batchNumber} batches.");
+        $logger->info('🏁 polygon:ticker-news:ingest batch enqueue complete', [
+            'queued_tickers' => $queuedTickers,
+            'batches'        => $batchNumber,
+            'limit'          => $limit,
+        ]);
+
         return self::SUCCESS;
     }
 
+    /**
+     * Dispatch one Bus::batch of jobs.
+     *
+     * @param array<IngestTickerNewsJob> $jobs
+     */
     protected function dispatchChunk(array $jobs, int $batchNumber, int $sleep, $logger): void
     {
+        if (empty($jobs)) return;
+
+        $jobCount = count($jobs);
+
         try {
+            $logger->info('📦 Dispatching PolygonNews batch', [
+                'batch_number' => $batchNumber,
+                'jobs'         => $jobCount,
+            ]);
+
             $batch = Bus::batch($jobs)
                 ->name("PolygonNews Batch #{$batchNumber}")
                 ->onConnection('database')
                 ->onQueue('default')
-                ->then(fn() => Log::info("✅ PolygonNews Batch #{$batchNumber} complete"))
-                ->catch(fn(Throwable $e) => Log::error("❌ PolygonNews Batch #{$batchNumber} failed: {$e->getMessage()}"))
                 ->dispatch();
 
-            BatchMonitorService::createBatch("PolygonNews Batch #{$batchNumber}", count($jobs));
+            $this->info("✅ Dispatched news batch #{$batchNumber} ({$batch->totalJobs} jobs)");
 
-            $this->info("✅ Dispatched batch #{$batchNumber} ({$batch->totalJobs} jobs)");
-            sleep($sleep);
+            if ($sleep > 0) {
+                $this->info("⏳ Sleeping {$sleep}s before next news batch...");
+                sleep($sleep);
+            }
+
         } catch (Throwable $e) {
-            $logger->error("Error dispatching batch #{$batchNumber}: {$e->getMessage()}");
-            $this->error("❌ Failed to dispatch batch #{$batchNumber}: {$e->getMessage()}");
+            $this->error("❌ Failed to dispatch news batch #{$batchNumber}: {$e->getMessage()}");
+
+            $logger->error('❌ Exception while dispatching PolygonNews batch', [
+                'batch_number' => $batchNumber,
+                'jobs'         => $jobCount,
+                'error'        => $e->getMessage(),
+            ]);
         }
+    }
+}app/Console/Commands/OptimizeEnvironment.php
+
+
+===== FILE: app/Console/Commands/OptimizeEnvironment.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Facades\Log;
+
+/**
+ * ============================================================================
+ *  system:optimize-environment  (v1.0.0 — Safe Environment Reset Helper)
+ * ============================================================================
+ *
+ * 🔧 Purpose
+ * ----------------------------------------------------------------------------
+ * Provide a single, well-documented command that safely:
+ *
+ *   • Clears Laravel caches (config/route/view/application).
+ *   • Flushes and prunes queues (jobs + batches) in a controlled way.
+ *   • Restarts queue workers so they pick up fresh code/config.
+ *
+ * This replaces manually running:
+ *
+ *   php artisan optimize:clear
+ *   php artisan cache:clear
+ *   php artisan config:clear
+ *   php artisan route:clear
+ *   php artisan view:clear
+ *   php artisan queue:flush
+ *   php artisan queue:prune-batches --hours=0
+ *   php artisan queue:prune-failed --hours=0
+ *   php artisan queue:restart
+ *
+ * 🧠 Behavior
+ * ----------------------------------------------------------------------------
+ *  • By default, runs BOTH cache cleanup and queue cleanup.
+ *  • You can scope behavior with:
+ *
+ *      --queues-only   Run ONLY queue-related maintenance.
+ *      --no-queues     Run ONLY cache-related maintenance (skip queues).
+ *      --force         Skip confirmation prompts (useful for CI / cron).
+ *
+ *  • Each sub-step is wrapped in a tiny helper that:
+ *      - Logs to storage/logs/ingest.log (same as ingestion commands).
+ *      - Prints nice console output (✅ / ⚠️ / ❌).
+ *      - Catches and logs exceptions without aborting the whole command.
+ *
+ * 🧪 Example usage
+ * ----------------------------------------------------------------------------
+ *   # Full environment reset (caches + queues) with confirmation
+ *   php artisan system:optimize-environment
+ *
+ *   # Full reset, no prompts (for scripts / CI)
+ *   php artisan system:optimize-environment --force
+ *
+ *   # Only cache-related resets (no queue flushing)
+ *   php artisan system:optimize-environment --no-queues
+ *
+ *   # Only queue maintenance (leave caches intact)
+ *   php artisan system:optimize-environment --queues-only
+ *
+ * ============================================================================
+ */
+class OptimizeEnvironment extends Command
+{
+    /**
+     * The name and signature of the console command.
+     */
+    protected $signature = 'system:optimize-environment
+                            {--queues-only : Run only queue maintenance (skip cache clears)}
+                            {--no-queues : Run only cache clears (skip queue maintenance)}
+                            {--force : Skip interactive confirmation prompts}';
+
+    /**
+     * The console command description.
+     */
+    protected $description = 'Safely clear caches + queues and restart workers for a clean TickerWolf environment.';
+
+    /**
+     * Execute the console command.
+     */
+    public function handle(): int
+    {
+        $logger = Log::channel('ingest');
+
+        $queuesOnly = (bool) $this->option('queues-only');
+        $noQueues   = (bool) $this->option('no-queues');
+        $force      = (bool) $this->option('force');
+
+        // Sanity: prevent conflicting flags.
+        if ($queuesOnly && $noQueues) {
+            $this->error('❌ You cannot use --queues-only and --no-queues together.');
+            return Command::INVALID;
+        }
+
+        $this->newLine();
+        $this->info('🚿  TickerWolf environment optimization starting...');
+        $this->line('   Mode: ' . ($queuesOnly ? 'QUEUES ONLY' : ($noQueues ? 'CACHE ONLY' : 'CACHE + QUEUES')));
+        $this->line('   Force: ' . ($force ? 'YES' : 'NO'));
+        $this->newLine();
+
+        if (! $force) {
+            $confirmed = $this->confirm(
+                'This may clear caches and/or flush queues. Do you want to continue?',
+                true
+            );
+
+            if (! $confirmed) {
+                $this->warn('⚠️ Aborted by user. No changes made.');
+                return Command::SUCCESS;
+            }
+        }
+
+        $startedAt = microtime(true);
+
+        /**
+         * Small helper to run a sub-command with pretty logging.
+         *
+         * @param  string       $label   Human-readable description.
+         * @param  string       $command The artisan command (e.g. "cache:clear").
+         * @param  array<string,mixed> $params Assoc array of params/options.
+         */
+        $run = function (string $label, string $command, array $params = []) use ($logger) {
+            $this->info("▶ {$label}");
+            $this->line("   $ php artisan {$command}" . $this->formatParamsInline($params));
+
+            try {
+                $exitCode = $this->call($command, $params);
+
+                if ($exitCode === 0) {
+                    $this->info("✅ {$label} completed.");
+                    $logger->info("✅ {$label}", [
+                        'command' => $command,
+                        'params'  => $params,
+                    ]);
+                } else {
+                    $this->warn("⚠️ {$label} exited with code {$exitCode}.");
+                    $logger->warning("⚠️ {$label} non-zero exit code", [
+                        'command'   => $command,
+                        'params'    => $params,
+                        'exit_code' => $exitCode,
+                    ]);
+                }
+            } catch (\Throwable $e) {
+                $this->error("❌ {$label} failed: {$e->getMessage()}");
+
+                $logger->error("❌ {$label} threw an exception", [
+                    'command' => $command,
+                    'params'  => $params,
+                    'error'   => $e->getMessage(),
+                    'trace'   => substr($e->getTraceAsString(), 0, 400),
+                ]);
+            }
+
+            $this->newLine();
+        };
+
+        /*
+        |--------------------------------------------------------------------------
+        | 1️⃣ Cache / Config / Route / View Clears
+        |--------------------------------------------------------------------------
+        |
+        | These are safe to run at any time; they simply clear in-memory and
+        | on-disk caches so Laravel can regenerate them from your source code.
+        |
+        | Skipped when --queues-only is used.
+        */
+        if (! $queuesOnly) {
+            $this->sectionHeader('Cache / Config Resets');
+
+            $run('Clear compiled caches', 'optimize:clear');
+            $run('Clear application cache', 'cache:clear');
+            $run('Clear config cache', 'config:clear');
+            $run('Clear route cache', 'route:clear');
+            $run('Clear compiled views', 'view:clear');
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 2️⃣ Queue Maintenance
+        |--------------------------------------------------------------------------
+        |
+        | Flush, prune batches + failed jobs, then restart workers so they
+        | pull fresh code and configuration.
+        |
+        | Skipped when --no-queues is used.
+        */
+        if (! $noQueues) {
+            $this->sectionHeader('Queue Maintenance');
+
+            // Flush the jobs table (only if you are comfortable dropping ALL pending jobs).
+            $run('Flush all pending queue jobs', 'queue:flush');
+
+            // Prune batch metadata immediately (hours=0 means "everything older than now").
+            $run('Prune old job batches', 'queue:prune-batches', [
+                '--hours' => 0,
+            ]);
+
+            // Prune failed jobs (again, hours=0 = everything).
+            $run('Prune failed jobs', 'queue:prune-failed', [
+                '--hours' => 0,
+            ]);
+
+            // Restart any running workers so they reload code/config.
+            $run('Restart queue workers', 'queue:restart');
+        }
+
+        $elapsed = round(microtime(true) - $startedAt, 2);
+
+        $this->info("🏁 Environment optimization complete in {$elapsed}s.");
+        $this->newLine();
+
+        $logger->info('🏁 Environment optimization complete', [
+            'mode'    => $queuesOnly ? 'queues-only' : ($noQueues ? 'cache-only' : 'all'),
+            'force'   => $force,
+            'elapsed' => $elapsed,
+        ]);
+
+        return Command::SUCCESS;
+    }
+
+    /**
+     * Render a small section header for readability.
+     */
+    protected function sectionHeader(string $title): void
+    {
+        $this->newLine();
+        $this->line(str_repeat('-', 72));
+        $this->info(' ' . $title);
+        $this->line(str_repeat('-', 72));
+        $this->newLine();
+    }
+
+    /**
+     * Format params for inline echo in "php artisan ..." examples.
+     *
+     * This is just for pretty console output; it does NOT affect behavior.
+     *
+     * @param  array<string,mixed>  $params
+     * @return string
+     */
+    protected function formatParamsInline(array $params): string
+    {
+        if (empty($params)) {
+            return '';
+        }
+
+        $parts = [];
+
+        foreach ($params as $key => $value) {
+            // Options without values (boolean flags)
+            if ($value === null || $value === true) {
+                $parts[] = "--{$key}";
+                continue;
+            }
+
+            $parts[] = "--{$key}={$value}";
+        }
+
+        return ' ' . implode(' ', $parts);
     }
 }app/Console/Commands/PolygonTickerPriceHistoryIngest.php
 
@@ -2480,285 +4019,353 @@ class PolygonTickerNewsIngest extends Command
 
 namespace App\Console\Commands;
 
+use App\Jobs\IngestTickerPriceHistoryJob;
+use App\Models\Ticker;
 use Illuminate\Console\Command;
+use Illuminate\Support\Carbon;
 use Illuminate\Support\Facades\Bus;
 use Illuminate\Support\Facades\Log;
-use App\Models\Ticker;
-use App\Jobs\IngestTickerPriceHistoryJob;
-use App\Services\BatchMonitorService;
-use Illuminate\Support\Facades\Schema;
-use Illuminate\Support\Carbon;
 use Throwable;
 
 /**
  * ============================================================================
- *  polygon:ticker-price-histories:ingest  
- *  (v3.0 — Smart Missing-Date Queue Ingest + Symbol-Aware Case Handling)
+ *  polygon:ticker-price-histories:ingest
+ *  v3.0.0 — Multi-Ticker, Multi-Resolution (1d + 1h) Aggressive Batching
  * ============================================================================
  *
- * 🔧 Purpose:
- *   Dispatch asynchronous (queued) Polygon.io price-history ingestion jobs
- *   for all tickers or a specific ticker via --symbol.  
- *   NOW includes automatic “only ingest missing dates per ticker”.
- *
- * 🧠 Behavior:
+ * 🔧 Purpose
  * ----------------------------------------------------------------------------
- *   • Fetches all tickers (or one via --symbol).
- *   • Determines per-ticker start date automatically IF --from is omitted:
- *         → latest stored 't' for given resolution + 1 day
- *   • Falls back to polygon.price_history_min_date if no historical price exists.
- *   • If user passes --from manually, uses that globally exactly as before.
- *   • Skips tickers whose latest stored date already extends past --to.
- *   • Dispatches queue jobs in batches with optional throttling.
- *   • Integrates with BatchMonitorService for tracking.
+ * Dispatches queue jobs to ingest Polygon.io price history for the current
+ * ticker universe. This version is optimized for SPEED and LOW JOB COUNT:
  *
- * ⚙️ Config Integration (config/polygon.php):
+ *   • Each queue job processes MANY tickers (default: 100 per job, but we
+ *     actually inherit your old --batch value, e.g. 500, for max throughput).
+ *   • Each job fetches BOTH 1d and 1h bars for its ticker group in a single
+ *     execution (the job-level logic lives in IngestTickerPriceHistoryJob).
+ *   • Per-ticker auto-from logic is handled inside the job, using the DB to
+ *     find the latest existing bar and backfilling with a small redundancy.
+ *
+ * 🧠 High-Level Behavior
  * ----------------------------------------------------------------------------
- *     price_history_min_date
- *     default_timespan
- *     default_multiplier
+ *  1. Select active Polygon tickers (or a single symbol).
+ *  2. Stream them via cursor() so we never load all into memory at once.
+ *  3. Group tickers into multi-ticker jobs (size = --batch).
+ *  4. Each job:
+ *      • Fetches 1d and 1h bars (auto-from aware).
+ *      • Upserts bars into ticker_price_histories in bulk.
+ *  5. All jobs are dispatched as a single Bus batch on the "database" queue.
  *
- * 📦 Command Signature:
+ * ⚡ Aggressive Defaults (Preset A)
  * ----------------------------------------------------------------------------
- *   php artisan polygon:ticker-price-histories:ingest
- *       --symbol=AAPL
- *       --resolution=1d
- *       --from=2020-01-01
- *       --to=2025-10-31
- *       --limit=1000
- *       --batch=500
- *       --sleep=5
+ *  • Jobs are multi-ticker (100+ tickers per job is normal).
+ *  • 1d auto-from lookback: ~45 days (handled in the job).
+ *  • 1h auto-from lookback: ~7 days (handled in the job).
+ *  • 1h retention purge: 168 hours (handled in the job).
  *
- * 🚀 New in v3.0:
+ * These are aggressively tuned for your Docker setup, but everything is still
+ * overrideable via flags if needed.
+ *
+ * 📦 Typical Usage
  * ----------------------------------------------------------------------------
- *   • Automatic per-ticker missing-date detection (HUGE performance savings)
- *   • Case-sensitive symbol handling retained
- *   • Massive reduction of unnecessary Polygon API calls
+ *  # Nightly full-universe ingest (1d + 1h)
+ *  php artisan polygon:ticker-price-histories:ingest
  *
+ *  # Limit to first 500 tickers
+ *  php artisan polygon:ticker-price-histories:ingest --limit=500
+ *
+ *  # Single symbol ad-hoc ingest
+ *  php artisan polygon:ticker-price-histories:ingest AAPL
+ *
+ *  # tickers:refresh-all will continue to call this, passing --batch=500, etc.
+ *
+ * 🧩 Related
+ * ----------------------------------------------------------------------------
+ *  • App\Jobs\IngestTickerPriceHistoryJob         (multi-ticker, 1d + 1h)
+ *  • App\Services\PolygonTickerPriceHistoryService (low-level API + upserts)
+ *  • tickers:refresh-all umbrella command
+ *  • docker "tickerwolf-queue" worker
  * ============================================================================
  */
 class PolygonTickerPriceHistoryIngest extends Command
 {
+    /**
+     * The name and signature of the console command.
+     *
+     * NOTE:
+     *  - We keep the old options (symbol, resolution, limit, batch, sleep, etc.)
+     *    for backwards compatibility with tickers:refresh-all.
+     *  - Internally we now ALWAYS treat this as a multi-resolution ingest:
+     *    IngestTickerPriceHistoryJob will handle both 1d and 1h.
+     */
     protected $signature = 'polygon:ticker-price-histories:ingest
-                            {--symbol= : Optional single ticker symbol to ingest (case-sensitive)}
-                            {--resolution=1d : Resolution (1d, 1m, 5m, etc.)}
-                            {--from= : Global start date. If omitted, missing-date logic applies.}
-                            {--to= : End date (YYYY-MM-DD), defaults to today}
+                            {symbol=ALL : Ticker symbol (e.g. AAPL) or ALL for full universe}
+                            {--resolution=both : 1d, 1h, or both (jobs treat "both" as default)}
                             {--limit=0 : Limit total tickers processed (0 = all)}
-                            {--batch=500 : Number of tickers per job batch}
-                            {--sleep=5 : Seconds to sleep between batches}';
+                            {--batch=100 : Tickers per queue job (multi-ticker job size)}
+                            {--from=2020-01-01 : Global baseline from-date (auto-from aware)}
+                            {--to= : Global to-date (default: today)}
+                            {--window-days=45 : Daily auto-from lookback window (days)}
+                            {--redundancy-days=2 : Redundant daily overlap (days)}
+                            {--redundancy-hours=3 : Redundant intraday overlap (hours)}
+                            {--retention-hours=168 : Hourly retention window for purge}
+                            {--sleep=0 : Seconds to sleep between Bus batch dispatch}
+                            {--fast : Apply aggressive preset A overrides}
+                            {--dev : Dev mode (auto-limit universe for testing)}';
 
-    protected $description = 'Queue Polygon.io price-history ingestion jobs for all or specific tickers with smart missing-date detection.';
+    /**
+     * The console command description.
+     */
+    protected $description = 'Ingest Polygon.io ticker price histories (1d + 1h) in aggressive multi-ticker batches.';
 
+    /**
+     * Execute the console command.
+     *
+     * @return int
+     */
     public function handle(): int
     {
-        /*
-        |--------------------------------------------------------------------------
-        | 1️⃣ Load Options & Config Defaults
-        |--------------------------------------------------------------------------
-        */
-        $symbol = trim($this->option('symbol') ?? '');     // Case-sensitive — DO NOT uppercase.
-        $resolution = $this->option('resolution') ?? config('polygon.default_timespan', '1d');
+        // ---------------------------------------------------------------------
+        // 1️⃣ Resolve options & presets
+        // ---------------------------------------------------------------------
+        $symbol         = strtoupper($this->argument('symbol') ?? 'ALL');
+        $resolutionMode = strtolower($this->option('resolution') ?? 'both'); // "1d", "1h", or "both"
+        $limit          = (int) $this->option('limit');
+        $tickersPerJob  = max(1, (int) $this->option('batch'));
+        $sleep          = max(0, (int) $this->option('sleep'));
 
-        $fromOption = $this->option('from');
-        $from       = $fromOption ?? config('polygon.price_history_min_date', '2020-01-01');
-        $fromWasExplicit = $fromOption !== null;
+        $globalFrom     = $this->option('from') ?: '2020-01-01';
+        $toDate         = $this->option('to') ?: Carbon::today()->toDateString();
 
-        $toOption = $this->option('to');
-        $to       = $toOption ?: now()->toDateString();
+        $windowDays     = max(1, (int) $this->option('window-days'));
+        $redundancyDays = max(0, (int) $this->option('redundancy-days'));
+        $redundancyHours = max(0, (int) $this->option('redundancy-hours'));
+        $retentionHours = max(0, (int) $this->option('retention-hours'));
 
-        $limit     = (int) $this->option('limit', 0);
-        $batchSize = (int) $this->option('batch', 500);
-        $sleep     = (int) $this->option('sleep', 5);
+        $fastMode       = (bool) $this->option('fast');
+        $devMode        = (bool) $this->option('dev');
+
+        // Apply aggressive preset A (can be tweaked here if needed)
+        if ($fastMode) {
+            // If someone passes --fast, we bump a few knobs even harder.
+            $tickersPerJob  = max($tickersPerJob, 150);  // at least 150 per job
+            $windowDays     = max($windowDays, 45);
+            $redundancyDays = max($redundancyDays, 2);
+            $redundancyHours = max($redundancyHours, 3);
+        }
+
+        // Dev mode: auto-limit universe if no explicit limit provided
+        if ($devMode && $limit === 0) {
+            $limit = 250;
+        }
 
         $logger = Log::channel('ingest');
 
         $logger->info('📥 Polygon price-history ingest started', [
-            'symbol'     => $symbol ?: 'ALL',
-            'resolution' => $resolution,
-            'from'       => $from,
-            'to'         => $to,
-            'limit'      => $limit,
-            'batchSize'  => $batchSize,
-            'sleep'      => $sleep,
-            'autoFrom'   => !$fromWasExplicit,
+            'symbol'          => $symbol,
+            'resolution'      => $resolutionMode,
+            'global_from'     => $globalFrom,
+            'to'              => $toDate,
+            'limit'           => $limit,
+            'tickersPerJob'   => $tickersPerJob,
+            'sleep'           => $sleep,
+            'window_days'     => $windowDays,
+            'redundancyDays'  => $redundancyDays,
+            'redundancyHours' => $redundancyHours,
+            'retentionHours'  => $retentionHours,
+            'autoFromMode'    => true,
+            'fastMode'        => $fastMode,
+            'devMode'         => $devMode,
         ]);
 
-        $this->info("📈 Preparing Polygon ticker price ingestion...");
-        $this->line("   Symbol     : " . ($symbol ?: 'ALL TICKERS'));
-        $this->line("   Resolution : {$resolution}");
-        $this->line("   Global From: {$from}" . ($fromWasExplicit ? " (explicit)" : " (auto-mode)"));
-        $this->line("   To         : {$to}");
-        $this->line("   Batch Size : {$batchSize}");
+        $this->info('📈 Preparing Polygon ticker price ingestion...');
+        $this->line('   Symbol         : ' . ($symbol === 'ALL' ? 'ALL TICKERS' : $symbol));
+        $this->line('   Resolution     : ' . $resolutionMode . ' (jobs will treat "both" as 1d + 1h)');
+        $this->line('   Global From    : ' . $globalFrom . ' (auto-from baseline)');
+        $this->line('   To             : ' . $toDate);
+        $this->line('   Tickers/Job    : ' . $tickersPerJob . ' (multi-ticker jobs)');
+        $this->line('   Window Size    : ' . $windowDays . ' day(s) (daily auto-from)');
+        $this->line('   Redundancy     : ' . $redundancyDays . ' day(s), ' . $redundancyHours . ' hour(s)');
+        $this->line('   1h Retention   : ' . $retentionHours . ' hour(s)');
+        $this->line('   Mode           : ' . ($fastMode ? 'FAST/Aggressive' : 'Normal') . ($devMode ? ' + DEV' : ''));
         $this->newLine();
 
-        /*
-        |--------------------------------------------------------------------------
-        | 2️⃣ Build Ticker Query (case-sensitive)
-        |--------------------------------------------------------------------------
-        */
-        $query = Ticker::orderBy('id')->select('id', 'ticker');
+        // ---------------------------------------------------------------------
+        // 2️⃣ Build ticker universe query
+        // ---------------------------------------------------------------------
+        $tickerQuery = Ticker::query()
+            ->where('is_active_polygon', true)
+            ->orderBy('id')
+            ->select(['id', 'ticker', 'type']);
 
-        if ($symbol) {
-            $query->where('ticker', $symbol);
+        if ($symbol !== 'ALL') {
+            $tickerQuery->whereRaw('UPPER(ticker) = ?', [$symbol]);
         }
 
         if ($limit > 0) {
-            $query->limit($limit);
+            $tickerQuery->limit($limit);
         }
 
-        $total = $query->count();
+        $total = (clone $tickerQuery)->count();
+
         if ($total === 0) {
-            $this->warn("⚠️ No tickers found for ingestion (symbol={$symbol}).");
+            $this->warn('⚠️ No tickers found for price history ingestion.');
+            $logger->warning('⚠️ No tickers found for price history ingestion.', [
+                'symbol' => $symbol,
+                'limit'  => $limit,
+            ]);
+
             return Command::SUCCESS;
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | 3️⃣ Initialize Batch Monitor + Progress Bar
-        |--------------------------------------------------------------------------
-        */
-        BatchMonitorService::createBatch('PolygonTickerPriceHistories', $total);
+        $this->info("🔢 Found {$total} ticker(s) to process.");
+        $this->newLine();
 
+        // ---------------------------------------------------------------------
+        // 3️⃣ Stream tickers & assemble multi-ticker jobs
+        // ---------------------------------------------------------------------
         $bar = $this->output->createProgressBar($total);
-        $bar->setFormat("   🟢 Progress: %current%/%max% [%bar%] %percent:3s%%");
+        $bar->setFormat('   🟢 Tickers: %current%/%max% [%bar%] %percent:3s%%');
         $bar->start();
 
-        $batchIndex = 1;
+        $jobs              = [];
+        $tickerBuffer      = [];
+        $dispatchedTickers = 0;
 
-        /*
-        |--------------------------------------------------------------------------
-        | 4️⃣ Chunk & Dispatch Jobs (per-ticker missing-date logic)
-        |--------------------------------------------------------------------------
-        */
-        $query->chunk($batchSize, function ($tickers) use (
-            $resolution, $from, $to, $sleep, $bar, $logger, $fromWasExplicit, &$batchIndex
-        ) {
-            $jobs = [];
+        foreach ($tickerQuery->cursor() as $ticker) {
+            $tickerBuffer[] = [
+                'id'     => $ticker->id,
+                'ticker' => $ticker->ticker,
+                'type'   => $ticker->type,
+            ];
 
-            foreach ($tickers as $ticker) {
-
-                /*
-                 * 🔎 Missing-Date Logic:
-                 * ----------------------
-                 * If user passed --from manually → use it globally.
-                 * Otherwise → auto-detect last stored date, then effectiveFrom = (lastDate + 1 day).
-                 */
-                if ($fromWasExplicit) {
-                    $effectiveFrom = $from;
-                } else {
-                    $latestT = $ticker->priceHistories()
-                        ->where('resolution', $resolution)
-                        ->max('t');
-
-                    if ($latestT) {
-                        $effectiveFrom = Carbon::parse($latestT)->addDay()->toDateString();
-                    } else {
-                        $effectiveFrom = $from; // fallback global min date
-                    }
-                }
-
-                // 🛑 Already fully up-to-date? Skip job dispatching.
-                if ($effectiveFrom > $to) {
-                    $logger->info('⏭ Skipping up-to-date ticker', [
-                        'ticker' => $ticker->ticker,
-                        'resolution' => $resolution,
-                        'nextFrom' => $effectiveFrom,
-                        'to' => $to,
-                    ]);
-                    $bar->advance();
-                    continue;
-                }
-
-                $logger->info('📡 Queueing price history ingest job', [
-                    'ticker' => $ticker->ticker,
-                    'resolution' => $resolution,
-                    'from' => $effectiveFrom,
-                    'to' => $to,
-                ]);
-
-                $jobs[] = new IngestTickerPriceHistoryJob(
-                    $ticker,
-                    $effectiveFrom,
-                    $to,
-                    $resolution
+            // When the buffer reaches the target size, turn it into one job.
+            if (count($tickerBuffer) >= $tickersPerJob) {
+                $jobs[] = $this->makeJobFromBuffer(
+                    $tickerBuffer,
+                    $resolutionMode,
+                    $globalFrom,
+                    $toDate,
+                    $windowDays,
+                    $redundancyDays,
+                    $redundancyHours,
+                    $retentionHours
                 );
 
-                $bar->advance();
+                $dispatchedTickers += count($tickerBuffer);
+                $bar->advance(count($tickerBuffer));
+
+                $tickerBuffer = [];
             }
+        }
 
-            if (empty($jobs)) {
-                return;
-            }
+        // Flush remaining tickers into a final job
+        if (!empty($tickerBuffer)) {
+            $jobs[] = $this->makeJobFromBuffer(
+                $tickerBuffer,
+                $resolutionMode,
+                $globalFrom,
+                $toDate,
+                $windowDays,
+                $redundancyDays,
+                $redundancyHours,
+                $retentionHours
+            );
 
-            /*
-            |--------------------------------------------------------------------------
-            | Dispatch this chunk as a batch
-            |--------------------------------------------------------------------------
-            */
-            try {
-                $batch = Bus::batch($jobs)
-                    ->name("PolygonTickerPriceHistoriesIngest (Batch #{$batchIndex})")
-                    ->onConnection('database')
-                    ->onQueue('default')
-                    ->dispatch();
+            $dispatchedTickers += count($tickerBuffer);
+            $bar->advance(count($tickerBuffer));
 
-                $logger->info('✅ Dispatched ingestion batch', [
-                    'batch_index' => $batchIndex,
-                    'batch_id'    => $batch->id ?? null,
-                    'job_count'   => count($jobs),
-                ]);
+            $tickerBuffer = [];
+        }
 
-                $this->newLine();
-                $this->info("✅ Dispatched batch #{$batchIndex} (" . count($jobs) . " jobs)");
-
-                $batchIndex++;
-
-                if ($sleep > 0) {
-                    $this->info("⏳ Sleeping {$sleep}s before next batch...");
-                    sleep($sleep);
-                }
-
-            } catch (Throwable $e) {
-                $logger->error('❌ Failed to dispatch ingestion batch', [
-                    'batch_index' => $batchIndex,
-                    'error'       => $e->getMessage(),
-                    'trace'       => substr($e->getTraceAsString(), 0, 400),
-                ]);
-
-                $this->error("❌ Batch #{$batchIndex} failed: {$e->getMessage()}");
-            }
-        });
-
-        /*
-        |--------------------------------------------------------------------------
-        | 5️⃣ Finalize & Report
-        |--------------------------------------------------------------------------
-        */
         $bar->finish();
         $this->newLine(2);
 
-        $this->info("🎯 All batches dispatched successfully.");
-        $logger->info('🏁 Polygon price-history ingestion complete', [
-            'symbol'    => $symbol ?: 'ALL',
-            'total'     => $total,
-            'batches'   => $batchIndex - 1,
-            'completed' => now()->toIso8601String(),
-        ]);
+        if (empty($jobs)) {
+            $this->warn('⚠️ No jobs were created (unexpected).');
+            $logger->warning('⚠️ No jobs created in PolygonTickerPriceHistoryIngest.', [
+                'total_tickers' => $total,
+            ]);
 
-        /*
-        |--------------------------------------------------------------------------
-        | ℹ️ Schema Advisory (job_batches)
-        |--------------------------------------------------------------------------
-        */
-        if (!Schema::hasColumn('job_batches', 'processed_jobs')) {
-            $this->warn("⚠️ 'job_batches' table appears outdated. Run:");
-            $this->line("   php artisan queue:batches-table && php artisan migrate");
-            $this->line("   This adds 'processed_jobs' for accurate queue metrics.");
-            $this->newLine();
+            return Command::SUCCESS;
         }
 
+        // ---------------------------------------------------------------------
+        // 4️⃣ Dispatch as a single Bus batch (for monitoring)
+        // ---------------------------------------------------------------------
+        try {
+            $batch = Bus::batch($jobs)
+                ->name('PolygonTickerPriceHistoryIngest (multi-ticker 1d+1h)')
+                ->onConnection('database')
+                ->onQueue('default')
+                ->dispatch();
+
+            $logger->info('✅ Dispatched Polygon price-history Bus batch', [
+                'batch_id'          => $batch->id ?? null,
+                'job_count'         => count($jobs),
+                'total_tickers'     => $total,
+                'dispatched_tickers'=> $dispatchedTickers,
+                'tickers_per_job'   => $tickersPerJob,
+                'resolution_mode'   => $resolutionMode,
+            ]);
+
+            $this->info('✅ Dispatched Polygon price-history Bus batch:');
+            $this->line('   Jobs dispatched : ' . count($jobs));
+            $this->line('   Tickers targeted : ' . $total);
+            $this->line('   Tickers buffered : ' . $dispatchedTickers);
+            $this->line('   Batch ID         : ' . ($batch->id ?? 'n/a'));
+            $this->newLine();
+        } catch (Throwable $e) {
+            $logger->error('❌ Failed to dispatch Polygon price-history Bus batch', [
+                'error' => $e->getMessage(),
+                'trace' => substr($e->getTraceAsString(), 0, 500),
+            ]);
+
+            $this->error('❌ Failed to dispatch Polygon price-history Bus batch: ' . $e->getMessage());
+            return Command::FAILURE;
+        }
+
+        $this->info('🎯 All multi-ticker price-history jobs dispatched (1d + 1h).');
         return Command::SUCCESS;
+    }
+
+    /**
+     * Build a single multi-ticker price-history job from a buffer of tickers.
+     *
+     * @param  array<int, array{id:int,ticker:string,type:?string}>  $buffer
+     * @param  string  $resolutionMode  "1d", "1h", or "both"
+     * @param  string  $globalFrom
+     * @param  string  $toDate
+     * @param  int     $windowDays
+     * @param  int     $redundancyDays
+     * @param  int     $redundancyHours
+     * @param  int     $retentionHours
+     * @return \App\Jobs\IngestTickerPriceHistoryJob
+     */
+    protected function makeJobFromBuffer(
+        array $buffer,
+        string $resolutionMode,
+        string $globalFrom,
+        string $toDate,
+        int $windowDays,
+        int $redundancyDays,
+        int $redundancyHours,
+        int $retentionHours
+    ): IngestTickerPriceHistoryJob {
+        // NOTE: The job will:
+        //  - Loop these tickers
+        //  - Compute per-ticker auto-from for 1d and 1h
+        //  - Fetch data via PolygonTickerPriceHistoryService
+        //  - Upsert into ticker_price_histories in bulk
+        return new IngestTickerPriceHistoryJob(
+            $buffer,
+            $resolutionMode,
+            $globalFrom,
+            $toDate,
+            $windowDays,
+            $redundancyDays,
+            $redundancyHours,
+            $retentionHours
+        );
     }
 }app/Console/Commands/TickersReviewMissingDataCommand.php
 
@@ -3456,6 +5063,248 @@ class MonitorBatches extends Command
         } else {
             echo "\033[2J\033[;H";
         }
+    }
+}app/Console/Commands/QueueSupervisor.php
+
+
+===== FILE: app/Console/Commands/QueueSupervisor.php =====
+
+<?php
+
+namespace App\Console\Commands;
+
+use Illuminate\Console\Command;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Cache;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Log;
+use Illuminate\Support\Facades\Queue;
+
+/**
+ * ============================================================================
+ *  queue:supervisor  (Hybrid Queue Health Monitor — Option C)
+ * ============================================================================
+ *
+ * 🔧 Purpose
+ * ----------------------------------------------------------------------------
+ *  Lightweight queue supervisor for TickerWolf. It does NOT replace Docker's
+ *  restart policy or `queue:work`, but acts as a hybrid "brain":
+ *
+ *   • Periodically inspects queue health:
+ *       - Queue backlog (default queue size)
+ *       - Running job batches
+ *       - Failed jobs
+ *       - Last `queue:restart` timestamp
+ *   • Logs metrics to a dedicated queue supervisor log.
+ *   • Automatically calls `queue:restart` when thresholds are exceeded:
+ *       - Backlog > QUEUE_BACKLOG_HARD
+ *       - OR backlog > QUEUE_BACKLOG_SOFT AND last restart is old
+ *
+ *  This plays nicely with a dedicated `tickerwolf-queue` Docker service that
+ *  runs:
+ *
+ *    php artisan queue:work \
+ *        --queue=default \
+ *        --sleep=3 \
+ *        --backoff=5 \
+ *        --max-jobs=25 \
+ *        --max-time=240 \
+ *        --tries=3 \
+ *        --timeout=120
+ *
+ *  The supervisor does NOT spawn workers itself; it just orchestrates restarts
+ *  and logs insight so you can tune your pipeline safely.
+ *
+ * 🧪 Example usage
+ * ----------------------------------------------------------------------------
+ *   # One-off health check
+ *   php artisan queue:supervisor
+ *
+ *   # Dry-run mode (show what would happen, but do nothing)
+ *   php artisan queue:supervisor --dry
+ *
+ *   # Force a restart regardless of thresholds
+ *   php artisan queue:supervisor --force-restart
+ *
+ *  Typically, this command will be scheduled to run every 5 minutes.
+ *
+ * ============================================================================
+ */
+class QueueSupervisor extends Command
+{
+    /**
+     * Artisan command signature.
+     */
+    protected $signature = 'queue:supervisor
+                            {--dry : Only log + display metrics, do not mutate anything}
+                            {--force-restart : Force queue:restart even if thresholds are not met}';
+
+    /**
+     * Human-readable description.
+     */
+    protected $description = 'Monitor queue health and orchestrate safe worker restarts for TickerWolf.';
+
+    /**
+     * Main handler.
+     */
+    public function handle(): int
+    {
+        $dryRun       = (bool) $this->option('dry');
+        $forceRestart = (bool) $this->option('force-restart');
+
+        $workerConfig = config('queue_workers.default', []);
+        $superConfig  = config('queue_workers.supervisor', []);
+
+        $logger = Log::channel('ingest'); // Reuse ingest channel for now; you can make a dedicated one later.
+
+        $connection   = $workerConfig['connection'] ?? config('queue.default');
+        $queueName    = $workerConfig['queue'] ?? 'default';
+
+        $backlogSoft  = (int) ($superConfig['backlog_soft'] ?? 1000);
+        $backlogHard  = (int) ($superConfig['backlog_hard'] ?? 5000);
+        $restartMins  = (int) ($superConfig['restart_minutes'] ?? 60);
+
+        $this->info('🧭 Queue Supervisor (Hybrid Option C)');
+        $this->line('   Mode   : ' . ($dryRun ? 'DRY-RUN' : ($forceRestart ? 'FORCE-RESTART' : 'NORMAL')));
+        $this->line('   Conn   : ' . $connection);
+        $this->line('   Queue  : ' . $queueName);
+        $this->line('   Soft   : ' . $backlogSoft . ' jobs');
+        $this->line('   Hard   : ' . $backlogHard . ' jobs');
+        $this->line('   Restart: ' . $restartMins . ' minutes');
+        $this->newLine();
+
+        /*
+        |--------------------------------------------------------------------------
+        | 1️⃣ Collect Metrics
+        |--------------------------------------------------------------------------
+        */
+
+        // Approximate backlog size for the target queue.
+        $backlog = Queue::connection($connection)->size($queueName);
+
+        // Running job batches (using Laravel's batch system, if used).
+        $runningBatches = DB::table('job_batches')
+            ->where('status', 'running')
+            ->count();
+
+        // Total failed jobs.
+        $failedJobs = DB::table('failed_jobs')->count();
+
+        // Last queue:restart time from cache (this is how Laravel implements it).
+        $restartKey   = 'illuminate:queue:restart';
+        $restartValue = Cache::get($restartKey);
+        $lastRestart  = $restartValue ? Carbon::createFromTimestamp($restartValue) : null;
+        $minutesSinceRestart = $lastRestart ? $lastRestart->diffInMinutes(now()) : null;
+
+        $this->line("📊 Backlog size     : {$backlog} job(s)");
+        $this->line("📊 Running batches  : {$runningBatches}");
+        $this->line("📊 Failed jobs      : {$failedJobs}");
+
+        if ($lastRestart) {
+            $this->line('📊 Last restart     : ' . $lastRestart->toDateTimeString() . " ({$minutesSinceRestart} min ago)");
+        } else {
+            $this->line('📊 Last restart     : (no restart marker found)');
+        }
+
+        $this->newLine();
+
+        $logger->info('QueueSupervisor metrics', [
+            'connection'   => $connection,
+            'queue'        => $queueName,
+            'backlog'      => $backlog,
+            'running'      => $runningBatches,
+            'failed'       => $failedJobs,
+            'last_restart' => $lastRestart?->toIso8601String(),
+            'minutes_since_restart' => $minutesSinceRestart,
+        ]);
+
+        /*
+        |--------------------------------------------------------------------------
+        | 2️⃣ Build "Recommended" queue:work command (for logs + docs)
+        |--------------------------------------------------------------------------
+        */
+
+        $sleep    = $workerConfig['sleep'] ?? 3;
+        $backoff  = $workerConfig['backoff'] ?? 5;
+        $maxJobs  = $workerConfig['max_jobs'] ?? 25;
+        $maxTime  = $workerConfig['max_time'] ?? 240;
+        $tries    = $workerConfig['tries'] ?? 3;
+        $timeout  = $workerConfig['timeout'] ?? 120;
+
+        $recommendedCommand = sprintf(
+            'php artisan queue:work --queue=%s --sleep=%d --backoff=%d --max-jobs=%d --max-time=%d --tries=%d --timeout=%d',
+            $queueName,
+            $sleep,
+            $backoff,
+            $maxJobs,
+            $maxTime,
+            $tries,
+            $timeout
+        );
+
+        $this->line('🧾 Recommended worker command:');
+        $this->line('   ' . $recommendedCommand);
+        $this->newLine();
+
+        /*
+        |--------------------------------------------------------------------------
+        | 3️⃣ Decide Whether to Restart
+        |--------------------------------------------------------------------------
+        */
+
+        $shouldRestart = false;
+        $reason        = null;
+
+        if ($forceRestart) {
+            $shouldRestart = true;
+            $reason        = 'force flag passed';
+        } else {
+            if ($backlog >= $backlogHard) {
+                $shouldRestart = true;
+                $reason        = "backlog {$backlog} >= hard threshold {$backlogHard}";
+            } elseif ($backlog >= $backlogSoft && $minutesSinceRestart !== null && $minutesSinceRestart >= $restartMins) {
+                $shouldRestart = true;
+                $reason        = "backlog {$backlog} >= soft threshold {$backlogSoft} AND last restart {$minutesSinceRestart} min ago >= {$restartMins} min";
+            }
+        }
+
+        if (! $shouldRestart) {
+            $this->info('✅ Queue health within thresholds — no restart needed.');
+            return Command::SUCCESS;
+        }
+
+        $this->warn("⚠️ Restart recommended: {$reason}");
+
+        if ($dryRun) {
+            $this->info('🧪 Dry-run enabled — NOT calling queue:restart.');
+            return Command::SUCCESS;
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | 4️⃣ Perform Restart via Laravel Mechanism
+        |--------------------------------------------------------------------------
+        |
+        | This sets the `illuminate:queue:restart` cache key, which signals all
+        | running workers (in any container) to gracefully exit after finishing
+        | their current job. Docker’s restart policy then brings the container
+        | back up automatically.
+        |
+        */
+
+        Artisan::call('queue:restart');
+
+        $this->info('🔁 queue:restart dispatched successfully.');
+        $logger->warning('QueueSupervisor triggered queue:restart', [
+            'reason'       => $reason,
+            'backlog'      => $backlog,
+            'running'      => $runningBatches,
+            'failed'       => $failedJobs,
+            'command'      => $recommendedCommand,
+        ]);
+
+        return Command::SUCCESS;
     }
 }app/Console/Commands/PolygonPrefetchIntradayPrices.php
 
