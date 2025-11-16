@@ -70,13 +70,18 @@ OR RUN MASTER 'DATA REFRESH' COMMAND:
 
 2.) # Then in another terminal:
 
-    php artisan tickers:refresh-all --dev (main stuff for dev)
+    php artisan tickers:refresh-all --dev --fast
+
+    •	--dev = skip fundamentals & news
+    •	--fast = aggressive batching
+    •	Includes: tickers, slugs, overviews, 1d+1h price histories, indicators, snapshots, intraday-redis-warmup
+    •	Best for daily development refreshes
+    •	Cuts runtime from hours → minutes
 
     php artisan tickers:refresh-all --fast (all/heavy)
     
     •	Nightly pipeline (already wired):
         tickers:refresh-all --daily via scheduler.
-
 	•	Weekly fundamentals blast (already wired):
         tickers:refresh-all --weekly via scheduler.
 

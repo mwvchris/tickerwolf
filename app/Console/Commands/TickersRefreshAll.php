@@ -447,9 +447,11 @@ class TickersRefreshAll extends Command
         |   • support redundancy days to heal gaps
         */
         if ($includePrices) {
+            // Updated to match the actual command signature
+            // Supports: --batch, --fast, --sleep, --resolution, --limit, etc.
             $priceCmd = $fast
-                ? 'polygon:ticker-price-histories:ingest --window=45 --sleep=0 --redundancy-days=2'
-                : 'polygon:ticker-price-histories:ingest --window=14 --sleep=2 --redundancy-days=3';
+                ? 'polygon:ticker-price-histories:ingest --batch=150 --fast --sleep=0'
+                : 'polygon:ticker-price-histories:ingest --batch=75 --sleep=1';
 
             $this->runStep(
                 key: 'prices',
@@ -468,6 +470,7 @@ class TickersRefreshAll extends Command
                 'error'    => null,
             ];
         }
+
 
         /*
         |--------------------------------------------------------------------------
