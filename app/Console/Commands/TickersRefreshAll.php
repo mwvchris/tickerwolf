@@ -53,12 +53,12 @@ use Throwable;
  *                • Includes:
  *                    - tickers
  *                    - slugs
- *                    - overviews
  *                    - price histories (1d + 1h, optimized)
  *                    - indicators
  *                    - snapshots
  *                    - intraday prefetch
  *                • Skips:
+ *                    - overviews (currently skipping these to see how it effects overall run time.)
  *                    - fundamentals
  *                    - news
  *
@@ -267,6 +267,7 @@ class TickersRefreshAll extends Command
                 // Dev: everything except fundamentals + news.
                 $includeFundamentals = false;
                 $includeNews         = false;
+                $includeOverviews    = false; // temporarily disable overviews in dev
                 break;
 
             case 'daily':
