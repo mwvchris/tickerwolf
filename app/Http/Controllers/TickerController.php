@@ -213,11 +213,12 @@ class TickerController extends Controller
 
             // Meta
             'exchange'      => $ticker->exchange_short ?? $ticker->primary_exchange,
-            'companyName'          => $ticker->clean_base_name,      // "Alphabet Inc."
+            'companyName'   => $ticker->clean_base_name,      // "Alphabet Inc."
             'shareClass'    => $ticker->share_class,          // "Class C"
             'displayName'   => $ticker->clean_display_name,   // "Alphabet Inc. – Class C"
             'fullName'      => $ticker->full_display_name,    // same as above
-            'description'   => $ticker->description ?? null,
+            'description'   => $ticker->short_description ?? null,
+            'hasMoreDesc'   => $ticker->has_more_description ?? false,
             'logoUrl'       => $ticker->logo_url,
             'iconUrl'       => $ticker->icon_url,
             'ipoDate'       => $ticker->list_date ? \Illuminate\Support\Carbon::parse($ticker->list_date)->toFormattedDateString() : '—',

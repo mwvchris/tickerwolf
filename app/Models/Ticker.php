@@ -180,6 +180,66 @@ class Ticker extends Model
     }
 
     /**
+     * Return full description (raw from DB).
+     */
+    public function getFullDescriptionAttribute(): ?string
+    {
+        return $this->description ?: null;
+    }
+
+    /**
+     * Return trimmed description ending at the nearest sentence boundary.
+     */
+    public function getShortDescriptionAttribute(): ?string
+    {
+        $desc = trim($this->description ?? '');
+        if ($desc === '') {
+            return null;
+        }
+
+        // Maximum length defined in config/layout.php
+        $max = config('layout.short_description_max', 400);
+
+        // If already within limit → return untouched
+        if (strlen($desc) <= $max) {
+            return $desc;
+        }
+
+        // Soft cut
+        $cut = substr($desc, 0, $max);
+
+        // Find last sentence-ending punctuation before the cutoff
+        $lastPeriod = max(
+            strrpos($cut, '.'),
+            strrpos($cut, '!'),
+            strrpos($cut, '?')
+        );
+
+        // No punctuation found -> fall back to ellipsis cut
+        if ($lastPeriod === false) {
+            return rtrim($cut) . '…';
+        }
+
+        // Trim cleanly at sentence boundary
+        return rtrim(substr($cut, 0, $lastPeriod + 1));
+    }
+
+    /**
+     * Boolean: Whether ticker description exceeds short length.
+     */
+    public function getHasMoreDescriptionAttribute(): bool
+    {
+        $desc = trim($this->description ?? '');
+        if ($desc === '') {
+            return false;
+        }
+
+        $max = config('layout.short_description_max', 400);
+
+        return strlen($desc) > $max;
+    }
+
+    /**
      * Formatted employee count like “154,000”.
      *
      * @return string|null
